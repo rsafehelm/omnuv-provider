@@ -25,15 +25,35 @@ struct Core {
 }
 
 impl Core {
-    fn new(url: &str, token: &str) -> Self {
-        Self {
-            // ponytail: plain client, so core must be reached over a trusted
-            // network. Once NetBird enrollment lands this rides the overlay;
-            // until then do not expose core beyond the provider LAN.
-            http: reqwest::Client::new(),
-            base: url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+    /// The agent's own transport to Omnu Core.
+    ///
+    /// This is TLS, not the marketplace overlay. Control-plane traffic must not
+    /// depend on the overlay: a gateway fault would make a healthy provider look
+    /// offline and remove the very channel needed to repair it. The overlay
+    /// exists to aggregate a *buyer's* resources across providers, and carries
+    /// nothing of ours.
+    ///
+    /// Certificates are verified against the platform roots. `http://` is
+    /// refused unless the operator sets `OMNU_ALLOW_PLAINTEXT_CORE=1`, which
+    /// exists for a LAN development loop and says so in the log.
+    fn new(url: &str, token: &str) -> anyhow::Result<Self> {
+        let base = url.trim_end_matches('/').to_string();
+        if base.starts_with("http://") {
+            let allowed = std::env::var("OMNU_ALLOW_PLAINTEXT_CORE").is_ok_and(|v| v == "1");
+            anyhow::ensure!(
+                allowed,
+                "core url {base} is plaintext; agent credentials and inventory would cross the \
+                 network in the clear. Use https://, or set OMNU_ALLOW_PLAINTEXT_CORE=1 for a \
+                 development loop on a trusted LAN."
+            );
+            eprintln!("WARNING: talking to core at {base} over plaintext HTTP by explicit opt-in");
         }
+        let http = reqwest::Client::builder()
+            .use_rustls_tls()
+            .https_only(!base.starts_with("http://"))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        Ok(Self { http, base, token: token.to_string() })
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
@@ -81,7 +101,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         },
         cfg.proxmox.city.clone(),
     )?;
-    let core = Core::new(&cfg.core.url, &cfg.core.token);
+    let core = Core::new(&cfg.core.url, &cfg.core.token)?;
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
     // without Core ever learning this provider's addressing.
