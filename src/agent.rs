@@ -1,0 +1,345 @@
+//! The Provider Agent loop.
+//!
+//! Runs inside the provider environment, holds the runtime credentials locally,
+//! and reports normalized state upward. It never receives marketplace decision
+//! logic and never exposes the Proxmox API outward.
+
+use omnu_protocol::{
+    DesiredState, InstanceState, InstanceStatus, Lifecycle, StatusReport, WorkerState, WorkerStatus,
+};
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::audit;
+use crate::config::AgentConfig;
+use crate::driver::ComputeDriver;
+use crate::proxmox;
+
+const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+struct Core {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+impl Core {
+    fn new(url: &str, token: &str) -> Self {
+        Self {
+            // ponytail: plain client, so core must be reached over a trusted
+            // network. Once NetBird enrollment lands this rides the overlay;
+            // until then do not expose core beyond the provider LAN.
+            http: reqwest::Client::new(),
+            base: url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let res = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("GET {path}: {}", res.status());
+        }
+        Ok(res.json().await?)
+    }
+
+    async fn post(&self, path: &str, body: Option<serde_json::Value>) -> anyhow::Result<reqwest::Response> {
+        let mut req = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(std::time::Duration::from_secs(30));
+        if let Some(b) = body {
+            req = req.json(&b);
+        } else {
+            req = req.header("content-length", "0");
+        }
+        Ok(req.send().await?)
+    }
+}
+
+pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
+    let driver = proxmox::Client::new(
+        &cfg.proxmox.api_url,
+        cfg.proxmox.tls_fingerprint_sha256.as_deref(),
+        &cfg.proxmox.token_id,
+        &cfg.proxmox.token_secret,
+        cfg.proxmox.node.clone(),
+        cfg.proxmox.contribute.clone(),
+        match (cfg.proxmox.latitude, cfg.proxmox.longitude) {
+            (Some(latitude), Some(longitude)) => {
+                Some(omnu_protocol::GeoLocation { latitude, longitude })
+            }
+            _ => None,
+        },
+        cfg.proxmox.city.clone(),
+    )?;
+    let core = Core::new(&cfg.core.url, &cfg.core.token);
+
+    // Worker id -> local endpoint, so a tunnelled request can be resolved
+    // without Core ever learning this provider's addressing.
+    //
+    // A std mutex, not a tokio one: the resolver is a synchronous callback, and
+    // `blocking_lock()` panics when called from a runtime thread. Critical
+    // sections here are a map lookup.
+    let endpoints: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let heartbeat_secs = handshake(&core, &driver).await?;
+
+    // Woken by Core over the tunnel; the poll below is the safety net for when
+    // no tunnel is up, so a push is never a correctness dependency.
+    let nudge = Arc::new(tokio::sync::Notify::new());
+
+    // The tunnel is how Core reaches this provider without an inbound path.
+    {
+        let url = cfg.core.url.clone();
+        let token = cfg.core.token.clone();
+        let map = endpoints.clone();
+        let nudge_tx = nudge.clone();
+        tokio::spawn(async move {
+            let resolve: crate::tunnel::ResolveWorker = Arc::new(move |worker_id: &str| {
+                // Blocking lock inside a sync closure: the map is tiny and
+                // contended only by the reconcile loop.
+                map.lock().ok()?.get(worker_id).cloned()
+            });
+            crate::tunnel::run(&url, &token, resolve, nudge_tx).await;
+        });
+    }
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+    let mut inventory = tokio::time::interval(std::time::Duration::from_secs(cfg.inventory_every_secs));
+    // Reconciliation is push-driven; this interval is only the fallback for a
+    // provider with no live tunnel.
+    let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(120));
+
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                match core.post("/provider/v1/heartbeat", None).await {
+                    // A restarted core no longer knows this agent; re-handshake
+                    // rather than heartbeating into the void forever.
+                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                        eprintln!("heartbeat rejected; re-running handshake");
+                        let _ = handshake(&core, &driver).await;
+                    }
+                    Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
+                    Err(e) => eprintln!("heartbeat failed: {e}"),
+                    _ => {}
+                }
+            }
+            _ = nudge.notified() => {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints).await {
+                    eprintln!("reconcile (pushed) failed: {e}");
+                }
+            }
+            _ = reconcile.tick() => {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints).await {
+                    eprintln!("reconcile failed: {e}");
+                }
+            }
+            _ = inventory.tick() => {
+                if let Err(e) = report_inventory(&core, &driver).await {
+                    // Never exit on a transient failure: the agent is a daemon,
+                    // and a provider that gives up looks identical to one that
+                    // died. Missed heartbeats already mark it offline.
+                    eprintln!("inventory report failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u64> {
+    let body = serde_json::json!({
+        "agent_version": AGENT_VERSION,
+        "protocol_versions": [omnu_protocol::PROTOCOL_VERSION],
+        "drivers": { "compute": [driver.kind().as_str()] },
+    });
+
+    // Core may simply not be up yet at boot; keep trying with a bounded backoff.
+    let mut delay = 2u64;
+    loop {
+        match core.post("/provider/v1/handshake", Some(body.clone())).await {
+            Ok(r) if r.status().is_success() => {
+                let v: serde_json::Value = r.json().await?;
+                let secs = v.get("heartbeat_interval_secs").and_then(|x| x.as_u64()).unwrap_or(30);
+                println!(
+                    "handshake ok: provider {} protocol v{} heartbeat {}s",
+                    v.get("provider_id").and_then(|x| x.as_str()).unwrap_or("?"),
+                    v.get("protocol_version").and_then(|x| x.as_u64()).unwrap_or(0),
+                    secs
+                );
+                return Ok(secs);
+            }
+            Ok(r) => {
+                let status = r.status();
+                let detail = r.text().await.unwrap_or_default();
+                eprintln!("handshake rejected ({status}): {detail}");
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    anyhow::bail!("enrollment token rejected; re-enrol this provider");
+                }
+            }
+            Err(e) => eprintln!("handshake failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        delay = (delay * 2).min(60);
+    }
+}
+
+async fn report_inventory(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<()> {
+    let report = driver.inventory().await?;
+    let res = core.post("/provider/v1/inventory", Some(serde_json::to_value(&report)?)).await?;
+    if !res.status().is_success() {
+        anyhow::bail!("core rejected inventory: {}", res.status());
+    }
+    println!(
+        "reported {} node(s), {} vCPU, {} GiB, {} GiB disk, {} GPU(s)",
+        report.nodes.len(),
+        report.total_cpu_cores(),
+        report.total_memory_mib() / 1024,
+        report.total_disk_gib(),
+        report.gpu_count()
+    );
+    Ok(())
+}
+
+/// Converges the provider toward Core's desired state, then reports what is
+/// actually true. This runs on every tick rather than on an event, so a missed
+/// message or an agent restart cannot leave the two sides diverged.
+async fn reconcile_workers(
+    core: &Core,
+    driver: &proxmox::Client,
+    cfg: &AgentConfig,
+    endpoints: &Arc<Mutex<HashMap<String, String>>>,
+) -> anyhow::Result<()> {
+    let desired: DesiredState = core.get_json("/provider/v1/desired-state").await?;
+    if desired.protocol_version != omnu_protocol::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "core speaks protocol v{}, this agent speaks v{}",
+            desired.protocol_version,
+            omnu_protocol::PROTOCOL_VERSION
+        );
+    }
+    if desired.inference_workers.is_empty() && desired.instances.is_empty() {
+        return Ok(());
+    }
+
+    let node = cfg.proxmox.node.as_deref().unwrap_or_default();
+    let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
+
+    let mut statuses = Vec::new();
+    for spec in &desired.inference_workers {
+        let result = match spec.lifecycle {
+            Lifecycle::Deleted => driver
+                .delete_inference_worker(node, &spec.id)
+                .await
+                .map(|_| WorkerStatus {
+                    id: spec.id.clone(),
+                    state: WorkerState::Offline,
+                    local_id: None,
+                    endpoint: None,
+                    message: Some("deleted".into()),
+                }),
+            _ => {
+                driver
+                    .ensure_inference_worker(
+                        node,
+                        cfg.proxmox.template_vmid,
+                        storage,
+                        &cfg.proxmox.snippet_dir,
+                        spec,
+                    )
+                    .await
+            }
+        };
+        // A failure on one worker must not stop the others from converging, and
+        // must be visible to the operator rather than retried in silence.
+        statuses.push(result.unwrap_or_else(|e| {
+            eprintln!("worker {}: {e}", spec.id);
+            WorkerStatus {
+                id: spec.id.clone(),
+                state: WorkerState::Error,
+                local_id: None,
+                endpoint: None,
+                message: Some(e.to_string().chars().take(400).collect()),
+            }
+        }));
+    }
+
+    {
+        // Refresh the resolver's view so tunnelled requests reach the right
+        // worker as soon as it is serving.
+        let Ok(mut map) = endpoints.lock() else { return Ok(()) };
+        for s in &statuses {
+            match &s.endpoint {
+                Some(ep) => {
+                    map.insert(s.id.clone(), ep.clone());
+                }
+                None => {
+                    map.remove(&s.id);
+                }
+            }
+        }
+    }
+
+    for s in &statuses {
+        println!("worker {} -> {:?} {}", s.id, s.state, s.endpoint.as_deref().unwrap_or(""));
+        audit::record(
+            "worker.reconcile",
+            "core",
+            &s.id,
+            &format!("{:?}", s.state).to_lowercase(),
+            s.local_id.as_deref(),
+        );
+    }
+    // Buyer instances converge on the same pass and by the same rules.
+    let mut instances = Vec::new();
+    for spec in &desired.instances {
+        let result = match spec.lifecycle {
+            Lifecycle::Deleted => driver.delete_instance(node, &spec.id).await.map(|_| InstanceStatus {
+                id: spec.id.clone(),
+                rebooted_token: None,
+                state: InstanceState::Stopped,
+                local_id: None,
+                private_ip: None,
+                message: Some("deleted".into()),
+            }),
+            _ => {
+                driver
+                    .ensure_instance(node, cfg.proxmox.template_vmid, storage, &cfg.proxmox.snippet_dir, spec)
+                    .await
+            }
+        };
+        instances.push(result.unwrap_or_else(|e| {
+            eprintln!("instance {}: {e}", spec.id);
+            InstanceStatus {
+                id: spec.id.clone(),
+                rebooted_token: None,
+                state: InstanceState::Error,
+                local_id: None,
+                private_ip: None,
+                message: Some(e.to_string().chars().take(400).collect()),
+            }
+        }));
+    }
+    for i in &instances {
+        println!("instance {} -> {:?} {}", i.id, i.state, i.private_ip.as_deref().unwrap_or(""));
+    }
+
+    let report = StatusReport {
+        protocol_version: omnu_protocol::PROTOCOL_VERSION,
+        workers: statuses,
+        instances,
+    };
+    let res = core.post("/provider/v1/status", Some(serde_json::to_value(&report)?)).await?;
+    if !res.status().is_success() {
+        anyhow::bail!("core rejected status report: {}", res.status());
+    }
+    Ok(())
+}
