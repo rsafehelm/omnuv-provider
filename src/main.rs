@@ -1,6 +1,7 @@
 mod agent;
 mod audit;
 mod config;
+mod gateway;
 mod instance;
 mod join;
 mod driver;

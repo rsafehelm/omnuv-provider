@@ -246,12 +246,54 @@ async fn reconcile_workers(
             omnu_protocol::PROTOCOL_VERSION
         );
     }
-    if desired.inference_workers.is_empty() && desired.instances.is_empty() {
+    if desired.inference_workers.is_empty()
+        && desired.instances.is_empty()
+        && desired.gateway.is_none()
+    {
         return Ok(());
     }
 
     let node = cfg.proxmox.node.as_deref().unwrap_or_default();
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
+
+    // The gateway first: it carries buyer traffic, and a buyer VM that comes up
+    // before its gateway simply has nowhere to talk to yet. A failure here is
+    // reported and does not stop workers or instances converging — the control
+    // plane does not run on the overlay, so a broken gateway is a degraded
+    // buyer network, not a degraded provider.
+    let gateway_status = match &desired.gateway {
+        Some(spec) if spec.lifecycle == Lifecycle::Deleted => {
+            match driver.delete_gateway(node, &spec.id).await {
+                Ok(()) => Some(omnu_protocol::GatewayStatus {
+                    id: spec.id.clone(),
+                    state: omnu_protocol::GatewayState::Offline,
+                    local_id: None,
+                    overlay_address: None,
+                    message: Some("deleted".into()),
+                }),
+                Err(e) => {
+                    eprintln!("gateway {}: {e}", spec.id);
+                    None
+                }
+            }
+        }
+        Some(spec) => Some(
+            driver
+                .ensure_gateway(node, cfg.proxmox.template_vmid, storage, &cfg.proxmox.snippet_dir, spec)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("gateway {}: {e}", spec.id);
+                    omnu_protocol::GatewayStatus {
+                        id: spec.id.clone(),
+                        state: omnu_protocol::GatewayState::Error,
+                        local_id: None,
+                        overlay_address: None,
+                        message: Some(e.to_string().chars().take(400).collect()),
+                    }
+                }),
+        ),
+        None => None,
+    };
 
     let mut statuses = Vec::new();
     for spec in &desired.inference_workers {
@@ -356,6 +398,7 @@ async fn reconcile_workers(
         protocol_version: omnu_protocol::PROTOCOL_VERSION,
         workers: statuses,
         instances,
+        gateway: gateway_status,
     };
     let res = core.post("/provider/v1/status", Some(serde_json::to_value(&report)?)).await?;
     if !res.status().is_success() {
