@@ -5,7 +5,7 @@
 //! state survives an agent restart, and nothing the marketplace did not create
 //! is ever touched.
 
-use omnu_protocol::{InstanceSpec, InstanceState, InstanceStatus, Lifecycle};
+use omnu_protocol::{InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment};
 
 use crate::audit;
 use crate::proxmox::Client;
@@ -15,6 +15,11 @@ use crate::proxmox::Client;
 pub const TAG: &str = "omnu-instance";
 
 const NO_FORM: &[(String, String)] = &[];
+
+/// The isolated bridge buyer machines attach to. Created at provider bootstrap,
+/// never by the agent: it is host network configuration, and the agent's token
+/// holds SDN.Use and deliberately not SDN.Allocate.
+pub(crate) const MARKETPLACE_BRIDGE: &str = "omnu0";
 
 fn short_tag(id: &str) -> String {
     format!("omnu-{}", id.replace('-', "").chars().take(12).collect::<String>())
@@ -59,10 +64,45 @@ packages:
   - qemu-guest-agent
 runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent ]
-"#,
+{network}"#,
         name = spec.name,
         nested = render("      "),
         top = render("  "),
+        network = spec.network.as_ref().map(private_network).unwrap_or_default(),
+    )
+}
+
+/// Configures the machine's place on the buyer's private network.
+///
+/// The address is a **/32**, not the project prefix. Each provider has its own
+/// isolated bridge, so two machines on the same project network but different
+/// providers are not on the same segment: giving them a /24 would have them ARP
+/// for each other and fail. With a /32 plus an on-link route to the gateway,
+/// anything in the project that is not local is routed — which is what makes a
+/// private network span providers at all.
+fn private_network(net: &NetworkAttachment) -> String {
+    let hosts = match &net.dns_name {
+        Some(dns) => format!(
+            "write_files:\n  - path: /etc/hosts.omnu\n    content: |\n      {} {}\n",
+            net.address, dns
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"  # The buyer's private network. eth1 is on the provider's isolated
+  # marketplace bridge, which has no uplink: this machine has no path to the
+  # provider's own network at all.
+  - [ sh, -c, "ip link set dev eth1 up || true" ]
+  - [ sh, -c, "ip addr add {address}/32 dev eth1 || true" ]
+  # On-link to the gateway first, then everything else in the project through
+  # it. Without the first route the second has no reachable next hop.
+  - [ sh, -c, "ip route add {gateway} dev eth1 scope link || true" ]
+  - [ sh, -c, "ip route add {cidr} via {gateway} dev eth1 || true" ]
+{hosts}"#,
+        address = net.address,
+        gateway = net.gateway,
+        cidr = net.cidr,
+        hosts = hosts,
     )
 }
 
@@ -172,6 +212,13 @@ impl Client {
                 format!("Omnu instance {}\nManaged by omnu-provider. Do not edit.", spec.id),
             ),
         ];
+        let mut config = config;
+        // A second interface on the marketplace's isolated bridge, when the
+        // buyer's project has a network. `net0` stays on the provider's own
+        // bridge for outbound internet; nothing routes between them.
+        if spec.network.is_some() {
+            config.push((format!("net1"), format!("virtio,bridge={MARKETPLACE_BRIDGE}")));
+        }
         self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
 
         self.put_form::<serde_json::Value>(

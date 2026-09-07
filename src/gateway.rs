@@ -230,6 +230,14 @@ impl proxmox::Client {
                 ("memory".to_string(), "1024".to_string()),
                 ("agent".to_string(), "enabled=1".into()),
                 ("ipconfig0".to_string(), "ip=dhcp".into()),
+                // net0 reaches the overlay control plane over the provider's
+                // own network; net1 is the isolated marketplace bridge the
+                // buyer's machines live on. The gateway is the only thing that
+                // sees both, which is the entire point of it.
+                (
+                    "net1".to_string(),
+                    format!("virtio,bridge={}", crate::instance::MARKETPLACE_BRIDGE),
+                ),
                 ("cicustom".to_string(), format!("user=omnu-snippets:snippets/{file}")),
                 ("tags".to_string(), format!("{TAG};{tag}")),
                 // The gateway must come back with the host, or a reboot leaves
