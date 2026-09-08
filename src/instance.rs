@@ -322,6 +322,26 @@ impl Client {
                 _ => {}
             }
 
+            // The generated cloud-init, brought up to date so a generator
+            // change reaches a machine that already exists. The drive is
+            // refreshed and nothing more: this is the buyer's machine, and
+            // rebooting it to apply a marketplace change is not ours to
+            // decide. It takes effect at their next boot — including the one
+            // they may ask for on the line below.
+            if spec.lifecycle != Lifecycle::Deleted
+                && let Err(e) = self
+                    .sync_cloud_init(
+                        node,
+                        vm.vmid,
+                        snippet_dir,
+                        &format!("omnu-instance-{}.yaml", spec.id),
+                        &cloud_init(spec),
+                    )
+                    .await
+            {
+                eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
+            }
+
             // One-shot: performed here and echoed back so Core can clear it.
             let mut rebooted_token = None;
             if running && spec.lifecycle == Lifecycle::Running {

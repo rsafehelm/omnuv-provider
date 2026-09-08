@@ -315,6 +315,34 @@ impl proxmox::Client {
                 running = false;
             }
 
+            // The generated cloud-init, brought up to date. A gateway built
+            // before a generator changed would otherwise keep the old
+            // configuration for its whole life, and the fix would be a human
+            // editing iptables on a guest — which is how it went once, and
+            // exactly what the reconciliation model exists to prevent. The
+            // gateway is marketplace-owned, holds no state and its loss is
+            // survivable (5.15), so the agent applies it: rewrite, regenerate
+            // the drive, reboot. bootcmd runs on every boot, so the reboot is
+            // what makes it true.
+            let mut refreshed = false;
+            if running && spec.lifecycle == Lifecycle::Running {
+                match self
+                    .sync_cloud_init(node, vm.vmid, snippet_dir, &format!("omnu-gw-{tag}.yaml"), &cloud_init(spec))
+                    .await
+                {
+                    Ok(true) => {
+                        let upid: String = self
+                            .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
+                            .await?;
+                        self.wait_task(node, &upid).await?;
+                        audit::record("gateway.refresh", "agent", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                        refreshed = true;
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("gateway {}: cloud-init not refreshed: {e}", spec.id),
+                }
+            }
+
             let addr = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
 
             // Keep the resolver's map current. dnsmasq watches the directory,
@@ -332,14 +360,14 @@ impl proxmox::Client {
                 id: spec.id.clone(),
                 // READY means the guest is answering, not merely that a VM
                 // exists: a gateway that never booted is not carrying traffic.
-                state: match (running, addr.is_some()) {
+                state: match (running, addr.is_some() && !refreshed) {
                     (true, true) => GatewayState::Ready,
                     (true, false) => GatewayState::Deploying,
                     _ => GatewayState::Offline,
                 },
                 local_id: Some(vm.vmid.to_string()),
                 overlay_address: addr,
-                message: None,
+                message: refreshed.then(|| "configuration refreshed; rebooting".to_string()),
             });
         }
 
@@ -639,6 +667,32 @@ mod tests {
             dns_records: vec![],
         };
         assert!(!cloud_init(&spec).contains("ip_forward"));
+    }
+
+    /// The invariant the refresh rests on: the same spec must render the same
+    /// bytes. If it did not, every reconcile pass would see drift and reboot
+    /// the gateway, forever.
+    #[test]
+    fn cloud_init_is_deterministic() {
+        let spec = GatewaySpec {
+            id: "abcdef12".into(),
+            network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
+            lifecycle: Lifecycle::Running,
+            management_url: "https://nb.example".into(),
+            setup_key: "K".into(),
+            slice_address: Some("10.200.7.1/24".into()),
+            advertise_cidr: Some("10.200.7.0/24".into()),
+            ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
+            dns_records: vec![
+                omnu_protocol::DnsRecord { name: "b.internal".into(), address: "10.200.7.11".into() },
+                omnu_protocol::DnsRecord { name: "a.internal".into(), address: "10.200.7.10".into() },
+            ],
+        };
+        assert_eq!(cloud_init(&spec), cloud_init(&spec));
+        // Including the record order, which arrives however the query sorted it.
+        let mut shuffled = spec.clone();
+        shuffled.dns_records.reverse();
+        assert_eq!(cloud_init(&spec), cloud_init(&shuffled), "records must not reorder the config");
     }
 
     #[test]

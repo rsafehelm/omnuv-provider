@@ -196,6 +196,42 @@ impl Client {
         self.send_form(reqwest::Method::PUT, path, form).await
     }
 
+    /// Brings a VM's cloud-init drive up to date with its snippet on disk.
+    ///
+    /// The snippet is read when the drive is regenerated, not when the file
+    /// changes, so a generator change reaches a machine that already exists
+    /// only through this. `VM.Config.Cloudinit`, which the agent's role holds
+    /// (verified at source: `PVE::API2::Qemu` `cloudinit_update`).
+    pub(crate) async fn regenerate_cloudinit(&self, node: &str, vmid: u32) -> anyhow::Result<()> {
+        self.put_form::<Option<serde_json::Value>>(
+            &format!("/nodes/{node}/qemu/{vmid}/cloudinit"),
+            &[] as &[(String, String)],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Writes the machine's cloud-init and refreshes its drive when the
+    /// generated config has changed since the machine was built. Returns
+    /// whether anything changed — a reboot is what actually applies it, and
+    /// whose call that is depends on who owns the machine.
+    pub(crate) async fn sync_cloud_init(
+        &self,
+        node: &str,
+        vmid: u32,
+        snippet_dir: &str,
+        file: &str,
+        desired: &str,
+    ) -> anyhow::Result<bool> {
+        let path = format!("{snippet_dir}/{file}");
+        if std::fs::read_to_string(&path).is_ok_and(|current| current == desired) {
+            return Ok(false);
+        }
+        std::fs::write(&path, desired).map_err(|e| anyhow::anyhow!("writing {path}: {e}"))?;
+        self.regenerate_cloudinit(node, vmid).await?;
+        Ok(true)
+    }
+
     /// Writes a file inside a guest through the QEMU guest agent.
     ///
     /// Needs `VM.GuestAgent.FileWrite` on the VM. That is a root-level write
