@@ -198,7 +198,10 @@ write_files:
 # slow or absent apt must not delay the gateway's address, forwarding or the
 # overlay: they are configured here and depend on nothing installed later.
 bootcmd:
-  - [ sh, -c, \"systemctl enable --now qemu-guest-agent 2>/dev/null || true\" ]
+  # --no-block: in the init stage a start job for a unit ordered after
+  # basic.target cannot complete until this very stage finishes; waiting on
+  # it is a deadlock that looks like a boot stuck at cloud-init-network.
+  - [ sh, -c, \"systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true\" ]
 {routes}runcmd:
   - [ mkdir, -p, /etc/omnu ]
   # runcmd is the final stage, after packages: both are installed by then.

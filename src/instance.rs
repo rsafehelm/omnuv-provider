@@ -592,6 +592,8 @@ mod tests {
         let ci = cloud_init(&spec);
         let boot = ci.find("bootcmd:").expect("has bootcmd");
         let after = &ci[boot + "bootcmd:".len()..];
-        assert!(after.trim_start().starts_with("- ["), "bootcmd has at least one item");
+        // The first entry, past any comment lines.
+        let first = after.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
+        assert!(first.starts_with("- ["), "bootcmd has at least one item, got {first:?}");
     }
 }
