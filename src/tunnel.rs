@@ -230,6 +230,9 @@ async fn connect(
                         table.lock().await.remove(&id);
                         return;
                     }
+                    if let Some(password) = stream.credential {
+                        let _ = tx.send(TunnelFrame::ConsoleCredential { id: id.clone(), password }).await;
+                    }
                     let mut from_vm = stream.from_vm;
                     while let Some(bytes) = from_vm.recv().await {
                         use base64::Engine as _;

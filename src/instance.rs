@@ -376,6 +376,11 @@ impl Client {
             ("cpu".into(), "host".into()),
             ("agent".into(), "enabled=1".into()),
             ("ipconfig0".into(), "ip=dhcp".into()),
+            // A display as well as the serial port: the serial console is
+            // where a Linux machine logs in, the screen is what the buyer
+            // opens to watch it boot or rescue it, and what a Windows machine
+            // uses for everything.
+            ("vga".into(), "std".into()),
             ("cicustom".into(), format!("user=omnu-snippets:snippets/{file}")),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
             (

@@ -38,6 +38,9 @@ pub enum ConsoleInput {
 pub struct ConsoleStream {
     pub to_vm: mpsc::Sender<ConsoleInput>,
     pub from_vm: mpsc::Receiver<Vec<u8>>,
+    /// A secret the viewer authenticates with inside the protocol (VNC), for
+    /// this session only.
+    pub credential: Option<String>,
 }
 
 /// The runtime-neutral face of a console, so the tunnel never sees the
@@ -57,6 +60,15 @@ struct TermProxy {
     user: String,
 }
 
+#[derive(serde::Deserialize)]
+struct VncProxy {
+    port: serde_json::Value,
+    ticket: String,
+    /// The VNC password the hypervisor minted for this proxy session.
+    #[serde(default)]
+    password: Option<String>,
+}
+
 impl Client {
     pub async fn open_console(
         &self,
@@ -64,9 +76,6 @@ impl Client {
         instance_id: &str,
         kind: ConsoleKind,
     ) -> anyhow::Result<ConsoleStream> {
-        if kind != ConsoleKind::Serial {
-            anyhow::bail!("the VNC console is not available on this provider yet");
-        }
         let Some(vm) = self
             .find_tagged_vm(node, crate::instance::TAG, &crate::instance::short_tag(instance_id))
             .await?
@@ -77,6 +86,9 @@ impl Client {
             anyhow::bail!("the machine is not running");
         }
 
+        if kind == ConsoleKind::Vnc {
+            return self.open_vnc(node, instance_id, vm.vmid).await;
+        }
         // One ticket, one websocket: the ticket is only good for this machine's
         // console and only briefly.
         let tp: TermProxy =
@@ -158,7 +170,66 @@ impl Client {
             audit::record("console.close", "core", &id, "ok", None);
         });
 
-        Ok(ConsoleStream { to_vm, from_vm })
+        Ok(ConsoleStream { to_vm, from_vm, credential: None })
+    }
+
+    /// The machine's screen: the hypervisor's VNC server behind the same API
+    /// websocket, as a raw RFB stream. The viewer speaks RFB itself and
+    /// authenticates with the password the hypervisor minted for this session.
+    async fn open_vnc(&self, node: &str, instance_id: &str, vmid: u32) -> anyhow::Result<ConsoleStream> {
+        let vp: VncProxy = self
+            .post_form(&format!("/nodes/{node}/qemu/{vmid}/vncproxy"), &[("websocket".to_string(), "1".to_string())])
+            .await?;
+        let port = vp.port.as_str().map(str::to_string).unwrap_or_else(|| vp.port.to_string());
+        let host = self.base.split("://").nth(1).unwrap_or(&self.base);
+        let url = format!(
+            "wss://{host}/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port={}&vncticket={}",
+            urlencode(&port),
+            urlencode(&vp.ticket)
+        );
+        let mut request = url.into_client_request()?;
+        request.headers_mut().insert("authorization", self.auth.parse()?);
+        request.headers_mut().insert("sec-websocket-protocol", "binary".parse()?);
+        let connector = tokio_tungstenite::Connector::Rustls(self.tls.clone());
+        let (socket, _) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .map_err(|e| anyhow::anyhow!("screen websocket: {e}"))?;
+        let (mut sink, mut stream) = socket.split();
+
+        let (to_vm, mut input) = mpsc::channel::<ConsoleInput>(64);
+        let (output, from_vm) = mpsc::channel::<Vec<u8>>(256);
+        audit::record("console.open", "core", instance_id, "ok", Some(&format!("vmid={vmid} kind=vnc")));
+
+        let id = instance_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = stream.next() => match msg {
+                        Some(Ok(Message::Binary(b))) => {
+                            if output.send(b.to_vec()).await.is_err() { break }
+                        }
+                        Some(Ok(Message::Text(t))) => {
+                            if output.send(t.as_bytes().to_vec()).await.is_err() { break }
+                        }
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    },
+                    next = input.recv() => match next {
+                        // Raw RFB both ways; the viewer owns the protocol.
+                        Some(ConsoleInput::Data(d)) => {
+                            if sink.send(Message::binary(d)).await.is_err() { break }
+                        }
+                        Some(ConsoleInput::Resize { .. }) => {}
+                        None => break,
+                    },
+                }
+            }
+            let _ = sink.close().await;
+            audit::record("console.close", "core", &id, "ok", Some("kind=vnc"));
+        });
+
+        Ok(ConsoleStream { to_vm, from_vm, credential: vp.password })
     }
 }
 
