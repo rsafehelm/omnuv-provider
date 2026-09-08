@@ -69,6 +69,23 @@ fn advertisable(cidr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The slice a gateway advertises must be the one its own address is in:
+/// `10.200.7.1/24` advertises `10.200.7.0/24` and nothing else. The negative
+/// guard above stops the dangerous prefixes; this is the positive half.
+fn holds_its_slice(slice_address: &str, advertise_cidr: &str) -> bool {
+    fn parse(s: &str) -> Option<(u32, u8)> {
+        let (ip, len) = s.split_once('/')?;
+        let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+        let len: u8 = len.parse().ok()?;
+        (len <= 32).then_some((u32::from(ip), len))
+    }
+    let (Some((a, alen)), Some((c, clen))) = (parse(slice_address), parse(advertise_cidr)) else {
+        return false;
+    };
+    let mask = if clen == 0 { 0 } else { u32::MAX << (32 - clen) };
+    alen == clen && a & mask == c & mask && c & !mask == 0
+}
+
 /// The gateway's cloud-init.
 ///
 /// `netbird up` is idempotent, so a rebuilt gateway re-enrols with the same key
@@ -88,7 +105,7 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     // before any of this is written, because the agent is the last place a
     // forbidden prefix can be stopped before a route reaches a provider.
     let routes = match (&spec.slice_address, spec.advertise_cidr.as_deref()) {
-        (Some(addr), Some(cidr)) if advertisable(cidr).is_ok() => format!(
+        (Some(addr), Some(cidr)) if advertisable(cidr).is_ok() && holds_its_slice(addr, cidr) => format!(
             r#"  # This interface is the provider's isolated marketplace bridge. This
   # address is the next hop for every buyer machine here, and the bridge has no
   # uplink, so nothing on it can reach the provider's own network. One block
@@ -243,18 +260,28 @@ impl proxmox::Client {
         snippet_dir: &str,
         spec: &GatewaySpec,
     ) -> anyhow::Result<GatewayStatus> {
-        if let Some(cidr) = &spec.advertise_cidr
-            && let Err(why) = advertisable(cidr)
-        {
+        if let Some(cidr) = &spec.advertise_cidr {
             // Refuse rather than build something that would advertise it. This
-            // is the last point before a route is written on the provider.
-            return Ok(GatewayStatus {
-                id: spec.id.clone(),
-                state: GatewayState::Error,
-                local_id: None,
-                overlay_address: None,
-                message: Some(why),
-            });
+            // is the last point before a route is written on the provider:
+            // never a forbidden prefix, and only the slice this gateway's own
+            // address is in.
+            let refused = match advertisable(cidr) {
+                Err(why) => Some(why),
+                Ok(()) => spec
+                    .slice_address
+                    .as_deref()
+                    .filter(|addr| !holds_its_slice(addr, cidr))
+                    .map(|addr| format!("{cidr} is not the slice {addr} is in")),
+            };
+            if let Some(why) = refused {
+                return Ok(GatewayStatus {
+                    id: spec.id.clone(),
+                    state: GatewayState::Error,
+                    local_id: None,
+                    overlay_address: None,
+                    message: Some(why),
+                });
+            }
         }
 
         let tag = short_tag(&spec.id);
@@ -398,6 +425,33 @@ impl proxmox::Client {
             overlay_address: None,
             message: Some(format!("gateway vm {vmid} created and started")),
         })
+    }
+
+    /// Removes gateways on this node that Core no longer knows about: a VM
+    /// carrying this agent's gateway tag whose id is in no desired spec,
+    /// running or deleted. A protocol upgrade or a Core restore leaves such a
+    /// VM behind, holding a key nothing distributes any more and capacity no
+    /// allocation pays for. Nothing without the tag is ever touched.
+    pub async fn reap_stale_gateways(&self, node: &str, desired: &[GatewaySpec]) -> anyhow::Result<usize> {
+        let vms: Vec<crate::worker::VmRef> = self.get_json(&format!("/nodes/{node}/qemu")).await?;
+        let keep: Vec<String> = desired.iter().map(|s| short_tag(&s.id)).collect();
+        let mut reaped = 0;
+        for vm in vms {
+            let Some(tags) = vm.tags.as_deref() else { continue };
+            if !tags.split(';').any(|t| t == TAG) || tags.split(';').any(|t| keep.iter().any(|k| k == t)) {
+                continue;
+            }
+            if vm.status.as_deref() == Some("running") {
+                let upid: String =
+                    self.post_form(&format!("/nodes/{node}/qemu/{}/status/stop", vm.vmid), NO_FORM).await?;
+                self.wait_task(node, &upid).await?;
+            }
+            let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
+            self.wait_task(node, &upid).await?;
+            audit::record("gateway.reap", "agent", &tags, "ok", Some(&vm.vmid.to_string()));
+            reaped += 1;
+        }
+        Ok(reaped)
     }
 
     /// Destroys the gateway, and with it the network's segment here: Core asks
@@ -549,6 +603,32 @@ mod tests {
             serde_yaml_ng::from_str(&ci).expect("gateway cloud-init must be valid YAML");
         assert!(doc.get("bootcmd").is_some_and(|b| b.is_sequence()));
         assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
+    }
+
+    /// 5.8, the positive half: the slice a gateway advertises is exactly the
+    /// one its own address is in — never a neighbour's, never a supernet.
+    #[test]
+    fn a_gateway_advertises_exactly_the_slice_it_holds() {
+        assert!(holds_its_slice("10.200.7.1/24", "10.200.7.0/24"));
+        assert!(holds_its_slice("10.200.99.1/24", "10.200.99.0/24"));
+        assert!(!holds_its_slice("10.200.7.1/24", "10.200.8.0/24"), "a neighbour's slice");
+        assert!(!holds_its_slice("10.200.7.1/24", "10.200.0.0/16"), "a supernet");
+        assert!(!holds_its_slice("10.200.7.1/24", "10.200.7.1/24"), "not a prefix");
+        assert!(!holds_its_slice("10.200.7.1/24", "10.200.7.0/25"), "a different length");
+        assert!(!holds_its_slice("10.200.7.1/24", "nonsense"));
+        // A mismatch never reaches cloud-init: no forwarding is written.
+        let spec = GatewaySpec {
+            id: "abcdef12".into(),
+            network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
+            lifecycle: Lifecycle::Running,
+            management_url: "https://nb.example".into(),
+            setup_key: "K".into(),
+            slice_address: Some("10.200.7.1/24".into()),
+            advertise_cidr: Some("10.200.8.0/24".into()),
+            ssh_keys: vec![],
+            dns_records: vec![],
+        };
+        assert!(!cloud_init(&spec).contains("ip_forward"));
     }
 
     #[test]

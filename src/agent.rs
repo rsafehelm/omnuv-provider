@@ -304,6 +304,13 @@ async fn reconcile_workers(
         };
         gateways.push(status);
     }
+    // Anything tagged as a gateway that Core did not just ask for, running or
+    // deleted, is left over from before and goes.
+    match driver.reap_stale_gateways(node, &desired.gateways).await {
+        Ok(0) => {}
+        Ok(n) => println!("reaped {n} stale gateway(s)"),
+        Err(e) => eprintln!("stale gateways: {e}"),
+    }
 
     let mut statuses = Vec::new();
     for spec in &desired.inference_workers {
