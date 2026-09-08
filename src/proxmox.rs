@@ -192,6 +192,28 @@ impl Client {
         self.send_form(reqwest::Method::PUT, path, form).await
     }
 
+    /// Writes a file inside a guest through the QEMU guest agent.
+    ///
+    /// Needs `VM.GuestAgent.FileWrite` on the VM. That is a root-level write
+    /// into a guest, so bootstrap grants it on the gateway pool only: the agent
+    /// can feed its own gateway's resolver and cannot touch a buyer VM or the
+    /// provider's own machines. Proxmox base64-encodes `content` itself; the
+    /// limit is 60 KiB.
+    pub(crate) async fn guest_file_write(
+        &self,
+        node: &str,
+        vmid: u32,
+        file: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        self.post_form::<Option<serde_json::Value>>(
+            &format!("/nodes/{node}/qemu/{vmid}/agent/file-write"),
+            &[("file".to_string(), file.to_string()), ("content".to_string(), content.to_string())],
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn send_form<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
@@ -428,6 +450,8 @@ impl Client {
         Ok(InventoryReport {
             protocol_version: omnu_protocol::PROTOCOL_VERSION,
             runtime: RuntimeKind::Proxmox,
+            // Filled in by the agent from its own image map before reporting.
+            images: Vec::new(),
             capabilities: ComputeCapabilities {
                 vm: true,
                 cloud_init: true,

@@ -72,13 +72,84 @@ fn cloud_init(spec: &GatewaySpec) -> String {
         .iter()
         .map(|k| format!("      - {k}\n"))
         .collect();
-    let routes = match spec.advertise_cidr.as_deref() {
-        Some(cidr) if advertisable(cidr).is_ok() => format!(
-            "  # Advertise this buyer's slice and nothing wider. Never a supernet,\n  \
-             # never a default route: either would pull the provider's own traffic\n  \
-             # onto the overlay.\n  - [ sh, -c, \"echo '{cidr}' > /etc/omnu/advertise\" ]\n"
+    // The gateway's own place on the marketplace bridge, and the forwarding
+    // that makes it a gateway rather than merely a machine with two interfaces.
+    //
+    // Which prefixes it carries is decided by the marketplace and configured on
+    // the overlay control plane, not here: the peer needs an address, a route
+    // into the bridge, and `ip_forward`. `advertise_cidr` is still checked
+    // before any of this is written, because the agent is the last place a
+    // forbidden prefix can be stopped before a route reaches a provider.
+    let routes = match (&spec.slice_address, spec.advertise_cidr.as_deref()) {
+        (Some(addr), Some(cidr)) if advertisable(cidr).is_ok() => format!(
+            r#"  # This interface is the provider's isolated marketplace bridge. This
+  # address is the next hop for every buyer machine here, and the bridge has no
+  # uplink, so nothing on it can reach the provider's own network. One block
+  # scalar, not flow entries: the MAC-resolution shell contains "$DEV", which
+  # would close a `[ sh, -c, "..." ]` string and break the whole cloud-config.
+  - |
+    {resolve}
+    ip link set dev $DEV up
+    ip addr replace {addr} dev $DEV
+    # Without forwarding the VM is not a gateway at all: buyer traffic arrives
+    # from the overlay and would be dropped instead of forwarded onto the bridge.
+    sysctl -w net.ipv4.ip_forward=1
+    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-omnu.conf
+    # NetBird puts overlay routes in table 7120, but its own ip rule for that
+    # table (pref 110) sits after the main table (pref 105, which only
+    # suppresses the default route). So the /24 this gateway holds on the bridge
+    # shadows the remote /32s and forwarded buyer traffic never reaches the
+    # overlay — it is redirected back onto the bridge and dropped. Consult the
+    # overlay table first for the whole marketplace pool: a remote machine's /32
+    # wins, a local address misses table 7120 and falls back to the on-link /24.
+    # Table 7120 is NetBird 0.78.1's default; del-then-add keeps it single per boot.
+    ip rule del to 10.200.0.0/13 lookup 7120 pref 100 2>/dev/null || true
+    ip rule add to 10.200.0.0/13 lookup 7120 pref 100
+    # The gateway forwards buyer traffic into the overlay and nowhere else. It
+    # has a default route out net0 onto the provider's LAN, so without this a
+    # buyer that routed the LAN through .1 would be forwarded there. Likewise
+    # the gateway itself answers the bridge only on its marketplace address.
+    # Idempotent, and runs before the overlay client adds its own rules.
+    iptables -C FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -I FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP
+    iptables -C INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -I INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP
+    # Declarative copy so systemd-networkd owns the interface across reboots.
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={addr}\nIPForward=yes\n' > /etc/systemd/network/10-omnu.network
+    systemctl enable systemd-networkd 2>/dev/null || true
+"#,
+            addr = addr,
+            mac = crate::instance::marketplace_mac(&spec.id),
+            resolve = crate::instance::resolve_dev(&crate::instance::marketplace_mac(&spec.id)),
         ),
         _ => String::new(),
+    };
+
+    // The project's private resolver. dnsmasq listens only on the slice
+    // address, is authoritative for `internal` and never forwards, and reads
+    // its records from a directory it watches — so the agent keeps the map
+    // current with a guest-agent file write and needs no exec privilege. The
+    // seed written here is the map at build time; the agent replaces it on
+    // every reconcile.
+    let dns = match &spec.slice_address {
+        Some(addr) => {
+            let ip = addr.split('/').next().unwrap_or(addr);
+            let seed: String = hosts_file(&spec.dns_records)
+                .lines()
+                .map(|l| format!("      {l}\n"))
+                .collect();
+            format!(
+                "  - path: /etc/dnsmasq.d/omnu.conf
+    content: |
+      bind-dynamic
+      listen-address={ip}
+      no-resolv
+      local=/internal/
+      hostsdir=/etc/omnu/hosts.d
+  - path: {DNS_HOSTS_PATH}
+    content: |
+{seed}"
+            )
+        }
+        None => String::new(),
     };
 
     format!(
@@ -98,30 +169,37 @@ users:
     lock_passwd: true
     ssh_authorized_keys:
 {keys}ssh_authorized_keys:
-{keys}package_update: true
-packages:
+{keys}packages:
   - qemu-guest-agent
-  - curl
-  - ca-certificates
+  - dnsmasq
 write_files:
   - path: /etc/omnu/gateway.env
     permissions: '0600'
     content: |
       OMNU_GATEWAY_ID={id}
       NB_MANAGEMENT_URL={mgmt}
-runcmd:
+{dns}# bootcmd runs in the init stage, before the config stage where apt runs. A
+# slow or absent apt must not delay the gateway's address, forwarding or the
+# overlay: they are configured here and depend on nothing installed later.
+bootcmd:
+  - [ sh, -c, \"systemctl enable --now qemu-guest-agent 2>/dev/null || true\" ]
+{routes}runcmd:
   - [ mkdir, -p, /etc/omnu ]
-  - [ systemctl, enable, --now, qemu-guest-agent ]
-  - bash -c 'curl -fsSL https://pkgs.netbird.io/install.sh | sh'
-  - [ systemctl, enable, --now, netbird ]
-  - bash -c 'netbird up --management-url {mgmt} --setup-key {key} --hostname omnu-gw-{short}'
-{routes}",
+  # runcmd is the final stage, after packages: both are installed by then.
+  - [ sh, -c, \"systemctl enable --now qemu-guest-agent || true\" ]
+  - [ sh, -c, \"systemctl enable --now dnsmasq || true\" ]
+  # Enrol against the marketplace control plane over the LAN. The curl install
+  # is time-bounded so it can never hang the boot.
+  - [ sh, -c, \"command -v netbird >/dev/null || timeout 60 bash -c 'curl -fsSL https://pkgs.netbird.io/install.sh | sh' || true\" ]
+  - [ sh, -c, \"systemctl enable --now netbird || true\" ]
+  - [ sh, -c, \"netbird up --management-url {mgmt} --setup-key {key} --hostname omnu-gw-{short}\" ]",
         keys = if keys.is_empty() { "      []\n".to_string() } else { keys },
         id = spec.id,
         mgmt = spec.management_url,
         key = spec.setup_key,
         short = &spec.id[..spec.id.len().min(8)],
         routes = routes,
+        dns = dns,
     )
 }
 
@@ -178,6 +256,18 @@ impl proxmox::Client {
             }
 
             let addr = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+
+            // Keep the resolver's map current. dnsmasq watches the directory,
+            // so replacing the file is the whole update; the write is idempotent
+            // and cheap, and needs only the pool-scoped file-write privilege.
+            if addr.is_some()
+                && let Err(e) = self
+                    .guest_file_write(node, vm.vmid, DNS_HOSTS_PATH, &hosts_file(&spec.dns_records))
+                    .await
+            {
+                eprintln!("gateway {}: private DNS map not written: {e}", spec.id);
+            }
+
             return Ok(GatewayStatus {
                 id: spec.id.clone(),
                 // READY means the guest is answering, not merely that a VM
@@ -216,6 +306,9 @@ impl proxmox::Client {
                     ("name".to_string(), format!("omnu-gw-{tag}")),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
+                    // Into the pool that carries the file-write grant; a
+                    // gateway is the only kind of VM that ever goes there.
+                    ("pool".to_string(), GATEWAY_POOL.to_string()),
                 ],
             )
             .await?;
@@ -236,7 +329,11 @@ impl proxmox::Client {
                 // sees both, which is the entire point of it.
                 (
                     "net1".to_string(),
-                    format!("virtio,bridge={}", crate::instance::MARKETPLACE_BRIDGE),
+                    format!(
+                        "virtio={},bridge={}",
+                        crate::instance::marketplace_mac(&spec.id),
+                        crate::instance::MARKETPLACE_BRIDGE
+                    ),
                 ),
                 ("cicustom".to_string(), format!("user=omnu-snippets:snippets/{file}")),
                 ("tags".to_string(), format!("{TAG};{tag}")),
@@ -296,6 +393,30 @@ impl proxmox::Client {
     }
 }
 
+/// The Proxmox pool gateways are cloned into. Bootstrap grants
+/// `VM.GuestAgent.FileWrite` on this pool and nowhere else, so the agent can
+/// write the resolver's map into its own gateway and into nothing else on the
+/// host — not a buyer VM, not the provider's own machines.
+pub(crate) const GATEWAY_POOL: &str = "omnu";
+
+/// Where the gateway's resolver reads the project's names. dnsmasq watches
+/// the directory (`hostsdir`), so replacing this file is the whole update.
+const DNS_HOSTS_PATH: &str = "/etc/omnu/hosts.d/project";
+
+/// The resolver's hosts file: one `address name` line per record, sorted so
+/// the same map always produces the same bytes.
+fn hosts_file(records: &[omnu_protocol::DnsRecord]) -> String {
+    let mut lines: Vec<String> =
+        records.iter().map(|r| format!("{} {}", r.address, r.name)).collect();
+    lines.sort();
+    let mut out = String::from("# Managed by omnu-provider; the marketplace owns these names.\n");
+    for l in lines {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
+}
+
 /// A tag Proxmox accepts: lowercase alphanumerics only, and short enough to
 /// read in the UI.
 fn short_tag(id: &str) -> String {
@@ -340,10 +461,16 @@ mod tests {
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
             setup_key: "K".into(),
+            slice_address: Some("10.200.7.1/24".into()),
             advertise_cidr: Some("0.0.0.0/0".into()),
             ssh_keys: vec![],
+            dns_records: vec![],
         };
-        assert!(!cloud_init(&spec).contains("0.0.0.0/0"));
+        // A refused advertise_cidr renders no routes block at all, so the
+        // gateway is never built to forward for that slice.
+        let ci = cloud_init(&spec);
+        assert!(!ci.contains("0.0.0.0/0"));
+        assert!(!ci.contains("ip_forward"));
     }
 
     #[test]
@@ -353,13 +480,37 @@ mod tests {
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
             setup_key: "K".into(),
+            slice_address: Some("10.200.7.1/24".into()),
             advertise_cidr: Some("10.200.7.0/24".into()),
             ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
+            dns_records: vec![omnu_protocol::DnsRecord {
+                name: "gpu-2.internal".into(),
+                address: "10.200.7.11".into(),
+            }],
         };
         let ci = cloud_init(&spec);
-        assert!(ci.contains("10.200.7.0/24"));
+        // The resolver listens on the slice address only, is authoritative for
+        // `internal`, reads a watched directory, and is seeded with the map.
+        assert!(ci.contains("listen-address=10.200.7.1\n"));
+        assert!(ci.contains("hostsdir=/etc/omnu/hosts.d"));
+        assert!(ci.contains("10.200.7.11 gpu-2.internal"));
+        // The gateway must never be a path from the bridge to the provider's
+        // LAN: forwarding and the gateway's own services are pool-only.
+        assert!(ci.contains("iptables -I FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP"));
+        assert!(ci.contains("iptables -I INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP"));
+        // The slice address and forwarding land in bootcmd, before the config
+        // stage where apt (which needs internet this VM may not have) runs.
+        assert!(ci.contains("10.200.7.1/24"));
+        assert!(ci.contains("net.ipv4.ip_forward=1"));
+        assert!(ci.contains("bootcmd:"));
         assert!(ci.contains("netbird up"));
         assert!(ci.contains("ssh-ed25519 AAAA test"));
+        // Must parse: the slice-address shell uses `[ -n "$DEV" ]`, which only
+        // survives inside a block scalar. As a flow scalar it broke the config.
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&ci).expect("gateway cloud-init must be valid YAML");
+        assert!(doc.get("bootcmd").is_some_and(|b| b.is_sequence()));
+        assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
     }
 
     #[test]

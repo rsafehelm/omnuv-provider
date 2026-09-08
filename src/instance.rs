@@ -5,7 +5,7 @@
 //! state survives an agent restart, and nothing the marketplace did not create
 //! is ever touched.
 
-use omnu_protocol::{InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment};
+use omnu_protocol::{FirstBoot, InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment};
 
 use crate::audit;
 use crate::proxmox::Client;
@@ -20,6 +20,47 @@ const NO_FORM: &[(String, String)] = &[];
 /// never by the agent: it is host network configuration, and the agent's token
 /// holds SDN.Use and deliberately not SDN.Allocate.
 pub(crate) const MARKETPLACE_BRIDGE: &str = "omnu0";
+
+/// The NAT bridge a buyer machine's internet interface attaches to. Also
+/// bootstrap's: the host hands out addresses, masquerades outbound traffic and
+/// refuses everything else — a buyer VM never appears on the provider's own
+/// LAN and cannot reach the host, other providers' machines or, with port
+/// isolation, another tenant's VM on the same bridge. Gateways and inference
+/// workers are marketplace-owned and stay on the provider's bridge.
+pub(crate) const EGRESS_BRIDGE: &str = "omnunat0";
+
+/// A stable, locally-administered MAC for a machine's marketplace interface.
+///
+/// The interface cannot be found by name: the distro picks that (`ens19`,
+/// `enp6s19`, …) and it differs by image and by slot. Deriving the address from
+/// the machine's own id gives cloud-init something deterministic to match on,
+/// and keeps it stable across a rebuild.
+pub(crate) fn marketplace_mac(id: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    // 02: locally administered, unicast.
+    format!(
+        "02:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        (h >> 32) as u8, (h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, h as u8
+    )
+}
+
+/// Shell that resolves the marketplace interface by MAC and exports `$DEV`.
+///
+/// One line, and the caller must place it inside a YAML **block** scalar (`- |`),
+/// never a `[ sh, -c, "..." ]` flow scalar: the `"$DEV"` test would close the
+/// flow string early and cloud-init would reject the whole config.
+pub(crate) fn resolve_dev(mac: &str) -> String {
+    format!(
+        r#"DEV=$(ip -o link | awk -F'[ :]+' '/{mac_lower}/ {{print $2; exit}}'); [ -n "$DEV" ] || DEV=$(ip -o link | awk -F'[ :]+' '/{mac_upper}/ {{print $2; exit}}')"#,
+        mac_lower = mac.to_lowercase(),
+        mac_upper = mac,
+    )
+}
+
 
 fn short_tag(id: &str) -> String {
     format!("omnu-{}", id.replace('-', "").chars().take(12).collect::<String>())
@@ -51,24 +92,65 @@ manage_etc_hosts: true
 users:
   # `default` keeps the image's own user (ubuntu), which most tooling assumes.
   - default
-  - name: omnu
+  - name: {user}
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
-    lock_passwd: true
+    lock_passwd: {lock}
     ssh_authorized_keys:
 {nested}
 # Applies to the default user.
 ssh_authorized_keys:
 {top}
-packages:
+{password}packages:
   - qemu-guest-agent
+# The marketplace network is configured in bootcmd, which cloud-init runs in
+# the init stage on EVERY boot — before the config stage where apt runs, and
+# unlike runcmd, which runs only once. A slow first-boot apt used to leave the
+# private network unconfigured forever; here it comes up regardless.
+bootcmd:
+  - [ sh, -c, "systemctl enable --now qemu-guest-agent 2>/dev/null || true" ]
+{network}
+# runcmd is the final stage, after packages: the agent is installed by then.
+# Networking already ran in bootcmd, so a slow apt here delays nothing.
 runcmd:
-  - [ systemctl, enable, --now, qemu-guest-agent ]
-{network}"#,
+  - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
+{network_final}"#,
         name = spec.name,
+        user = spec.image.default_user,
+        // A password is only usable when the account is not locked; without
+        // one, the account stays key-only as before.
+        lock = if spec.console_password_hash.is_some() { "false" } else { "true" },
+        // The console password, as its crypt(3) hash: the plaintext was shown
+        // to the buyer once and is not in this file. SSH stays key-only.
+        password = spec
+            .console_password_hash
+            .as_deref()
+            .map(|hash| {
+                format!(
+                    "chpasswd:\n  expire: false\n  users:\n    - name: {}\n      password: \"{hash}\"\n      type: hash\nssh_pwauth: false\n",
+                    spec.image.default_user
+                )
+            })
+            .unwrap_or_default(),
         nested = render("      "),
         top = render("  "),
         network = spec.network.as_ref().map(private_network).unwrap_or_default(),
+        // Binds the marketplace NIC to our networkd file on first boot. By the
+        // time this link appeared, networkd had already bound it to the
+        // image's catch-all (dracut's DHCP-everything); a new file is only
+        // seen after `reload`, and a bound link is only re-matched by
+        // `reconfigure`. Both are D-Bus calls, which is why this cannot live
+        // in bootcmd. First boot only: later boots bind the file directly.
+        network_final = spec
+            .network
+            .as_ref()
+            .map(|n| {
+                format!(
+                    "  - |\n    {}\n    systemctl enable systemd-networkd 2>/dev/null || true\n    networkctl reload\n    networkctl reconfigure $DEV\n",
+                    resolve_dev(&n.mac)
+                )
+            })
+            .unwrap_or_default(),
     )
 }
 
@@ -81,28 +163,44 @@ runcmd:
 /// anything in the project that is not local is routed — which is what makes a
 /// private network span providers at all.
 fn private_network(net: &NetworkAttachment) -> String {
-    let hosts = match &net.dns_name {
-        Some(dns) => format!(
-            "write_files:\n  - path: /etc/hosts.omnu\n    content: |\n      {} {}\n",
-            net.address, dns
-        ),
-        None => String::new(),
-    };
+    // One YAML block scalar (`- |`), not `[ sh, -c, "..." ]` flow entries: the
+    // MAC-resolution shell needs both single quotes (awk) and double quotes
+    // (`[ -n "$DEV" ]`), and a double quote inside a flow scalar closes it and
+    // makes cloud-init reject the entire config. A literal block is verbatim.
     format!(
-        r#"  # The buyer's private network. eth1 is on the provider's isolated
-  # marketplace bridge, which has no uplink: this machine has no path to the
-  # provider's own network at all.
-  - [ sh, -c, "ip link set dev eth1 up || true" ]
-  - [ sh, -c, "ip addr add {address}/32 dev eth1 || true" ]
-  # On-link to the gateway first, then everything else in the project through
-  # it. Without the first route the second has no reachable next hop.
-  - [ sh, -c, "ip route add {gateway} dev eth1 scope link || true" ]
-  - [ sh, -c, "ip route add {cidr} via {gateway} dev eth1 || true" ]
-{hosts}"#,
+        r#"  # The buyer's private network. This interface is on the provider's
+  # isolated marketplace bridge, which has no uplink: this machine has no path
+  # to the provider's own network at all.
+  - |
+    {resolve}
+    ip link set dev $DEV up
+    ip addr replace {address}/32 dev $DEV
+    # On-link to the gateway first, then everything else in the project through
+    # it. Without the first route the second has no reachable next hop.
+    ip route replace {gateway} dev $DEV scope link
+    ip route replace {cidr} via {gateway} dev $DEV
+    # The declarative copy, which is also how the project's private names get
+    # resolved: DNS= points this link at the gateway and Domains=~internal is a
+    # routing-only domain, so only `.internal` goes there and every other
+    # lookup stays on the image's own resolver. Placement is invisible without
+    # touching the machine's internet resolution.
+    #
+    # GatewayOnLink is required: the gateway is outside the /32, and without
+    # it networkd rejects the route, leaves the link "configuring" forever and
+    # never hands the DNS server to resolved — names silently stop resolving.
+    #
+    # Only written here, not applied: bootcmd runs before D-Bus is up, so
+    # networkctl and resolvectl cannot act yet (they fail silently). runcmd
+    # applies it on first boot; on every later boot networkd binds the file
+    # itself, and its name sorts before the image's catch-all and any netplan
+    # file so it always wins the match.
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/32\nDNS={gateway}\nDomains=~internal\n\n[Route]\nDestination={gateway}/32\nScope=link\n\n[Route]\nDestination={cidr}\nGateway={gateway}\nGatewayOnLink=yes\n' > /etc/systemd/network/05-omnu.network
+"#,
         address = net.address,
         gateway = net.gateway,
         cidr = net.cidr,
-        hosts = hosts,
+        mac = net.mac,
+        resolve = resolve_dev(&net.mac),
     )
 }
 
@@ -153,17 +251,28 @@ impl Client {
                 }
             }
 
-            let ip = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+            // The guest agent answering (any IPv4) is the liveness signal. But
+            // the buyer-visible address is the *marketplace* one Core assigned,
+            // not whatever the guest reports on its provider-local NIC — that
+            // would leak the provider's network and show the wrong IP. Fall back
+            // to the guest address only when the instance has no project network.
+            let guest_ip = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+            let private_ip = spec
+                .network
+                .as_ref()
+                .map(|n| n.address.clone())
+                .filter(|_| guest_ip.is_some())
+                .or_else(|| guest_ip.clone());
             return Ok(InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token,
-                state: match (running, ip.is_some()) {
+                state: match (running, guest_ip.is_some()) {
                     (true, true) => InstanceState::Running,
                     (true, false) => InstanceState::Provisioning,
                     (false, _) => InstanceState::Stopped,
                 },
                 local_id: Some(vm.vmid.to_string()),
-                private_ip: ip,
+                private_ip,
                 message: None,
             });
         }
@@ -179,8 +288,18 @@ impl Client {
             });
         }
 
+        // The image decides how first boot is rendered. Only cloud-init is
+        // implemented; a Cloudbase-Init image is refused here with the reason
+        // reported, never built wrong. Adding Windows is this one arm.
+        let user_data = match spec.image.first_boot {
+            FirstBoot::CloudInit => cloud_init(spec),
+            FirstBoot::CloudbaseInit => anyhow::bail!(
+                "image {}: Cloudbase-Init first boot is not implemented in this agent version",
+                spec.image.id
+            ),
+        };
         let file = format!("omnu-instance-{}.yaml", spec.id);
-        std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec))
+        std::fs::write(format!("{snippet_dir}/{file}"), user_data)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
@@ -213,11 +332,18 @@ impl Client {
             ),
         ];
         let mut config = config;
+        // The template's net0 sits on the provider's own bridge. A buyer
+        // machine's goes on the NAT bridge instead: outbound internet, no
+        // presence on the provider's LAN. Proxmox picks the MAC and its IPAM
+        // hands the machine an address on that bridge.
+        config.push(("net0".to_string(), format!("virtio,bridge={EGRESS_BRIDGE}")));
         // A second interface on the marketplace's isolated bridge, when the
-        // buyer's project has a network. `net0` stays on the provider's own
-        // bridge for outbound internet; nothing routes between them.
+        // buyer's project has a network. Nothing routes between the two.
         if spec.network.is_some() {
-            config.push((format!("net1"), format!("virtio,bridge={MARKETPLACE_BRIDGE}")));
+            config.push((
+                "net1".to_string(),
+                format!("virtio={},bridge={MARKETPLACE_BRIDGE}", marketplace_mac(&spec.id)),
+            ));
         }
         self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
 
@@ -256,5 +382,102 @@ impl Client {
         self.wait_task(node, &upid).await?;
         audit::record("instance.delete", "core", id, "ok", Some(&vm.vmid.to_string()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_with_network() -> InstanceSpec {
+        InstanceSpec {
+            id: "abcdef12-0000-0000-0000-000000000000".into(),
+            lifecycle: Lifecycle::Running,
+            name: "gpu-1".into(),
+            image: omnu_protocol::ImageSpec::default(),
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 40,
+            ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
+            console_password_hash: Some("$6$rounds=10000$saltsaltsaltsalt$hashhashhashhash".into()),
+            gpu_local_ids: vec![],
+            reboot_token: None,
+            network: Some(NetworkAttachment {
+                address: "10.200.99.10".into(),
+                cidr: "10.200.99.0/24".into(),
+                gateway: "10.200.99.1".into(),
+                dns_name: Some("gpu-1.internal".into()),
+                mac: "02:09:a4:76:f8:ee".into(),
+            }),
+        }
+    }
+
+    /// The bug this whole fix exists for: the marketplace address must be set in
+    /// bootcmd (every boot, before the config stage where apt runs), never only
+    /// in runcmd (first boot only, after a slow apt that may not have finished).
+    #[test]
+    fn marketplace_network_is_in_bootcmd_before_runcmd() {
+        let ci = cloud_init(&spec_with_network());
+        let boot = ci.find("bootcmd:").expect("has bootcmd");
+        let run = ci.find("runcmd:").expect("has runcmd");
+        let addr = ci.find("10.200.99.10/32").expect("configures the /32");
+        assert!(boot < addr, "address must be under bootcmd");
+        assert!(addr < run, "address must come before runcmd, not inside it");
+        // The agent is still installed and started so Core can read the IP back.
+        assert!(ci.contains("qemu-guest-agent"));
+        // The image's user gets the console password as a hash, the account is
+        // unlocked for it, and SSH stays key-only.
+        assert!(ci.contains("- name: omnu\n    sudo:"));
+        assert!(ci.contains("lock_passwd: false"));
+        assert!(ci.contains("password: \"$6$rounds=10000$"));
+        assert!(ci.contains("type: hash"));
+        assert!(ci.contains("ssh_pwauth: false"));
+        // Private names resolve at the gateway, scoped to `.internal` only, so
+        // the machine's ordinary resolution is untouched.
+        assert!(ci.contains("DNS=10.200.99.1\\nDomains=~internal"));
+        // Without this networkd never finishes the link and DNS never lands.
+        assert!(ci.contains("Gateway=10.200.99.1\\nGatewayOnLink=yes"));
+        // Our file must sort first, and the first-boot rebind (reload, then
+        // reconfigure — D-Bus calls) must be in runcmd, never in bootcmd
+        // where D-Bus is not up yet and they fail silently.
+        assert!(ci.contains("05-omnu.network"));
+        let reload = ci.find("networkctl reload").expect("reloads");
+        let reconf = ci.find("networkctl reconfigure $DEV").expect("reconfigures");
+        assert!(run < reload && reload < reconf, "rebind lives in runcmd, reload before reconfigure");
+        let bootcmd = &ci[boot..run];
+        assert!(!bootcmd.contains("networkctl reload"), "no reload in bootcmd: D-Bus is not up");
+        assert!(!bootcmd.contains("networkctl reconfigure"), "no reconfigure in bootcmd");
+        assert!(!ci.contains("resolvectl dns"), "DNS comes from the networkd file, not resolvectl");
+    }
+
+    /// The bug that shipped once and cost a full validation cycle: the
+    /// MAC-resolution shell contains `[ -n "$DEV" ]`, and a double quote inside
+    /// a `[ sh, -c, "..." ]` flow scalar closes the YAML string, so cloud-init
+    /// silently rejected the *entire* config — no networking, no agent. A
+    /// `contains()` check cannot see that; parsing as YAML can.
+    #[test]
+    fn cloud_init_is_valid_yaml() {
+        let ci = cloud_init(&spec_with_network());
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&ci).expect("cloud-init must be valid YAML");
+        let boot = doc.get("bootcmd").expect("has bootcmd");
+        assert!(boot.is_sequence(), "bootcmd is a list");
+        // The network setup is one block-scalar string entry that mentions the
+        // address and the "$DEV" test that broke the flow form.
+        let joined = serde_yaml_ng::to_string(boot).unwrap();
+        assert!(joined.contains("10.200.99.10/32"));
+        assert!(joined.contains("$DEV"));
+    }
+
+    /// A project without a private network must still produce valid cloud-init:
+    /// bootcmd is never left empty (which cloud-init reads as null).
+    #[test]
+    fn no_network_still_has_a_bootcmd_body() {
+        let mut spec = spec_with_network();
+        spec.network = None;
+        let ci = cloud_init(&spec);
+        let boot = ci.find("bootcmd:").expect("has bootcmd");
+        let after = &ci[boot + "bootcmd:".len()..];
+        assert!(after.trim_start().starts_with("- ["), "bootcmd has at least one item");
     }
 }

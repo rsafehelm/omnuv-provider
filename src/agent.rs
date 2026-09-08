@@ -164,7 +164,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 }
             }
             _ = inventory.tick() => {
-                if let Err(e) = report_inventory(&core, &driver).await {
+                if let Err(e) = report_inventory(&core, &driver, cfg.proxmox.offered_images()).await {
                     // Never exit on a transient failure: the agent is a daemon,
                     // and a provider that gives up looks identical to one that
                     // died. Missed heartbeats already mark it offline.
@@ -212,8 +212,11 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
     }
 }
 
-async fn report_inventory(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<()> {
-    let report = driver.inventory().await?;
+async fn report_inventory(core: &Core, driver: &impl ComputeDriver, offered_images: Vec<String>) -> anyhow::Result<()> {
+    let mut report = driver.inventory().await?;
+    // Which marketplace images this provider can build — ids only; the
+    // templates behind them are this provider's own configuration.
+    report.images = offered_images;
     let res = core.post("/provider/v1/inventory", Some(serde_json::to_value(&report)?)).await?;
     if !res.status().is_success() {
         anyhow::bail!("core rejected inventory: {}", res.status());
@@ -372,11 +375,15 @@ async fn reconcile_workers(
                 private_ip: None,
                 message: Some("deleted".into()),
             }),
-            _ => {
-                driver
-                    .ensure_instance(node, cfg.proxmox.template_vmid, storage, &cfg.proxmox.snippet_dir, spec)
-                    .await
-            }
+            // The image names a template this provider must have. Refusing
+            // here, with the reason reported, is what keeps the scheduler's
+            // provider_images honest: Core only places images we said we offer.
+            _ => match cfg.proxmox.template_for(&spec.image.id) {
+                Some(template) => {
+                    driver.ensure_instance(node, template, storage, &cfg.proxmox.snippet_dir, spec).await
+                }
+                None => Err(anyhow::anyhow!("image {} is not offered by this provider", spec.image.id)),
+            },
         };
         instances.push(result.unwrap_or_else(|e| {
             eprintln!("instance {}: {e}", spec.id);

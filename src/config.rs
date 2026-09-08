@@ -162,9 +162,17 @@ pub struct ProxmoxRuntime {
     pub tls_fingerprint_sha256: Option<String>,
     pub token_id: String,
     pub token_secret: String,
-    /// Template cloned for marketplace VMs.
+    /// Template cloned for marketplace-managed VMs (inference workers, the
+    /// overlay gateway), and for the shipped Linux image when `images` is not
+    /// set.
     #[serde(default = "default_template_vmid")]
     pub template_vmid: u32,
+    /// Marketplace image id → the local template that builds it. This is the
+    /// one place a provider's template ids live; the marketplace only ever
+    /// learns which image ids are offered. A Windows image is an entry here
+    /// and a licensed template, nothing more.
+    #[serde(default)]
+    pub images: std::collections::BTreeMap<String, u32>,
     /// Where the agent writes cloud-init user-data. Must be a Proxmox storage
     /// with `snippets` content, owned by the agent's user.
     #[serde(default = "default_snippet_dir")]
@@ -180,6 +188,30 @@ pub struct ProxmoxRuntime {
 
 fn default_template_vmid() -> u32 {
     9000
+}
+
+/// The image the marketplace shipped with; offered from `template_vmid` when
+/// an operator has not written an `images` map.
+pub const DEFAULT_IMAGE: &str = "ubuntu-26.04";
+
+impl ProxmoxRuntime {
+    /// The local template that builds a marketplace image, if this provider
+    /// offers it.
+    pub fn template_for(&self, image: &str) -> Option<u32> {
+        if self.images.is_empty() {
+            return (image == DEFAULT_IMAGE).then_some(self.template_vmid);
+        }
+        self.images.get(image).copied()
+    }
+
+    /// Image ids reported with the inventory, so the scheduler never places
+    /// an image on a provider that cannot build it.
+    pub fn offered_images(&self) -> Vec<String> {
+        if self.images.is_empty() {
+            return vec![DEFAULT_IMAGE.to_string()];
+        }
+        self.images.keys().cloned().collect()
+    }
 }
 
 fn default_snippet_dir() -> String {
