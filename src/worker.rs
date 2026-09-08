@@ -27,7 +27,7 @@ pub(crate) struct VmRef {
     pub(crate) status: Option<String>,
 }
 
-fn mapping_name(pci: &str) -> String {
+pub(crate) fn mapping_name(pci: &str) -> String {
     format!("omnu-gpu-{}", pci.replace([':', '.'], "-"))
 }
 

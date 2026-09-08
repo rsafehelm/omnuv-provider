@@ -340,6 +340,16 @@ impl Client {
             ),
         ];
         let mut config = config;
+        // The GPUs the marketplace allocated, by the host's published
+        // mappings: a non-root token may only attach a device the host has
+        // explicitly offered. The template is already q35/UEFI, which PCIe
+        // passthrough needs.
+        for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
+            config.push((
+                format!("hostpci{i}"),
+                format!("mapping={},pcie=1", crate::worker::mapping_name(pci)),
+            ));
+        }
         // The template's net0 sits on the provider's own bridge. A buyer
         // machine's goes on the NAT bridge instead: outbound internet, no
         // presence on the provider's LAN. Proxmox picks the MAC and its IPAM
