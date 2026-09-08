@@ -6,6 +6,7 @@ mod instance;
 mod join;
 mod driver;
 mod proxmox;
+mod sdn;
 mod tls;
 mod tunnel;
 mod console;

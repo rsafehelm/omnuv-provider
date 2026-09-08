@@ -21,10 +21,13 @@ pub(crate) const BUYER_POOL: &str = "omnu-buyers";
 
 const NO_FORM: &[(String, String)] = &[];
 
-/// The isolated bridge buyer machines attach to. Created at provider bootstrap,
-/// never by the agent: it is host network configuration, and the agent's token
-/// holds SDN.Use and deliberately not SDN.Allocate.
-pub(crate) const MARKETPLACE_BRIDGE: &str = "omnu0";
+/// The isolated bridge a buyer machine attaches to: its own network's segment
+/// on this provider, one vnet per network in the marketplace zone (see `sdn`).
+/// The network's gateway creates it and is the only other thing on it, so a
+/// machine of another tenant is never on the same wire.
+pub(crate) fn marketplace_bridge(net: &NetworkAttachment) -> String {
+    crate::sdn::vnet_for(&net.network_id)
+}
 
 /// The NAT bridge a buyer machine's internet interface attaches to. Also
 /// bootstrap's: the host hands out addresses, masquerades outbound traffic and
@@ -209,9 +212,9 @@ runcmd:
 /// Configures the machine's place on the buyer's private network.
 ///
 /// The address is a **/32**, not the project prefix. Each provider has its own
-/// isolated bridge, so two machines on the same project network but different
-/// providers are not on the same segment: giving them a /24 would have them ARP
-/// for each other and fail. With a /32 plus an on-link route to the gateway,
+/// isolated segment per network, so two machines on the same project network
+/// but different providers are not on the same wire: giving them a /24 would
+/// have them ARP for each other and fail. With a /32 plus an on-link route to the gateway,
 /// anything in the project that is not local is routed — which is what makes a
 /// private network span providers at all.
 fn private_network(net: &NetworkAttachment) -> String {
@@ -257,6 +260,25 @@ fn private_network(net: &NetworkAttachment) -> String {
 }
 
 impl Client {
+    /// Moves the machine's marketplace interface onto its network's segment
+    /// if it is anywhere else. Its address never changes; the segment is
+    /// where the network's gateway is.
+    async fn ensure_segment(&self, node: &str, vmid: u32, net: &NetworkAttachment) -> anyhow::Result<()> {
+        let bridge = marketplace_bridge(net);
+        let cfg: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await?;
+        let current = cfg.get("net1").and_then(|v| v.as_str()).unwrap_or_default();
+        if current.split(',').any(|kv| kv == format!("bridge={bridge}")) {
+            return Ok(());
+        }
+        self.post_form::<serde_json::Value>(
+            &format!("/nodes/{node}/qemu/{vmid}/config"),
+            &[("net1".to_string(), format!("virtio={},bridge={bridge}", net.mac))],
+        )
+        .await?;
+        audit::record("instance.segment", "core", &vmid.to_string(), "ok", Some(&bridge));
+        Ok(())
+    }
+
     pub async fn ensure_instance(
         &self,
         node: &str,
@@ -267,6 +289,16 @@ impl Client {
     ) -> anyhow::Result<InstanceStatus> {
         if let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(&spec.id)).await? {
             let mut running = vm.status.as_deref() == Some("running");
+
+            // The machine's place on its network's segment. A machine built
+            // before the segment existed sits on another bridge; Proxmox
+            // re-plugs a running machine's interface live, and the guest's
+            // own configuration does not change.
+            if let Some(net) = &spec.network
+                && spec.lifecycle != Lifecycle::Deleted
+            {
+                self.ensure_segment(node, vm.vmid, net).await?;
+            }
 
             // Converge toward the requested lifecycle rather than merely
             // reporting what is there.
@@ -407,12 +439,12 @@ impl Client {
         // presence on the provider's LAN. Proxmox picks the MAC and its IPAM
         // hands the machine an address on that bridge.
         config.push(("net0".to_string(), format!("virtio,bridge={EGRESS_BRIDGE}")));
-        // A second interface on the marketplace's isolated bridge, when the
+        // A second interface on the network's own isolated segment, when the
         // buyer's project has a network. Nothing routes between the two.
-        if spec.network.is_some() {
+        if let Some(net) = &spec.network {
             config.push((
                 "net1".to_string(),
-                format!("virtio={},bridge={MARKETPLACE_BRIDGE}", marketplace_mac(&spec.id)),
+                format!("virtio={},bridge={}", marketplace_mac(&spec.id), marketplace_bridge(net)),
             ));
         }
         self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
@@ -516,6 +548,7 @@ mod tests {
             gpu_local_ids: vec![],
             reboot_token: None,
             network: Some(NetworkAttachment {
+                network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
                 address: "10.200.99.10".into(),
                 cidr: "10.200.99.0/24".into(),
                 gateway: "10.200.99.1".into(),

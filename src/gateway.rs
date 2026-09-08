@@ -14,6 +14,13 @@
 //! networking is never touched, and a gateway that misconfigures its routes can
 //! only hurt its own namespace.
 //!
+//! # One per buyer network
+//!
+//! A gateway serves one network: it sits on that network's own segment here
+//! (see `sdn`), holds that network's key, and answers that network's names.
+//! The agent creates the segment before the first gateway on it and removes
+//! it with the last, so a tenant's machines never share a wire with another's.
+//!
 //! # What it carries
 //!
 //! Buyer traffic, and nothing else. The agent reaches Core over TLS on the
@@ -172,9 +179,9 @@ fn cloud_init(spec: &GatewaySpec) -> String {
         "#cloud-config
 # Omnu marketplace overlay gateway. Managed by omnu-provider; do not edit.
 #
-# This VM is the only overlay peer on this provider. The hypervisor never runs
-# the overlay client, because a WireGuard interface writing routes there could
-# take the host and every guest on it off the network.
+# This VM is one buyer network's overlay peer on this provider. The hypervisor
+# never runs the overlay client, because a WireGuard interface writing routes
+# there could take the host and every guest on it off the network.
 hostname: omnu-gw-{short}
 manage_etc_hosts: true
 users:
@@ -312,6 +319,11 @@ impl proxmox::Client {
             });
         }
 
+        // The network's own segment on this provider, before anything sits
+        // on it. Idempotent, so a gateway rebuilt after a crash finds it.
+        let bridge = crate::sdn::vnet_for(&spec.network_id);
+        self.ensure_vnet(node, &bridge).await?;
+
         let file = format!("omnu-gw-{tag}.yaml");
         std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec))
             .map_err(|e| anyhow::anyhow!("writing the gateway's cloud-init: {e}"))?;
@@ -343,16 +355,12 @@ impl proxmox::Client {
                 ("agent".to_string(), "enabled=1".into()),
                 ("ipconfig0".to_string(), "ip=dhcp".into()),
                 // net0 reaches the overlay control plane over the provider's
-                // own network; net1 is the isolated marketplace bridge the
-                // buyer's machines live on. The gateway is the only thing that
-                // sees both, which is the entire point of it.
+                // own network; net1 is the network's isolated segment, where
+                // its machines live. The gateway is the only thing that sees
+                // both, which is the entire point of it.
                 (
                     "net1".to_string(),
-                    format!(
-                        "virtio={},bridge={}",
-                        crate::instance::marketplace_mac(&spec.id),
-                        crate::instance::MARKETPLACE_BRIDGE
-                    ),
+                    format!("virtio={},bridge={bridge}", crate::instance::marketplace_mac(&spec.id)),
                 ),
                 ("cicustom".to_string(), format!("user=omnu-snippets:snippets/{file}")),
                 ("tags".to_string(), format!("{TAG};{tag}")),
@@ -368,8 +376,8 @@ impl proxmox::Client {
                 (
                     "description".into(),
                     format!(
-                        "Omnu overlay gateway {}\nThe only overlay peer on this provider; the \
-                         host never runs it.\nManaged by omnu-provider. Do not edit.",
+                        "Omnu overlay gateway {}\nOne buyer network's overlay peer on this \
+                         provider; the host never runs it.\nManaged by omnu-provider. Do not edit.",
                         spec.id
                     ),
                 ),
@@ -392,23 +400,23 @@ impl proxmox::Client {
         })
     }
 
-    /// Destroys the gateway. Rebuilding is this plus the next reconcile pass —
-    /// there is no separate repair path, because a gateway holds no state worth
-    /// keeping.
-    pub async fn delete_gateway(&self, node: &str, gateway_id: &str) -> anyhow::Result<()> {
-        let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(gateway_id)).await? else {
-            return Ok(());
-        };
-        if vm.status.as_deref() == Some("running") {
-            let upid: String = self
-                .post_form(&format!("/nodes/{node}/qemu/{}/status/stop", vm.vmid), NO_FORM)
-                .await?;
+    /// Destroys the gateway, and with it the network's segment here: Core asks
+    /// for this only once the network has no machine left on this provider.
+    /// Rebuilding is this plus the next reconcile pass — there is no separate
+    /// repair path, because a gateway holds no state worth keeping.
+    pub async fn delete_gateway(&self, node: &str, gateway_id: &str, network_id: &str) -> anyhow::Result<()> {
+        if let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(gateway_id)).await? {
+            if vm.status.as_deref() == Some("running") {
+                let upid: String = self
+                    .post_form(&format!("/nodes/{node}/qemu/{}/status/stop", vm.vmid), NO_FORM)
+                    .await?;
+                self.wait_task(node, &upid).await?;
+            }
+            let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
             self.wait_task(node, &upid).await?;
+            audit::record("gateway.delete", "core", gateway_id, "ok", Some(&vm.vmid.to_string()));
         }
-        let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
-        self.wait_task(node, &upid).await?;
-        audit::record("gateway.delete", "core", gateway_id, "ok", Some(&vm.vmid.to_string()));
-        Ok(())
+        self.delete_vnet(node, &crate::sdn::vnet_for(network_id)).await
     }
 }
 
@@ -477,6 +485,7 @@ mod tests {
     fn a_refused_slice_is_not_written_into_cloud_init() {
         let spec = GatewaySpec {
             id: "abcdef12".into(),
+            network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
             setup_key: "K".into(),
@@ -496,6 +505,7 @@ mod tests {
     fn a_slice_that_is_allowed_is_written() {
         let spec = GatewaySpec {
             id: "abcdef12".into(),
+            network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
             setup_key: "K".into(),

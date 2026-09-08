@@ -244,7 +244,8 @@ impl Client {
         Ok(res.json::<Envelope<T>>().await?.data)
     }
 
-    pub(crate) async fn delete_task(&self, path: &str) -> anyhow::Result<String> {
+    /// A DELETE; most return a task id, SDN objects return nothing.
+    pub(crate) async fn delete_task<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let res = self
             .http
             .delete(format!("{}/api2/json{path}", self.base))
@@ -255,7 +256,7 @@ impl Client {
         if !status.is_success() {
             anyhow::bail!("DELETE {path}: {status}");
         }
-        Ok(res.json::<Envelope<String>>().await?.data)
+        Ok(res.json::<Envelope<T>>().await?.data)
     }
 
     /// Proxmox operations are asynchronous tasks. Treating them as fire-and-
