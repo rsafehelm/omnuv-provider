@@ -17,3 +17,17 @@ pub trait ComputeDriver {
         &self,
     ) -> impl std::future::Future<Output = anyhow::Result<InventoryReport>> + Send;
 }
+
+/// A shared driver is still the driver: the agent hands one `Arc` to the
+/// tunnel (for consoles) and keeps using it for everything else.
+impl<T: ComputeDriver + Sync> ComputeDriver for std::sync::Arc<T> {
+    fn kind(&self) -> RuntimeKind {
+        (**self).kind()
+    }
+
+    fn inventory(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<InventoryReport>> + Send {
+        (**self).inventory()
+    }
+}

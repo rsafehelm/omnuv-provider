@@ -14,6 +14,11 @@ use crate::proxmox::Client;
 /// worker tag so the two lifecycles can never be confused.
 pub const TAG: &str = "omnu-instance";
 
+/// The Proxmox pool buyer machines are cloned into. Bootstrap grants
+/// `VM.Console` on this pool and nowhere else, so the agent can open the
+/// console of a machine the marketplace built — never a provider's own.
+pub(crate) const BUYER_POOL: &str = "omnu-buyers";
+
 const NO_FORM: &[(String, String)] = &[];
 
 /// The isolated bridge buyer machines attach to. Created at provider bootstrap,
@@ -62,7 +67,7 @@ pub(crate) fn resolve_dev(mac: &str) -> String {
 }
 
 
-fn short_tag(id: &str) -> String {
+pub(crate) fn short_tag(id: &str) -> String {
     format!("omnu-{}", id.replace('-', "").chars().take(12).collect::<String>())
 }
 
@@ -313,6 +318,9 @@ impl Client {
                     ("name".to_string(), format!("omnu-{}", spec.name)),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
+                    // The pool that carries the console grant; only machines
+                    // the marketplace built ever go there.
+                    ("pool".to_string(), BUYER_POOL.to_string()),
                 ],
             )
             .await?;

@@ -8,6 +8,7 @@ mod driver;
 mod proxmox;
 mod tls;
 mod tunnel;
+mod console;
 mod worker;
 
 const USAGE: &str = "\

@@ -107,8 +107,10 @@ struct PciClaims {
 
 pub struct Client {
     http: reqwest::Client,
-    base: String,
-    auth: String,
+    /// The pinned TLS configuration, shared with the console websocket.
+    pub(crate) tls: std::sync::Arc<rustls::ClientConfig>,
+    pub(crate) base: String,
+    pub(crate) auth: String,
     node: Option<String>,
     contribute: Contribution,
     location: Option<omnu_protocol::GeoLocation>,
@@ -145,8 +147,10 @@ impl Client {
         location: Option<omnu_protocol::GeoLocation>,
         city: Option<String>,
     ) -> anyhow::Result<Self> {
+        let tls = crate::tls::config(fingerprint)?;
         Ok(Self {
-            http: crate::tls::client(fingerprint)?,
+            http: crate::tls::client(tls.clone())?,
+            tls,
             base: api_url.trim_end_matches('/').to_string(),
             auth: format!("PVEAPIToken={token_id}={token_secret}"),
             node,

@@ -86,7 +86,7 @@ impl Core {
 }
 
 pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
-    let driver = proxmox::Client::new(
+    let driver = Arc::new(proxmox::Client::new(
         &cfg.proxmox.api_url,
         cfg.proxmox.tls_fingerprint_sha256.as_deref(),
         &cfg.proxmox.token_id,
@@ -100,7 +100,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             _ => None,
         },
         cfg.proxmox.city.clone(),
-    )?;
+    )?);
     let core = Core::new(&cfg.core.url, &cfg.core.token)?;
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
@@ -123,13 +123,19 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         let token = cfg.core.token.clone();
         let map = endpoints.clone();
         let nudge_tx = nudge.clone();
+        // Consoles are opened by the driver on the node it manages; the
+        // tunnel only ever sees the runtime-neutral opener.
+        let consoles: Arc<dyn crate::console::ConsoleOpener> = Arc::new(crate::console::DriverConsoles {
+            driver: driver.clone(),
+            node: cfg.proxmox.node.clone().unwrap_or_default(),
+        });
         tokio::spawn(async move {
             let resolve: crate::tunnel::ResolveWorker = Arc::new(move |worker_id: &str| {
                 // Blocking lock inside a sync closure: the map is tiny and
                 // contended only by the reconcile loop.
                 map.lock().ok()?.get(worker_id).cloned()
             });
-            crate::tunnel::run(&url, &token, resolve, nudge_tx).await;
+            crate::tunnel::run(&url, &token, resolve, nudge_tx, consoles).await;
         });
     }
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));

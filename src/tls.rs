@@ -83,9 +83,9 @@ impl ServerCertVerifier for PinnedCert {
     }
 }
 
-pub fn client(fingerprint: Option<&str>) -> anyhow::Result<reqwest::Client> {
-    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
-
+/// The pinned TLS configuration every connection to the hypervisor uses —
+/// the API client and the console websocket alike.
+pub fn config(fingerprint: Option<&str>) -> anyhow::Result<Arc<rustls::ClientConfig>> {
     let Some(fp) = fingerprint else {
         anyhow::bail!(
             "no tlsFingerprintSha256 configured. Read it with:\n  \
@@ -96,13 +96,18 @@ pub fn client(fingerprint: Option<&str>) -> anyhow::Result<reqwest::Client> {
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = PinnedCert::new(fp, provider.clone())?;
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
+    Ok(Arc::new(
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth(),
+    ))
+}
 
-    Ok(builder.use_preconfigured_tls(tls).build()?)
+pub fn client(tls: Arc<rustls::ClientConfig>) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+    Ok(builder.use_preconfigured_tls(Arc::unwrap_or_clone(tls)).build()?)
 }
 
 #[cfg(test)]

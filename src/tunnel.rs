@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::audit;
+use crate::console::{ConsoleInput, ConsoleOpener};
 
 /// Resolves a marketplace worker id to the endpoint it serves on locally.
 /// Core never learns the provider's addressing; it names the worker, the agent
@@ -30,6 +31,7 @@ pub async fn run(
     token: &str,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
+    consoles: Arc<dyn ConsoleOpener>,
 ) {
     let ws_url = core_url
         .replacen("https://", "wss://", 1)
@@ -38,7 +40,7 @@ pub async fn run(
 
     let mut backoff = 2u64;
     loop {
-        match connect(&ws_url, token, resolve.clone(), nudge.clone()).await {
+        match connect(&ws_url, token, resolve.clone(), nudge.clone(), consoles.clone()).await {
             Ok(()) => {
                 audit::record("tunnel.closed", "agent", "core", "ok", None);
                 backoff = 2;
@@ -122,6 +124,7 @@ async fn connect(
     token: &str,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
+    consoles: Arc<dyn ConsoleOpener>,
 ) -> anyhow::Result<()> {
     let mut request = ws_url.into_client_request()?;
     request
@@ -141,6 +144,10 @@ async fn connect(
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<TunnelFrame>(256);
     let inflight: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    // Open consoles, by tunnel id: where a buyer's keystrokes go. Dropping
+    // the sender ends the session at the hypervisor.
+    let sessions: Arc<Mutex<HashMap<String, mpsc::Sender<ConsoleInput>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     // Keepalive: an idle WebSocket through a NAT or proxy is reaped silently,
@@ -201,7 +208,58 @@ async fn connect(
                 });
                 inflight.lock().await.insert(key, handle);
             }
+            TunnelFrame::ConsoleOpen { id, instance_id, kind } => {
+                // Recorded before anything is opened: a console is a
+                // root-equivalent path into a machine on this host.
+                audit::record("console.request", "core", &instance_id, "accepted", Some(kind.as_str()));
+                let tx = out_tx.clone();
+                let opener = consoles.clone();
+                let table = sessions.clone();
+                let key = id.clone();
+                let handle = tokio::spawn(async move {
+                    let stream = match opener.open(&instance_id, kind).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            audit::record("console.request", "core", &instance_id, "error", Some(&e.to_string()));
+                            let _ = tx.send(TunnelFrame::Error { id, message: e.to_string() }).await;
+                            return;
+                        }
+                    };
+                    table.lock().await.insert(id.clone(), stream.to_vm);
+                    if tx.send(TunnelFrame::Head { id: id.clone(), status: 200 }).await.is_err() {
+                        table.lock().await.remove(&id);
+                        return;
+                    }
+                    let mut from_vm = stream.from_vm;
+                    while let Some(bytes) = from_vm.recv().await {
+                        use base64::Engine as _;
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        if tx.send(TunnelFrame::ConsoleData { id: id.clone(), data }).await.is_err() {
+                            break;
+                        }
+                    }
+                    table.lock().await.remove(&id);
+                    let _ = tx.send(TunnelFrame::End { id }).await;
+                });
+                inflight.lock().await.insert(key, handle);
+            }
+            TunnelFrame::ConsoleData { id, data } => {
+                use base64::Engine as _;
+                if let (Some(to_vm), Ok(bytes)) = (
+                    sessions.lock().await.get(&id).cloned(),
+                    base64::engine::general_purpose::STANDARD.decode(data),
+                ) {
+                    let _ = to_vm.send(ConsoleInput::Data(bytes)).await;
+                }
+            }
+            TunnelFrame::ConsoleResize { id, cols, rows } => {
+                if let Some(to_vm) = sessions.lock().await.get(&id).cloned() {
+                    let _ = to_vm.send(ConsoleInput::Resize { cols, rows }).await;
+                }
+            }
             TunnelFrame::Cancel { id } => {
+                // A console's sender goes too, which is what closes it.
+                sessions.lock().await.remove(&id);
                 if let Some(h) = inflight.lock().await.remove(&id) {
                     h.abort();
                     audit::record("tunnel.cancel", "core", &id, "ok", None);
