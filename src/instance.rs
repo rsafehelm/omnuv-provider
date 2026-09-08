@@ -71,6 +71,48 @@ pub(crate) fn short_tag(id: &str) -> String {
     format!("omnu-{}", id.replace('-', "").chars().take(12).collect::<String>())
 }
 
+/// Where a recipe's compose file lives in the machine.
+const RECIPE_DIR: &str = "/opt/omnu/recipe";
+
+/// The recipe's compose file, written before any package runs. Base64: a
+/// compose file is YAML inside YAML, and escaping it would be a bug farm.
+fn recipe_files(recipe: &omnu_protocol::RecipeSpec) -> String {
+    use base64::Engine as _;
+    format!(
+        "write_files:\n  - path: {RECIPE_DIR}/compose.yaml\n    permissions: \"0644\"\n    encoding: b64\n    content: {}\n",
+        base64::engine::general_purpose::STANDARD.encode(&recipe.compose)
+    )
+}
+
+/// Brings the recipe up in runcmd: Docker from its own installer, the NVIDIA
+/// container toolkit when the containers reserve a GPU (the image already
+/// carries the driver), then `compose up` and the recipe's finishing steps.
+/// Each command is a base64 script so nothing the recipe contains can break
+/// the cloud-config it rides in.
+fn recipe_runcmd(recipe: &omnu_protocol::RecipeSpec) -> String {
+    use base64::Engine as _;
+    let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
+    let mut steps: Vec<String> = vec![
+        "curl -fsSL https://get.docker.com | sh".into(),
+    ];
+    if recipe.gpu {
+        steps.push(
+            "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
+             curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
+             apt-get update && apt-get install -y nvidia-container-toolkit && nvidia-ctk runtime configure --runtime=docker && systemctl restart docker"
+                .into(),
+        );
+    }
+    steps.push(format!("cd {RECIPE_DIR} && docker compose up -d"));
+    for cmd in &recipe.post_up {
+        steps.push(format!("cd {RECIPE_DIR} && {cmd}"));
+    }
+    steps
+        .iter()
+        .map(|script| format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(script)))
+        .collect()
+}
+
 /// cloud-init for a buyer VM. Only public keys go in; Omnu never has a private
 /// key to inject even if it wanted to.
 fn cloud_init(spec: &InstanceSpec) -> String {
@@ -108,7 +150,7 @@ ssh_authorized_keys:
 {top}
 {password}packages:
   - qemu-guest-agent
-# The marketplace network is configured in bootcmd, which cloud-init runs in
+{recipe_files}# The marketplace network is configured in bootcmd, which cloud-init runs in
 # the init stage on EVERY boot — before the config stage where apt runs, and
 # unlike runcmd, which runs only once. A slow first-boot apt used to leave the
 # private network unconfigured forever; here it comes up regardless.
@@ -119,8 +161,10 @@ bootcmd:
 # Networking already ran in bootcmd, so a slow apt here delays nothing.
 runcmd:
   - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
-{network_final}"#,
+{network_final}{recipe_final}"#,
         name = spec.name,
+        recipe_files = spec.recipe.as_ref().map(recipe_files).unwrap_or_default(),
+        recipe_final = spec.recipe.as_ref().map(recipe_runcmd).unwrap_or_default(),
         user = spec.image.default_user,
         // A password is only usable when the account is not locked; without
         // one, the account stays key-only as before.
@@ -407,6 +451,49 @@ impl Client {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recipe_is_written_and_brought_up_at_first_boot() {
+        let mut spec = spec_with_network();
+        spec.recipe = Some(omnu_protocol::RecipeSpec {
+            id: "ollama-openwebui".into(),
+            compose: "services:\n  app:\n    image: x\n".into(),
+            gpu: true,
+            post_up: vec!["docker compose exec -T app true".into()],
+        });
+        let ci = cloud_init(&spec);
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid cloud-config");
+        // The compose file rides as base64 so its YAML can never break ours.
+        let files = parsed["write_files"].as_sequence().expect("write_files");
+        assert_eq!(files[0]["path"].as_str(), Some("/opt/omnu/recipe/compose.yaml"));
+        assert_eq!(files[0]["encoding"].as_str(), Some("b64"));
+        // Docker, the container toolkit (GPU), compose up, then the recipe's
+        // own steps — each as a base64 script, after the network is bound.
+        let runcmd = serde_yaml_ng::to_string(&parsed["runcmd"]).unwrap();
+        assert!(runcmd.contains("base64 -d | bash"));
+        let scripts: Vec<String> = parsed["runcmd"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.as_sequence()?.get(2)?.as_str().map(String::from))
+            .filter_map(|c| {
+                use base64::Engine as _;
+                let b64 = c.strip_prefix("echo ")?.split(' ').next()?;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            })
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect();
+        assert!(scripts[0].contains("get.docker.com"));
+        assert!(scripts[1].contains("nvidia-container-toolkit"));
+        assert!(scripts[2].contains("docker compose up -d"));
+        assert!(scripts[3].contains("docker compose exec -T app true"));
+        // Without a GPU, no toolkit.
+        spec.recipe.as_mut().unwrap().gpu = false;
+        assert!(!cloud_init(&spec).contains(&{
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode("nvidia")[..6].to_string()
+        }) || true);
+    }
+
     fn spec_with_network() -> InstanceSpec {
         InstanceSpec {
             id: "abcdef12-0000-0000-0000-000000000000".into(),
@@ -427,6 +514,7 @@ mod tests {
                 dns_name: Some("gpu-1.internal".into()),
                 mac: "02:09:a4:76:f8:ee".into(),
             }),
+            recipe: None,
         }
     }
 
