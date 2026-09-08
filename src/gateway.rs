@@ -144,6 +144,13 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # which the DROP above must let through.
     iptables -t nat -C POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE
     iptables -C FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # And outbound: traffic from the bridge bound for the overlay leaves with
+    # this gateway's own overlay address as its source. The far gateway admits
+    # traffic per peer, and a bridge address is no peer; it masquerades onto
+    # its bridge in turn (the rule above), so neither machine needs a route
+    # back to the overlay. Across providers a machine sees its peer's gateway
+    # rather than the peer — the v0.1 masquerade trade the design allows.
+    iptables -t nat -C POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE
     # The same boundary from the overlay side. A peer's client only sends what
     # its routes allow, but a member owns their device and could send anything
     # with the same key; this gateway forwards overlay traffic onto the bridge
@@ -584,6 +591,9 @@ mod tests {
         // Device traffic is rewritten to the gateway's address, buyer traffic
         // is not, and the reply path through the DROP is open.
         assert!(ci.contains("POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE"));
+        // And bridge traffic leaves for the overlay as this gateway: the far
+        // side admits per peer, so a machine's own address would be dropped.
+        assert!(ci.contains("POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE"));
         assert!(ci.contains("-I FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"));
         assert!(ci.find("-j DROP").unwrap() < ci.find("ESTABLISHED,RELATED -j ACCEPT").unwrap());
         // And the overlay side is fenced the same way, ahead of the client's
