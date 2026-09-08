@@ -155,7 +155,10 @@ ssh_authorized_keys:
 # unlike runcmd, which runs only once. A slow first-boot apt used to leave the
 # private network unconfigured forever; here it comes up regardless.
 bootcmd:
-  - [ sh, -c, "systemctl enable --now qemu-guest-agent 2>/dev/null || true" ]
+  # --no-block: in the init stage a start job for a unit ordered after
+  # basic.target cannot complete until this very stage finishes; waiting on
+  # it is a deadlock that looks like a boot stuck at cloud-init-network.
+  - [ sh, -c, "systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true" ]
 {network}
 # runcmd is the final stage, after packages: the agent is installed by then.
 # Networking already ran in bootcmd, so a slow apt here delays nothing.
