@@ -143,6 +143,9 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // Reconciliation is push-driven; this interval is only the fallback for a
     // provider with no live tunnel.
     let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(120));
+    // Push for latency, pull for truth (CLAUDE.md, *The Three Tiers*): Core
+    // pushes a nudge when something changes, this interval is what makes a
+    // lost nudge cost latency rather than correctness.
 
     loop {
         tokio::select! {
