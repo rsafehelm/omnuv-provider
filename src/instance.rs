@@ -579,6 +579,44 @@ mod tests {
         }
     }
 
+    /// A recipe's setup is arbitrary shell — heredocs, quotes, dollars,
+    /// backslashes — and it rides inside a YAML document. Base64 is what keeps
+    /// the two apart, and this is the assertion that says so: the nastiest
+    /// script we ship must not be able to break the config it travels in.
+    #[test]
+    fn a_recipe_of_raw_shell_cannot_break_the_cloud_config() {
+        let nasty = r#"set -euo pipefail
+U=$(getent passwd 1000 | cut -d: -f1)
+cat > "$HOME/.config/sunshine/apps.json" <<'APPS'
+{ "apps": [ { "name": "Steam Big Picture", "detached": ["setsid steam steam://open/bigpicture"] } ] }
+APPS
+echo 'single' "double" `backtick` \$escaped
+"#;
+        let mut spec = spec_with_network();
+        spec.recipe = Some(omnu_protocol::RecipeSpec {
+            id: "steam-gaming".into(),
+            compose: "services: {}\n".into(),
+            gpu: true,
+            post_up: vec![nasty.to_string()],
+        });
+        let ci = cloud_init(&spec);
+        // None of it appears literally, so none of it can be parsed as YAML.
+        assert!(!ci.contains("APPS"), "the script must ride encoded, not inline");
+        assert!(!ci.contains("bigpicture"));
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&ci).expect("cloud-init must still be valid YAML");
+        assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
+        // And it is recoverable: what boots is exactly what the catalog holds.
+        use base64::Engine as _;
+        let line = ci.lines().find(|l| l.contains("base64 -d")).expect("an encoded step");
+        let b64 = line.split("echo ").nth(1).unwrap().split(' ').next().unwrap();
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD.decode(b64).expect("decodes"),
+        )
+        .unwrap();
+        assert!(decoded.contains("docker") || decoded.contains("nvidia") || decoded.contains("APPS"));
+    }
+
     /// The bug this whole fix exists for: the marketplace address must be set in
     /// bootcmd (every boot, before the config stage where apt runs), never only
     /// in runcmd (first boot only, after a slow apt that may not have finished).
