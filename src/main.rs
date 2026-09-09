@@ -13,13 +13,13 @@ mod console;
 mod worker;
 
 const USAGE: &str = "\
-omnu-provider - Omnu Provider Agent
+omnuv-provider - Omnuv Provider Agent
 
 USAGE:
-    omnu-provider join  --core <url> --token <token> [options]
-    omnu-provider leave [--dry-run]
-    omnu-provider agent [--config /etc/omnu/agent.yaml]
-    omnu-provider discover --provider <id> [--config <path>]
+    omnuv-provider join  --core <url> --token <token> [options]
+    omnuv-provider leave [--dry-run]
+    omnuv-provider agent [--config /etc/omnuv/agent.yaml]
+    omnuv-provider discover --provider <id> [--config <path>]
 
 JOIN OPTIONS:
     --region <name>       marketplace region                 (default eu-west)
@@ -30,7 +30,7 @@ JOIN OPTIONS:
     --gpu <pci>           GPU to sell, repeatable (e.g. 0000:21:00.0)
     --dry-run             print every command without running it
 
-`join` runs on your own machine and dials Omnu outward. Omnu never connects to
+`join` runs on your own machine and dials Omnuv outward. Omnuv never connects to
 you: no inbound rule, no port forward, no SSH access, no public address. The
 Proxmox token it creates is restricted and stays on this host.
 
@@ -40,8 +40,8 @@ a one-shot debugging command that prints a report instead of sending it.
 
 Prints a normalized InventoryReport as JSON on stdout. Pipe it into core:
 
-    omnu-provider discover --provider pve-titan | \\
-        omnu-core ingest --name Titan --region eu-west
+    omnuv-provider discover --provider pve-titan | \\
+        omnuv-core ingest --name Titan --region eu-west
 
 Credentials come from the environment, named by the provider's tokenEnv entry.
 ";
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
             .filter_map(|(i, _)| args.get(i + 1).cloned())
             .collect();
 
-        audit::init(std::env::var("OMNU_AUDIT_LOG").ok().as_deref());
+        audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
         return join::run(join::JoinArgs {
             core: need("--core")?,
             token: need("--token")?,
@@ -94,11 +94,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if command == "agent" {
-        let path = arg("--config").unwrap_or_else(|| "/etc/omnu/agent.yaml".into());
+        let path = arg("--config").unwrap_or_else(|| "/etc/omnuv/agent.yaml".into());
         let cfg = config::load_agent(&path)?;
         // Audit before anything else, so even a failed start is on the record.
-        audit::init(std::env::var("OMNU_AUDIT_LOG").ok().as_deref());
-        eprintln!("omnu-provider agent starting (config {path})");
+        audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
+        eprintln!("omnuv-provider agent starting (config {path})");
         eprintln!("audit log policy: {}", audit::REDACTION_POLICY);
         return agent::run(cfg).await;
     }

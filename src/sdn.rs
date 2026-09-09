@@ -20,7 +20,7 @@
 use crate::proxmox::Client;
 
 /// The marketplace zone every segment lives in. Created at provider bootstrap.
-pub(crate) const ZONE: &str = "omnu";
+pub(crate) const ZONE: &str = "omnuv";
 
 const NO_FORM: &[(String, String)] = &[];
 

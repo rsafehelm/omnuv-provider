@@ -3,7 +3,7 @@
 //! This agent is open source and runs on hardware the provider owns. Core can
 //! ask it to do things — create a VM, attach a GPU, forward a request — so the
 //! provider must be able to see exactly what was asked and what happened,
-//! without taking Omnu's word for it and without asking Omnu for the record.
+//! without taking Omnuv's word for it and without asking Omnuv for the record.
 //!
 //! The log is therefore:
 //!   - local, append-only JSON Lines the provider can read, grep and ship
@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 /// Where the record is written. Also emitted to the journal via `tracing`, so
-/// `journalctl -u omnu-provider` shows the same events.
-const DEFAULT_PATH: &str = "/var/log/omnu/audit.log";
+/// `journalctl -u omnuv-provider` shows the same events.
+const DEFAULT_PATH: &str = "/var/log/omnuv/audit.log";
 
 static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 

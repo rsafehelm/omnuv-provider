@@ -129,7 +129,7 @@ developmentInfrastructure:
 }
 
 // ---------- agent configuration ----------
-// Read from /etc/omnu/agent.yaml on the provider host. This file holds the
+// Read from /etc/omnuv/agent.yaml on the provider host. This file holds the
 // provider's own runtime credentials and must be root-owned, mode 0600. They
 // never leave the machine: Core is told inventory, never how to reach Proxmox.
 
@@ -215,7 +215,7 @@ impl ProxmoxRuntime {
 }
 
 fn default_snippet_dir() -> String {
-    "/var/lib/omnu/snippets".to_string()
+    "/var/lib/omnuv/snippets".to_string()
 }
 
 pub fn load_agent(path: &str) -> anyhow::Result<AgentConfig> {

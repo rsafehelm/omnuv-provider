@@ -4,14 +4,14 @@
 //! requested GPUs attached and vLLM running inside. The marketplace id is
 //! written into the VM description so state survives an agent restart.
 
-use omnu_protocol::{InferenceWorkerSpec, Lifecycle, WorkerState, WorkerStatus};
+use omnuv_protocol::{InferenceWorkerSpec, Lifecycle, WorkerState, WorkerStatus};
 use serde::Deserialize;
 
 use crate::proxmox::Client;
 
 /// Marks VMs this agent owns. Recovery and deletion key off this, so nothing
 /// the marketplace did not create is ever touched.
-pub const TAG: &str = "omnu-worker";
+pub const TAG: &str = "omnuv-worker";
 
 /// Typed empty form body for endpoints that take no parameters.
 const NO_FORM: &[(String, String)] = &[];
@@ -36,7 +36,7 @@ pub(crate) struct VmRef {
 /// Verified on Pluto's `0000:5d:00.0`, the boot card: with the ROM bar hidden
 /// the guest's driver loads and `nvidia-smi` lists the 3090.
 pub(crate) fn mapping_name(pci: &str) -> String {
-    format!("omnu-gpu-{}", pci.replace([':', '.'], "-"))
+    format!("omnuv-gpu-{}", pci.replace([':', '.'], "-"))
 }
 
 /// cloud-init that brings up the NVIDIA stack and serves the model.
@@ -76,11 +76,11 @@ packages:
 # disk, and the model cache on it, survive. Rebuilding the VM to change a flag
 # costs a ~16 GB re-download.
 bootcmd:
-  - [ bash, -c, "mkdir -p /etc/omnu" ]
-  - [ bash, -c, "echo {args_b64} | base64 -d > /etc/omnu/vllm.args" ]
-  - [ bash, -c, "echo {image_b64} | base64 -d > /etc/omnu/vllm.image" ]
+  - [ bash, -c, "mkdir -p /etc/omnuv" ]
+  - [ bash, -c, "echo {args_b64} | base64 -d > /etc/omnuv/vllm.args" ]
+  - [ bash, -c, "echo {image_b64} | base64 -d > /etc/omnuv/vllm.image" ]
 write_files:
-  - path: /usr/local/bin/omnu-serve
+  - path: /usr/local/bin/omnuv-serve
     permissions: '0755'
     content: |
       #!/bin/bash
@@ -88,17 +88,17 @@ write_files:
       # rather than word-splitting a string keeps arguments with spaces or
       # punctuation intact.
       set -euo pipefail
-      mapfile -t ARGS < /etc/omnu/vllm.args
-      IMAGE=$(cat /etc/omnu/vllm.image)
-      exec /usr/bin/docker run --rm --name omnu-vllm \
+      mapfile -t ARGS < /etc/omnuv/vllm.args
+      IMAGE=$(cat /etc/omnuv/vllm.image)
+      exec /usr/bin/docker run --rm --name omnuv-vllm \
         --gpus all --ipc=host -p {port}:8000 \
-        -v /opt/omnu/hf:/root/.cache/huggingface \
+        -v /opt/omnuv/hf:/root/.cache/huggingface \
         "$IMAGE" "${{ARGS[@]}}"
-  - path: /etc/systemd/system/omnu-vllm.service
+  - path: /etc/systemd/system/omnuv-vllm.service
     permissions: '0644'
     content: |
       [Unit]
-      Description=Omnu inference worker (vLLM)
+      Description=Omnuv inference worker (vLLM)
       After=docker.service
       Requires=docker.service
 
@@ -109,17 +109,17 @@ write_files:
       # reliable. Restarting until the GPU appears is the whole design.
       Restart=always
       RestartSec=15s
-      ExecStartPre=-/usr/bin/docker rm -f omnu-vllm
+      ExecStartPre=-/usr/bin/docker rm -f omnuv-vllm
       # Reads image and arguments from disk at start, so changing them is a
       # reboot rather than a rebuild that re-downloads the model.
-      ExecStart=/usr/local/bin/omnu-serve
-      ExecStop=/usr/bin/docker stop omnu-vllm
+      ExecStart=/usr/local/bin/omnuv-serve
+      ExecStop=/usr/bin/docker stop omnuv-vllm
 
       [Install]
       WantedBy=multi-user.target
 runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent ]
-  - [ bash, -c, "mkdir -p /opt/omnu/hf /etc/omnu" ]
+  - [ bash, -c, "mkdir -p /opt/omnuv/hf /etc/omnuv" ]
   - [ bash, -c, "curl -fsSL https://get.docker.com | sh" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list" ]
@@ -132,7 +132,7 @@ runcmd:
   # metapackage for the newest available branch instead.
   - [ bash, -c, "apt-get update && DRV=$(apt-cache search --names-only '^nvidia-driver-[0-9]+-server$' | awk '{{print $1}}' | sort -V | tail -1) && echo \"installing $DRV\" && DEBIAN_FRONTEND=noninteractive apt-get install -y \"$DRV\"" ]
   - [ bash, -c, "command -v nvidia-smi || DEBIAN_FRONTEND=noninteractive apt-get install -y $(apt-cache search --names-only '^nvidia-utils-[0-9]+-server$' | awk '{{print $1}}' | sort -V | tail -1)" ]
-  - [ systemctl, enable, omnu-vllm.service ]
+  - [ systemctl, enable, omnuv-vllm.service ]
   # The driver is not loadable until the machine restarts; the service comes up
   # by itself afterwards.
   - [ bash, -c, "systemctl reboot" ]
@@ -216,7 +216,7 @@ impl Client {
         }
 
         // Snippet must exist before the VM references it.
-        let file = format!("omnu-{}.yaml", spec.id);
+        let file = format!("omnuv-{}.yaml", spec.id);
         std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec))
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
@@ -227,7 +227,7 @@ impl Client {
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
                 &[
                     ("newid".to_string(), vmid.to_string()),
-                    ("name".to_string(), format!("omnu-worker-{}", &spec.id[..8])),
+                    ("name".to_string(), format!("omnuv-worker-{}", &spec.id[..8])),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                 ],
@@ -243,9 +243,9 @@ impl Client {
             ("machine".into(), "q35".into()),
             ("agent".into(), "enabled=1".into()),
             ("ipconfig0".into(), "ip=dhcp".into()),
-            ("cicustom".into(), format!("user=omnu-snippets:snippets/{file}")),
+            ("cicustom".into(), format!("user=omnuv-snippets:snippets/{file}")),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
-            ("description".into(), format!("Omnu inference worker {}\nManaged by omnu-provider. Do not edit.", spec.id)),
+            ("description".into(), format!("Omnuv inference worker {}\nManaged by omnuv-provider. Do not edit.", spec.id)),
         ];
         // Mappings rather than raw addresses: a non-root token may only attach
         // a device the host has explicitly published.
@@ -344,7 +344,7 @@ fn worker_state(running: bool, has_address: bool, serving: bool) -> WorkerState 
 /// association. Collisions are implausible at POC scale and would only ever
 /// affect this agent's own VMs.
 fn short_tag(worker_id: &str) -> String {
-    format!("omnu-{}", worker_id.replace('-', "").chars().take(12).collect::<String>())
+    format!("omnuv-{}", worker_id.replace('-', "").chars().take(12).collect::<String>())
 }
 
 #[cfg(test)]
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn args_are_written_at_every_boot_not_baked_into_the_unit() {
-        use omnu_protocol::{InferenceWorkerSpec, Lifecycle};
+        use omnuv_protocol::{InferenceWorkerSpec, Lifecycle};
         let spec = InferenceWorkerSpec {
             id: "w1".into(),
             lifecycle: Lifecycle::Running,
@@ -372,14 +372,14 @@ mod tests {
         // the whole point: changing a flag must be a reboot, not a rebuild that
         // re-downloads the model.
         assert!(ci.contains("bootcmd:"), "args must be written from bootcmd");
-        assert!(ci.contains("/etc/omnu/vllm.args"));
-        assert!(ci.contains("/etc/omnu/vllm.image"));
+        assert!(ci.contains("/etc/omnuv/vllm.args"));
+        assert!(ci.contains("/etc/omnuv/vllm.image"));
         // Read into an argv array, not word-split from a string: `$(cat file)`
         // performs no quote removal and bash would brace-expand a value like
         // {"image":0,"video":0} before docker saw it.
-        assert!(ci.contains("mapfile -t ARGS < /etc/omnu/vllm.args"));
+        assert!(ci.contains("mapfile -t ARGS < /etc/omnuv/vllm.args"));
         assert!(ci.contains("\"${ARGS[@]}\""));
-        assert!(ci.contains("ExecStart=/usr/local/bin/omnu-serve"));
+        assert!(ci.contains("ExecStart=/usr/local/bin/omnuv-serve"));
         // The arguments must be base64, never shell-quoted text in the unit.
         assert!(!ci.contains("--max-model-len"), "args leaked into the unit in plain text");
 
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn ready_requires_a_serving_endpoint_not_merely_an_address() {
-        use omnu_protocol::WorkerState::*;
+        use omnuv_protocol::WorkerState::*;
         assert_eq!(worker_state(false, false, false), Offline);
         assert_eq!(worker_state(true, false, false), Deploying);
         // The window that matters: booted, addressable, still loading weights.
@@ -409,15 +409,15 @@ mod tests {
 
     #[test]
     fn maps_pci_addresses_to_published_mapping_names() {
-        assert_eq!(mapping_name("0000:21:00.0"), "omnu-gpu-0000-21-00-0");
-        assert_eq!(mapping_name("0000:5d:00.0"), "omnu-gpu-0000-5d-00-0");
+        assert_eq!(mapping_name("0000:21:00.0"), "omnuv-gpu-0000-21-00-0");
+        assert_eq!(mapping_name("0000:5d:00.0"), "omnuv-gpu-0000-5d-00-0");
     }
 
     #[test]
     fn short_tag_is_stable_and_tag_safe() {
         let t = short_tag("b48aedfb-205d-42fd-a6d3-3deafaeae938");
-        assert_eq!(t, "omnu-b48aedfb205d");
-        assert!(!t.contains('-') || t.starts_with("omnu-"));
+        assert_eq!(t, "omnuv-b48aedfb205d");
+        assert!(!t.contains('-') || t.starts_with("omnuv-"));
         assert!(t.len() <= 20);
     }
 }

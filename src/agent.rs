@@ -4,7 +4,7 @@
 //! and reports normalized state upward. It never receives marketplace decision
 //! logic and never exposes the Proxmox API outward.
 
-use omnu_protocol::{
+use omnuv_protocol::{
     DesiredState, InstanceState, InstanceStatus, Lifecycle, StatusReport, WorkerState, WorkerStatus,
 };
 
@@ -25,7 +25,7 @@ struct Core {
 }
 
 impl Core {
-    /// The agent's own transport to Omnu Core.
+    /// The agent's own transport to Omnuv Core.
     ///
     /// This is TLS, not the marketplace overlay. Control-plane traffic must not
     /// depend on the overlay: a gateway fault would make a healthy provider look
@@ -34,16 +34,16 @@ impl Core {
     /// nothing of ours.
     ///
     /// Certificates are verified against the platform roots. `http://` is
-    /// refused unless the operator sets `OMNU_ALLOW_PLAINTEXT_CORE=1`, which
+    /// refused unless the operator sets `OMNUV_ALLOW_PLAINTEXT_CORE=1`, which
     /// exists for a LAN development loop and says so in the log.
     fn new(url: &str, token: &str) -> anyhow::Result<Self> {
         let base = url.trim_end_matches('/').to_string();
         if base.starts_with("http://") {
-            let allowed = std::env::var("OMNU_ALLOW_PLAINTEXT_CORE").is_ok_and(|v| v == "1");
+            let allowed = std::env::var("OMNUV_ALLOW_PLAINTEXT_CORE").is_ok_and(|v| v == "1");
             anyhow::ensure!(
                 allowed,
                 "core url {base} is plaintext; agent credentials and inventory would cross the \
-                 network in the clear. Use https://, or set OMNU_ALLOW_PLAINTEXT_CORE=1 for a \
+                 network in the clear. Use https://, or set OMNUV_ALLOW_PLAINTEXT_CORE=1 for a \
                  development loop on a trusted LAN."
             );
             eprintln!("WARNING: talking to core at {base} over plaintext HTTP by explicit opt-in");
@@ -95,7 +95,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         cfg.proxmox.contribute.clone(),
         match (cfg.proxmox.latitude, cfg.proxmox.longitude) {
             (Some(latitude), Some(longitude)) => {
-                Some(omnu_protocol::GeoLocation { latitude, longitude })
+                Some(omnuv_protocol::GeoLocation { latitude, longitude })
             }
             _ => None,
         },
@@ -187,7 +187,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
 async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u64> {
     let body = serde_json::json!({
         "agent_version": AGENT_VERSION,
-        "protocol_versions": [omnu_protocol::PROTOCOL_VERSION],
+        "protocol_versions": [omnuv_protocol::PROTOCOL_VERSION],
         "drivers": { "compute": [driver.kind().as_str()] },
     });
 
@@ -251,11 +251,11 @@ async fn reconcile_workers(
     endpoints: &Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
     let desired: DesiredState = core.get_json("/provider/v1/desired-state").await?;
-    if desired.protocol_version != omnu_protocol::PROTOCOL_VERSION {
+    if desired.protocol_version != omnuv_protocol::PROTOCOL_VERSION {
         anyhow::bail!(
             "core speaks protocol v{}, this agent speaks v{}",
             desired.protocol_version,
-            omnu_protocol::PROTOCOL_VERSION
+            omnuv_protocol::PROTOCOL_VERSION
         );
     }
     if desired.inference_workers.is_empty()
@@ -278,9 +278,9 @@ async fn reconcile_workers(
     for spec in &desired.gateways {
         let status = if spec.lifecycle == Lifecycle::Deleted {
             match driver.delete_gateway(node, &spec.id, &spec.network_id).await {
-                Ok(()) => omnu_protocol::GatewayStatus {
+                Ok(()) => omnuv_protocol::GatewayStatus {
                     id: spec.id.clone(),
-                    state: omnu_protocol::GatewayState::Offline,
+                    state: omnuv_protocol::GatewayState::Offline,
                     local_id: None,
                     overlay_address: None,
                     message: Some("deleted".into()),
@@ -296,9 +296,9 @@ async fn reconcile_workers(
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!("gateway {}: {e}", spec.id);
-                    omnu_protocol::GatewayStatus {
+                    omnuv_protocol::GatewayStatus {
                         id: spec.id.clone(),
-                        state: omnu_protocol::GatewayState::Error,
+                        state: omnuv_protocol::GatewayState::Error,
                         local_id: None,
                         overlay_address: None,
                         message: Some(e.to_string().chars().take(400).collect()),
@@ -419,7 +419,7 @@ async fn reconcile_workers(
     }
 
     let report = StatusReport {
-        protocol_version: omnu_protocol::PROTOCOL_VERSION,
+        protocol_version: omnuv_protocol::PROTOCOL_VERSION,
         workers: statuses,
         instances,
         gateways,

@@ -1,12 +1,12 @@
 [package]
-name = "omnu-provider"
+name = "omnuv-provider"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Omnu Provider Agent. Executes normalized marketplace intent on a provider runtime."
+description = "Omnuv Provider Agent. Executes normalized marketplace intent on a provider runtime."
 
 [dependencies]
-omnu-protocol = { workspace = true }
+omnuv-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

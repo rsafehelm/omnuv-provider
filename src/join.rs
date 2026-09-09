@@ -1,6 +1,6 @@
-//! `omnu-provider join` — onboarding, run by the provider on their own machine.
+//! `omnuv-provider join` — onboarding, run by the provider on their own machine.
 //!
-//! Phone-home: this dials Core outward and nothing ever dials back. Omnu needs
+//! Phone-home: this dials Core outward and nothing ever dials back. Omnuv needs
 //! no SSH access, no inbound rule and no credentials for the hypervisor — the
 //! restricted Proxmox token is created here, locally, and never leaves.
 //!
@@ -55,7 +55,7 @@ fn step(label: &str, cmd: &str, dry: bool) -> anyhow::Result<String> {
 }
 
 pub fn run(a: JoinArgs) -> anyhow::Result<()> {
-    println!("omnu-provider join");
+    println!("omnuv-provider join");
     println!("  core:   {}", a.core);
     println!("  region: {}", a.region);
     if a.dry_run {
@@ -91,27 +91,27 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     println!("\nCreating a restricted Proxmox token. It stays on this machine:");
     step(
         "role",
-        &format!("pveum role list --output-format json | grep -q '\"OmnuAgent\"' || pveum role add OmnuAgent -privs \"{ROLE_PRIVS}\"; pveum role modify OmnuAgent -privs \"{ROLE_PRIVS}\""),
+        &format!("pveum role list --output-format json | grep -q '\"OmnuvAgent\"' || pveum role add OmnuvAgent -privs \"{ROLE_PRIVS}\"; pveum role modify OmnuvAgent -privs \"{ROLE_PRIVS}\""),
         a.dry_run,
     )?;
     step(
         "user",
-        "pveum user list --output-format json | grep -q '\"omnu@pve\"' || pveum user add omnu@pve --comment 'Omnu marketplace agent'",
+        "pveum user list --output-format json | grep -q '\"omnuv@pve\"' || pveum user add omnuv@pve --comment 'Omnuv marketplace agent'",
         a.dry_run,
     )?;
-    step("acl", "pveum acl modify / -user omnu@pve -role OmnuAgent", a.dry_run)?;
+    step("acl", "pveum acl modify / -user omnuv@pve -role OmnuvAgent", a.dry_run)?;
 
     let secret = if a.dry_run {
         "<created at run time>".to_string()
     } else {
-        sh("pveum user token remove omnu@pve agent >/dev/null 2>&1; \
-            pveum user token add omnu@pve agent --privsep 1 --output-format json")
+        sh("pveum user token remove omnuv@pve agent >/dev/null 2>&1; \
+            pveum user token add omnuv@pve agent --privsep 1 --output-format json")
             .and_then(|out| {
                 let v: serde_json::Value = serde_json::from_str(&out)?;
                 Ok(v["value"].as_str().unwrap_or_default().to_string())
             })?
     };
-    step("token acl", "pveum acl modify / -token 'omnu@pve!agent' -role OmnuAgent", a.dry_run)?;
+    step("token acl", "pveum acl modify / -token 'omnuv@pve!agent' -role OmnuvAgent", a.dry_run)?;
 
     let fingerprint = sh("openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256 | cut -d= -f2")
         .unwrap_or_default();
@@ -124,8 +124,8 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         .join("\n");
 
     let config = format!(
-        r#"# Written by `omnu-provider join`. Contains this machine's own Proxmox
-# credentials; they are never sent to Omnu.
+        r#"# Written by `omnuv-provider join`. Contains this machine's own Proxmox
+# credentials; they are never sent to Omnuv.
 core:
   url: "{core}"
   token: "{token}"
@@ -136,10 +136,10 @@ proxmox:
   apiUrl: "https://127.0.0.1:8006"
   node: "{node}"
   tlsFingerprintSha256: "{fingerprint}"
-  tokenId: "omnu@pve!agent"
+  tokenId: "omnuv@pve!agent"
   tokenSecret: "{secret}"
   templateVmid: 9000
-  snippetDir: /var/lib/omnu/snippets
+  snippetDir: /var/lib/omnuv/snippets
   contribute:
     cpuCores: {cpu}
     memoryMib: {mem}
@@ -156,41 +156,41 @@ proxmox:
         gpus = if gpus.is_empty() { "      []".to_string() } else { gpus },
     );
 
-    println!("\nWriting /etc/omnu/agent.yaml (0640 root:omnu)");
+    println!("\nWriting /etc/omnuv/agent.yaml (0640 root:omnuv)");
     if !a.dry_run {
-        std::fs::create_dir_all("/etc/omnu")?;
-        sh("id -u omnu >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/omnu --create-home omnu")?;
-        std::fs::write("/etc/omnu/agent.yaml", &config)?;
-        sh("chgrp omnu /etc/omnu/agent.yaml && chmod 0640 /etc/omnu/agent.yaml")?;
-        sh("install -d -o omnu -g omnu /var/lib/omnu/snippets /var/log/omnu")?;
-        sh("pvesm status --storage omnu-snippets >/dev/null 2>&1 || pvesm add dir omnu-snippets --path /var/lib/omnu --content snippets")?;
+        std::fs::create_dir_all("/etc/omnuv")?;
+        sh("id -u omnuv >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/omnuv --create-home omnuv")?;
+        std::fs::write("/etc/omnuv/agent.yaml", &config)?;
+        sh("chgrp omnuv /etc/omnuv/agent.yaml && chmod 0640 /etc/omnuv/agent.yaml")?;
+        sh("install -d -o omnuv -g omnuv /var/lib/omnuv/snippets /var/log/omnuv")?;
+        sh("pvesm status --storage omnuv-snippets >/dev/null 2>&1 || pvesm add dir omnuv-snippets --path /var/lib/omnuv --content snippets")?;
     }
 
     println!("Installing and starting the service");
     if !a.dry_run {
-        std::fs::write("/etc/systemd/system/omnu-provider.service", UNIT)?;
-        sh("systemctl daemon-reload && systemctl enable --now omnu-provider")?;
+        std::fs::write("/etc/systemd/system/omnuv-provider.service", UNIT)?;
+        sh("systemctl daemon-reload && systemctl enable --now omnuv-provider")?;
         audit::record("join.complete", "agent", &node, "ok", Some(&a.region));
     }
 
     println!("\nDone. The agent now dials {} outward.", a.core);
-    println!("Nothing listens on this machine, and Omnu never connects to it.");
-    println!("Audit log:  /var/log/omnu/audit.log");
-    println!("Logs:       journalctl -u omnu-provider -f");
-    println!("To leave:   omnu-provider leave");
+    println!("Nothing listens on this machine, and Omnuv never connects to it.");
+    println!("Audit log:  /var/log/omnuv/audit.log");
+    println!("Logs:       journalctl -u omnuv-provider -f");
+    println!("To leave:   omnuv-provider leave");
     Ok(())
 }
 
 const UNIT: &str = r#"[Unit]
-Description=Omnu Provider Agent
+Description=Omnuv Provider Agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/omnu-provider agent --config /etc/omnu/agent.yaml
-User=omnu
-Group=omnu
+ExecStart=/usr/local/bin/omnuv-provider agent --config /etc/omnuv/agent.yaml
+User=omnuv
+Group=omnuv
 Restart=always
 RestartSec=10s
 
@@ -199,7 +199,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ReadWritePaths=/var/lib/omnu /var/log/omnu
+ReadWritePaths=/var/lib/omnuv /var/log/omnuv
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
@@ -212,15 +212,15 @@ WantedBy=multi-user.target
 /// Removes everything `join` created. A provider must be able to leave as
 /// easily as they joined, without asking us.
 pub fn leave(dry_run: bool) -> anyhow::Result<()> {
-    println!("omnu-provider leave{}", if dry_run { " (dry run)" } else { "" });
+    println!("omnuv-provider leave{}", if dry_run { " (dry run)" } else { "" });
     for (label, cmd) in [
-        ("stop service", "systemctl disable --now omnu-provider 2>/dev/null || true"),
-        ("remove unit", "rm -f /etc/systemd/system/omnu-provider.service; systemctl daemon-reload"),
-        ("remove token", "pveum user token remove omnu@pve agent 2>/dev/null || true"),
-        ("remove acl", "pveum acl delete / -token 'omnu@pve!agent' -role OmnuAgent 2>/dev/null || true; pveum acl delete / -user omnu@pve -role OmnuAgent 2>/dev/null || true"),
-        ("remove user", "pveum user delete omnu@pve 2>/dev/null || true"),
-        ("remove role", "pveum role delete OmnuAgent 2>/dev/null || true"),
-        ("remove config", "rm -f /etc/omnu/agent.yaml"),
+        ("stop service", "systemctl disable --now omnuv-provider 2>/dev/null || true"),
+        ("remove unit", "rm -f /etc/systemd/system/omnuv-provider.service; systemctl daemon-reload"),
+        ("remove token", "pveum user token remove omnuv@pve agent 2>/dev/null || true"),
+        ("remove acl", "pveum acl delete / -token 'omnuv@pve!agent' -role OmnuvAgent 2>/dev/null || true; pveum acl delete / -user omnuv@pve -role OmnuvAgent 2>/dev/null || true"),
+        ("remove user", "pveum user delete omnuv@pve 2>/dev/null || true"),
+        ("remove role", "pveum role delete OmnuvAgent 2>/dev/null || true"),
+        ("remove config", "rm -f /etc/omnuv/agent.yaml"),
     ] {
         println!("  {label}\n    $ {cmd}");
         if !dry_run {
@@ -228,6 +228,6 @@ pub fn leave(dry_run: bool) -> anyhow::Result<()> {
         }
     }
     // The audit log is deliberately left in place: it is the provider's record.
-    println!("\nRemoved. /var/log/omnu/audit.log is kept — it is your record, not ours.");
+    println!("\nRemoved. /var/log/omnuv/audit.log is kept — it is your record, not ours.");
     Ok(())
 }

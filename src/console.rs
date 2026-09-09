@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
-use omnu_protocol::ConsoleKind;
+use omnuv_protocol::ConsoleKind;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;

@@ -5,19 +5,19 @@
 //! state survives an agent restart, and nothing the marketplace did not create
 //! is ever touched.
 
-use omnu_protocol::{FirstBoot, InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment};
+use omnuv_protocol::{FirstBoot, InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment};
 
 use crate::audit;
 use crate::proxmox::Client;
 
 /// Marks VMs this agent owns on behalf of buyers. Distinct from the inference
 /// worker tag so the two lifecycles can never be confused.
-pub const TAG: &str = "omnu-instance";
+pub const TAG: &str = "omnuv-instance";
 
 /// The Proxmox pool buyer machines are cloned into. Bootstrap grants
 /// `VM.Console` on this pool and nowhere else, so the agent can open the
 /// console of a machine the marketplace built — never a provider's own.
-pub(crate) const BUYER_POOL: &str = "omnu-buyers";
+pub(crate) const BUYER_POOL: &str = "omnuv-buyers";
 
 const NO_FORM: &[(String, String)] = &[];
 
@@ -35,7 +35,7 @@ pub(crate) fn marketplace_bridge(net: &NetworkAttachment) -> String {
 /// LAN and cannot reach the host, other providers' machines or, with port
 /// isolation, another tenant's VM on the same bridge. Gateways and inference
 /// workers are marketplace-owned and stay on the provider's bridge.
-pub(crate) const EGRESS_BRIDGE: &str = "omnunat0";
+pub(crate) const EGRESS_BRIDGE: &str = "omnuvnat0";
 
 /// A stable, locally-administered MAC for a machine's marketplace interface.
 ///
@@ -71,15 +71,15 @@ pub(crate) fn resolve_dev(mac: &str) -> String {
 
 
 pub(crate) fn short_tag(id: &str) -> String {
-    format!("omnu-{}", id.replace('-', "").chars().take(12).collect::<String>())
+    format!("omnuv-{}", id.replace('-', "").chars().take(12).collect::<String>())
 }
 
 /// Where a recipe's compose file lives in the machine.
-const RECIPE_DIR: &str = "/opt/omnu/recipe";
+const RECIPE_DIR: &str = "/opt/omnuv/recipe";
 
 /// The recipe's compose file, written before any package runs. Base64: a
 /// compose file is YAML inside YAML, and escaping it would be a bug farm.
-fn recipe_files(recipe: &omnu_protocol::RecipeSpec) -> String {
+fn recipe_files(recipe: &omnuv_protocol::RecipeSpec) -> String {
     use base64::Engine as _;
     format!(
         "write_files:\n  - path: {RECIPE_DIR}/compose.yaml\n    permissions: \"0644\"\n    encoding: b64\n    content: {}\n",
@@ -92,7 +92,7 @@ fn recipe_files(recipe: &omnu_protocol::RecipeSpec) -> String {
 /// carries the driver), then `compose up` and the recipe's finishing steps.
 /// Each command is a base64 script so nothing the recipe contains can break
 /// the cloud-config it rides in.
-fn recipe_runcmd(recipe: &omnu_protocol::RecipeSpec) -> String {
+fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     use base64::Engine as _;
     let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
     let mut steps: Vec<String> = vec![
@@ -116,7 +116,7 @@ fn recipe_runcmd(recipe: &omnu_protocol::RecipeSpec) -> String {
         .collect()
 }
 
-/// cloud-init for a buyer VM. Only public keys go in; Omnu never has a private
+/// cloud-init for a buyer VM. Only public keys go in; Omnuv never has a private
 /// key to inject even if it wanted to.
 fn cloud_init(spec: &InstanceSpec) -> String {
     // Two indent levels, because the same list appears at two depths. Getting
@@ -249,7 +249,7 @@ fn private_network(net: &NetworkAttachment) -> String {
     # applies it on first boot; on every later boot networkd binds the file
     # itself, and its name sorts before the image's catch-all and any netplan
     # file so it always wins the match.
-    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/32\nDNS={gateway}\nDomains=~internal\n\n[Route]\nDestination={gateway}/32\nScope=link\n\n[Route]\nDestination={cidr}\nGateway={gateway}\nGatewayOnLink=yes\n' > /etc/systemd/network/05-omnu.network
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/32\nDNS={gateway}\nDomains=~internal\n\n[Route]\nDestination={gateway}/32\nScope=link\n\n[Route]\nDestination={cidr}\nGateway={gateway}\nGatewayOnLink=yes\n' > /etc/systemd/network/05-omnuv.network
 "#,
         address = net.address,
         gateway = net.gateway,
@@ -334,7 +334,7 @@ impl Client {
                         node,
                         vm.vmid,
                         snippet_dir,
-                        &format!("omnu-instance-{}.yaml", spec.id),
+                        &format!("omnuv-instance-{}.yaml", spec.id),
                         &cloud_init(spec),
                     )
                     .await
@@ -402,7 +402,7 @@ impl Client {
                 spec.image.id
             ),
         };
-        let file = format!("omnu-instance-{}.yaml", spec.id);
+        let file = format!("omnuv-instance-{}.yaml", spec.id);
         std::fs::write(format!("{snippet_dir}/{file}"), user_data)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
@@ -414,7 +414,7 @@ impl Client {
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
                 &[
                     ("newid".to_string(), vmid.to_string()),
-                    ("name".to_string(), format!("omnu-{}", spec.name)),
+                    ("name".to_string(), format!("omnuv-{}", spec.name)),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // The pool that carries the console grant; only machines
@@ -436,11 +436,11 @@ impl Client {
             // opens to watch it boot or rescue it, and what a Windows machine
             // uses for everything.
             ("vga".into(), "std".into()),
-            ("cicustom".into(), format!("user=omnu-snippets:snippets/{file}")),
+            ("cicustom".into(), format!("user=omnuv-snippets:snippets/{file}")),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
             (
                 "description".into(),
-                format!("Omnu instance {}\nManaged by omnu-provider. Do not edit.", spec.id),
+                format!("Omnuv instance {}\nManaged by omnuv-provider. Do not edit.", spec.id),
             ),
         ];
         let mut config = config;
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn recipe_is_written_and_brought_up_at_first_boot() {
         let mut spec = spec_with_network();
-        spec.recipe = Some(omnu_protocol::RecipeSpec {
+        spec.recipe = Some(omnuv_protocol::RecipeSpec {
             id: "ollama-openwebui".into(),
             compose: "services:\n  app:\n    image: x\n".into(),
             gpu: true,
@@ -524,7 +524,7 @@ mod tests {
         let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid cloud-config");
         // The compose file rides as base64 so its YAML can never break ours.
         let files = parsed["write_files"].as_sequence().expect("write_files");
-        assert_eq!(files[0]["path"].as_str(), Some("/opt/omnu/recipe/compose.yaml"));
+        assert_eq!(files[0]["path"].as_str(), Some("/opt/omnuv/recipe/compose.yaml"));
         assert_eq!(files[0]["encoding"].as_str(), Some("b64"));
         // Docker, the container toolkit (GPU), compose up, then the recipe's
         // own steps — each as a base64 script, after the network is bound.
@@ -559,7 +559,7 @@ mod tests {
             id: "abcdef12-0000-0000-0000-000000000000".into(),
             lifecycle: Lifecycle::Running,
             name: "gpu-1".into(),
-            image: omnu_protocol::ImageSpec::default(),
+            image: omnuv_protocol::ImageSpec::default(),
             vcpus: 2,
             memory_mib: 4096,
             disk_gib: 40,
@@ -593,7 +593,7 @@ APPS
 echo 'single' "double" `backtick` \$escaped
 "#;
         let mut spec = spec_with_network();
-        spec.recipe = Some(omnu_protocol::RecipeSpec {
+        spec.recipe = Some(omnuv_protocol::RecipeSpec {
             id: "steam-gaming".into(),
             compose: "services: {}\n".into(),
             gpu: true,
@@ -632,7 +632,7 @@ echo 'single' "double" `backtick` \$escaped
         assert!(ci.contains("qemu-guest-agent"));
         // The image's user gets the console password as a hash, the account is
         // unlocked for it, and SSH stays key-only.
-        assert!(ci.contains("- name: omnu\n    sudo:"));
+        assert!(ci.contains("- name: omnuv\n    sudo:"));
         assert!(ci.contains("lock_passwd: false"));
         assert!(ci.contains("password: \"$6$rounds=10000$"));
         assert!(ci.contains("type: hash"));
@@ -645,7 +645,7 @@ echo 'single' "double" `backtick` \$escaped
         // Our file must sort first, and the first-boot rebind (reload, then
         // reconfigure — D-Bus calls) must be in runcmd, never in bootcmd
         // where D-Bus is not up yet and they fail silently.
-        assert!(ci.contains("05-omnu.network"));
+        assert!(ci.contains("05-omnuv.network"));
         let reload = ci.find("networkctl reload").expect("reloads");
         let reconf = ci.find("networkctl reconfigure $DEV").expect("reconfigures");
         assert!(run < reload && reload < reconf, "rebind lives in runcmd, reload before reconfigure");

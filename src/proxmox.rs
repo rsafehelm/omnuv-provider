@@ -1,7 +1,7 @@
 //! Read-only inventory discovery against the Proxmox VE REST API.
 //!
 //! This is the narrow first slice of the Proxmox compute driver: it normalizes
-//! what the host reports into `omnu_protocol::InventoryReport` and nothing else.
+//! what the host reports into `omnuv_protocol::InventoryReport` and nothing else.
 //! Proxmox concepts (node names, storage ids, PCI addresses) stop here.
 //!
 //! Discovery reports the DECLARED CONTRIBUTION clamped to physical reality, not
@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use omnu_protocol::{ComputeCapabilities, GpuDevice, InventoryReport, NodeInventory, RuntimeKind};
+use omnuv_protocol::{ComputeCapabilities, GpuDevice, InventoryReport, NodeInventory, RuntimeKind};
 use serde::Deserialize;
 
 use crate::config::{Contribution, ProxmoxTarget};
@@ -113,7 +113,7 @@ pub struct Client {
     pub(crate) auth: String,
     node: Option<String>,
     contribute: Contribution,
-    location: Option<omnu_protocol::GeoLocation>,
+    location: Option<omnuv_protocol::GeoLocation>,
     city: Option<String>,
 }
 
@@ -144,7 +144,7 @@ impl Client {
         token_secret: &str,
         node: Option<String>,
         contribute: Contribution,
-        location: Option<omnu_protocol::GeoLocation>,
+        location: Option<omnuv_protocol::GeoLocation>,
         city: Option<String>,
     ) -> anyhow::Result<Self> {
         let tls = crate::tls::config(fingerprint)?;
@@ -489,7 +489,7 @@ impl Client {
         }
 
         Ok(InventoryReport {
-            protocol_version: omnu_protocol::PROTOCOL_VERSION,
+            protocol_version: omnuv_protocol::PROTOCOL_VERSION,
             runtime: RuntimeKind::Proxmox,
             // Filled in by the agent from its own image map before reporting.
             images: Vec::new(),

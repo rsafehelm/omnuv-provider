@@ -28,7 +28,7 @@
 //! never makes a healthy provider look offline — it still heartbeats, still
 //! reports inventory, still serves inference, and can be told to rebuild this.
 
-use omnu_protocol::{GatewaySpec, GatewayState, GatewayStatus, Lifecycle};
+use omnuv_protocol::{GatewaySpec, GatewayState, GatewayStatus, Lifecycle};
 
 use crate::audit;
 use crate::proxmox;
@@ -36,7 +36,7 @@ use crate::proxmox;
 /// An empty form body, for POSTs that carry no parameters.
 const NO_FORM: &[(String, String)] = &[];
 
-pub const TAG: &str = "omnu-gateway";
+pub const TAG: &str = "omnuv-gateway";
 
 /// The gateway's root disk.
 ///
@@ -153,7 +153,7 @@ iptables -t mangle -C INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP 2>/dev/null || ipt
 fn fence_script(mac: &str) -> String {
     format!(
         "#!/bin/sh\n\
-         # Managed by omnu-provider; re-run on a timer. Do not edit.\n\
+         # Managed by omnuv-provider; re-run on a timer. Do not edit.\n\
          {resolve}\n\
          [ -n \"$DEV\" ] || exit 0\n\
          sysctl -qw net.ipv4.ip_forward=1\n\
@@ -191,9 +191,9 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # Without forwarding the VM is not a gateway at all: buyer traffic arrives
     # from the overlay and would be dropped instead of forwarded onto the bridge.
     sysctl -w net.ipv4.ip_forward=1
-    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-omnu.conf
+    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-omnuv.conf
     # Declarative copy so systemd-networkd owns the interface across reboots.
-    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={addr}\nIPForward=yes\n' > /etc/systemd/network/10-omnu.network
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={addr}\nIPForward=yes\n' > /etc/systemd/network/10-omnuv.network
     systemctl enable systemd-networkd 2>/dev/null || true
     # Install the fence and put it on a timer. Here, in bootcmd, rather than in
     # write_files: that module runs on a machine's first boot only, so a
@@ -206,13 +206,13 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # reply path, because a buyer machine has no route back to an overlay
     # address. Applying them once is not enough; they have to be true
     # continuously. Every line is check-then-insert, so re-running is free.
-    echo {fence} | base64 -d > /usr/local/sbin/omnu-gateway-fence
-    chmod 0755 /usr/local/sbin/omnu-gateway-fence
-    printf '[Unit]\nDescription=Re-assert the Omnu gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnu-gateway-fence\n' > /etc/systemd/system/omnu-gateway-fence.service
-    printf '[Unit]\nDescription=Keep the Omnu gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnu-gateway-fence.timer
+    echo {fence} | base64 -d > /usr/local/sbin/omnuv-gateway-fence
+    chmod 0755 /usr/local/sbin/omnuv-gateway-fence
+    printf '[Unit]\nDescription=Re-assert the Omnuv gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-fence\n' > /etc/systemd/system/omnuv-gateway-fence.service
+    printf '[Unit]\nDescription=Keep the Omnuv gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-fence.timer
     systemctl daemon-reload
-    systemctl enable --now --no-block omnu-gateway-fence.timer 2>/dev/null || true
-    /usr/local/sbin/omnu-gateway-fence || true
+    systemctl enable --now --no-block omnuv-gateway-fence.timer 2>/dev/null || true
+    /usr/local/sbin/omnuv-gateway-fence || true
 "#,
             addr = addr,
             mac = crate::instance::marketplace_mac(&spec.id),
@@ -240,13 +240,13 @@ fn cloud_init(spec: &GatewaySpec) -> String {
                 .map(|l| format!("      {l}\n"))
                 .collect();
             format!(
-                "  - path: /etc/dnsmasq.d/omnu.conf
+                "  - path: /etc/dnsmasq.d/omnuv.conf
     content: |
       bind-dynamic
       listen-address={ip}
       no-resolv
       local=/internal/
-      hostsdir=/etc/omnu/hosts.d
+      hostsdir=/etc/omnuv/hosts.d
   - path: {DNS_HOSTS_PATH}
     content: |
 {seed}"
@@ -257,16 +257,16 @@ fn cloud_init(spec: &GatewaySpec) -> String {
 
     format!(
         "#cloud-config
-# Omnu marketplace overlay gateway. Managed by omnu-provider; do not edit.
+# Omnuv marketplace overlay gateway. Managed by omnuv-provider; do not edit.
 #
 # This VM is one buyer network's overlay peer on this provider. The hypervisor
 # never runs the overlay client, because a WireGuard interface writing routes
 # there could take the host and every guest on it off the network.
-hostname: omnu-gw-{short}
+hostname: omnuv-gw-{short}
 manage_etc_hosts: true
 users:
   - default
-  - name: omnu
+  - name: omnuv
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: true
@@ -276,10 +276,10 @@ users:
   - qemu-guest-agent
   - dnsmasq
 write_files:
-  - path: /etc/omnu/gateway.env
+  - path: /etc/omnuv/gateway.env
     permissions: '0600'
     content: |
-      OMNU_GATEWAY_ID={id}
+      OMNUV_GATEWAY_ID={id}
       NB_MANAGEMENT_URL={mgmt}
 {dns}# bootcmd runs in the init stage, before the config stage where apt runs. A
 # slow or absent apt must not delay the gateway's address, forwarding or the
@@ -290,7 +290,7 @@ bootcmd:
   # it is a deadlock that looks like a boot stuck at cloud-init-network.
   - [ sh, -c, \"systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true\" ]
 {routes}runcmd:
-  - [ mkdir, -p, /etc/omnu ]
+  - [ mkdir, -p, /etc/omnuv ]
   # runcmd is the final stage, after packages: both are installed by then.
   - [ sh, -c, \"systemctl enable --now qemu-guest-agent || true\" ]
   - [ sh, -c, \"systemctl enable --now dnsmasq || true\" ]
@@ -300,7 +300,7 @@ bootcmd:
   # is time-bounded so it can never hang the boot.
   - [ sh, -c, \"command -v netbird >/dev/null || timeout 60 bash -c 'curl -fsSL https://pkgs.netbird.io/install.sh | sh' || true\" ]
   - [ sh, -c, \"systemctl enable --now netbird || true\" ]
-  - [ sh, -c, \"netbird up --management-url {mgmt} --setup-key {key} --hostname omnu-gw-{short}\" ]",
+  - [ sh, -c, \"netbird up --management-url {mgmt} --setup-key {key} --hostname omnuv-gw-{short}\" ]",
         keys = if keys.is_empty() { "      []\n".to_string() } else { keys },
         id = spec.id,
         mgmt = spec.management_url,
@@ -385,7 +385,7 @@ impl proxmox::Client {
             let mut refreshed = false;
             if running && spec.lifecycle == Lifecycle::Running {
                 match self
-                    .sync_cloud_init(node, vm.vmid, snippet_dir, &format!("omnu-gw-{tag}.yaml"), &cloud_init(spec))
+                    .sync_cloud_init(node, vm.vmid, snippet_dir, &format!("omnuv-gw-{tag}.yaml"), &cloud_init(spec))
                     .await
                 {
                     Ok(true) => {
@@ -444,7 +444,7 @@ impl proxmox::Client {
         let bridge = crate::sdn::vnet_for(&spec.network_id);
         self.ensure_vnet(node, &bridge).await?;
 
-        let file = format!("omnu-gw-{tag}.yaml");
+        let file = format!("omnuv-gw-{tag}.yaml");
         std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec))
             .map_err(|e| anyhow::anyhow!("writing the gateway's cloud-init: {e}"))?;
 
@@ -454,7 +454,7 @@ impl proxmox::Client {
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
                 &[
                     ("newid".to_string(), vmid.to_string()),
-                    ("name".to_string(), format!("omnu-gw-{tag}")),
+                    ("name".to_string(), format!("omnuv-gw-{tag}")),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // Into the pool that carries the file-write grant; a
@@ -490,7 +490,7 @@ impl proxmox::Client {
                     "net1".to_string(),
                     format!("virtio={},bridge={bridge}", crate::instance::marketplace_mac(&spec.id)),
                 ),
-                ("cicustom".to_string(), format!("user=omnu-snippets:snippets/{file}")),
+                ("cicustom".to_string(), format!("user=omnuv-snippets:snippets/{file}")),
                 ("tags".to_string(), format!("{TAG};{tag}")),
                 // The gateway must come back with the host, or a reboot leaves
                 // the provider silently off the overlay.
@@ -504,8 +504,8 @@ impl proxmox::Client {
                 (
                     "description".into(),
                     format!(
-                        "Omnu overlay gateway {}\nOne buyer network's overlay peer on this \
-                         provider; the host never runs it.\nManaged by omnu-provider. Do not edit.",
+                        "Omnuv overlay gateway {}\nOne buyer network's overlay peer on this \
+                         provider; the host never runs it.\nManaged by omnuv-provider. Do not edit.",
                         spec.id
                     ),
                 ),
@@ -579,19 +579,19 @@ impl proxmox::Client {
 /// `VM.GuestAgent.FileWrite` on this pool and nowhere else, so the agent can
 /// write the resolver's map into its own gateway and into nothing else on the
 /// host — not a buyer VM, not the provider's own machines.
-pub(crate) const GATEWAY_POOL: &str = "omnu";
+pub(crate) const GATEWAY_POOL: &str = "omnuv";
 
 /// Where the gateway's resolver reads the project's names. dnsmasq watches
 /// the directory (`hostsdir`), so replacing this file is the whole update.
-const DNS_HOSTS_PATH: &str = "/etc/omnu/hosts.d/project";
+const DNS_HOSTS_PATH: &str = "/etc/omnuv/hosts.d/project";
 
 /// The resolver's hosts file: one `address name` line per record, sorted so
 /// the same map always produces the same bytes.
-fn hosts_file(records: &[omnu_protocol::DnsRecord]) -> String {
+fn hosts_file(records: &[omnuv_protocol::DnsRecord]) -> String {
     let mut lines: Vec<String> =
         records.iter().map(|r| format!("{} {}", r.address, r.name)).collect();
     lines.sort();
-    let mut out = String::from("# Managed by omnu-provider; the marketplace owns these names.\n");
+    let mut out = String::from("# Managed by omnuv-provider; the marketplace owns these names.\n");
     for l in lines {
         out.push_str(&l);
         out.push('\n');
@@ -667,7 +667,7 @@ mod tests {
             slice_address: Some("10.200.7.1/24".into()),
             advertise_cidr: Some("10.200.7.0/24".into()),
             ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
-            dns_records: vec![omnu_protocol::DnsRecord {
+            dns_records: vec![omnuv_protocol::DnsRecord {
                 name: "gpu-2.internal".into(),
                 address: "10.200.7.11".into(),
             }],
@@ -676,15 +676,15 @@ mod tests {
         // The resolver listens on the slice address only, is authoritative for
         // `internal`, reads a watched directory, and is seeded with the map.
         assert!(ci.contains("listen-address=10.200.7.1\n"));
-        assert!(ci.contains("hostsdir=/etc/omnu/hosts.d"));
+        assert!(ci.contains("hostsdir=/etc/omnuv/hosts.d"));
         assert!(ci.contains("10.200.7.11 gpu-2.internal"));
         // The rules ride as a script the gateway re-runs, so they are asserted
         // where they actually live rather than in the document that carries
         // them. The timer is what makes them true continuously: the overlay
         // client rebuilds the firewall when its routing changes, and applying
         // these once at boot loses them without a word.
-        assert!(ci.contains("/usr/local/sbin/omnu-gateway-fence"));
-        assert!(ci.contains("omnu-gateway-fence.timer"));
+        assert!(ci.contains("/usr/local/sbin/omnuv-gateway-fence"));
+        assert!(ci.contains("omnuv-gateway-fence.timer"));
         assert!(ci.contains("OnUnitActiveSec=60s"));
         let fence = fence_script("02:09:a4:76:f8:ee");
         // The gateway must never be a path from the bridge to the provider's
@@ -763,8 +763,8 @@ mod tests {
             advertise_cidr: Some("10.200.7.0/24".into()),
             ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
             dns_records: vec![
-                omnu_protocol::DnsRecord { name: "b.internal".into(), address: "10.200.7.11".into() },
-                omnu_protocol::DnsRecord { name: "a.internal".into(), address: "10.200.7.10".into() },
+                omnuv_protocol::DnsRecord { name: "b.internal".into(), address: "10.200.7.11".into() },
+                omnuv_protocol::DnsRecord { name: "a.internal".into(), address: "10.200.7.10".into() },
             ],
         };
         assert_eq!(cloud_init(&spec), cloud_init(&spec));
