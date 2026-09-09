@@ -138,6 +138,15 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             crate::tunnel::run(&url, &token, resolve, nudge_tx, consoles).await;
         });
     }
+    // The desired state the agent already holds. Keeping it lets the agent ask
+    // Core with `?known=<version>` and be sent nothing when nothing changed,
+    // and it is the copy it maintains from while Core is unreachable. It is
+    // state the agent can always rebuild by asking again, which is the only
+    // kind it is allowed to hold: the moment it kept something unrecoverable
+    // it would need a database, and it would have become the second
+    // orchestration store the architecture forbids.
+    let held: Arc<Mutex<Option<DesiredState>>> = Arc::new(Mutex::new(None));
+
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
     let mut inventory = tokio::time::interval(std::time::Duration::from_secs(cfg.inventory_every_secs));
     // Reconciliation is push-driven; this interval is only the fallback for a
@@ -163,12 +172,12 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 }
             }
             _ = nudge.notified() => {
-                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints).await {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held).await {
                     eprintln!("reconcile (pushed) failed: {e}");
                 }
             }
             _ = reconcile.tick() => {
-                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints).await {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held).await {
                     eprintln!("reconcile failed: {e}");
                 }
             }
@@ -249,15 +258,62 @@ async fn reconcile_workers(
     driver: &proxmox::Client,
     cfg: &AgentConfig,
     endpoints: &Arc<Mutex<HashMap<String, String>>>,
+    held: &Arc<Mutex<Option<DesiredState>>>,
 ) -> anyhow::Result<()> {
-    let desired: DesiredState = core.get_json("/provider/v1/desired-state").await?;
-    if desired.protocol_version != omnuv_protocol::PROTOCOL_VERSION {
+    let node = cfg.proxmox.node.as_deref().unwrap_or_default();
+    let known = held.lock().ok().and_then(|h| h.as_ref().map(|d| d.version)).unwrap_or(0);
+
+    let fetched: DesiredState =
+        match core.get_json(&format!("/provider/v1/desired-state?known={known}")).await {
+            Ok(d) => d,
+            Err(e) => {
+                // Core is unreachable. Maintain, do not decide: the copy in
+                // hand is stale, so nothing is created and nothing is
+                // destroyed, but a machine that was meant to be running and
+                // has crashed is started again. An outage of the control plane
+                // must not become an outage of somebody's machine.
+                let specs = held
+                    .lock()
+                    .ok()
+                    .and_then(|h| h.as_ref().map(|d| d.instances.clone()))
+                    .unwrap_or_default();
+                if specs.is_empty() {
+                    return Err(e);
+                }
+                match driver.maintain(node, &specs).await {
+                    Ok(0) => {}
+                    Ok(n) => println!("core unreachable; maintained {n} machine(s), decided nothing"),
+                    Err(me) => eprintln!("core unreachable and maintenance failed: {me}"),
+                }
+                return Err(e);
+            }
+        };
+    if fetched.protocol_version != omnuv_protocol::PROTOCOL_VERSION {
         anyhow::bail!(
             "core speaks protocol v{}, this agent speaks v{}",
-            desired.protocol_version,
+            fetched.protocol_version,
             omnuv_protocol::PROTOCOL_VERSION
         );
     }
+
+    // `unchanged` saves the transfer, never the work: reconciliation runs every
+    // tick against the copy in hand, because drift on the hypervisor is exactly
+    // what this loop exists to correct.
+    let desired = if fetched.unchanged {
+        match held.lock().ok().and_then(|h| h.clone()) {
+            Some(d) => d,
+            // Core says nothing changed but we hold nothing. Ask again in full
+            // rather than reconciling against an empty picture, which would
+            // read as "delete everything".
+            None => core.get_json("/provider/v1/desired-state").await?,
+        }
+    } else {
+        if let Ok(mut h) = held.lock() {
+            *h = Some(fetched.clone());
+        }
+        fetched
+    };
+
     if desired.inference_workers.is_empty()
         && desired.instances.is_empty()
         && desired.gateways.is_empty()
@@ -265,7 +321,6 @@ async fn reconcile_workers(
         return Ok(());
     }
 
-    let node = cfg.proxmox.node.as_deref().unwrap_or_default();
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
 
     // Gateways first: each carries one buyer network's traffic and creates
@@ -281,6 +336,8 @@ async fn reconcile_workers(
                 Ok(()) => omnuv_protocol::GatewayStatus {
                     id: spec.id.clone(),
                     state: omnuv_protocol::GatewayState::Offline,
+                    retryable: None,
+                    waiting_on: None,
                     local_id: None,
                     overlay_address: None,
                     message: Some("deleted".into()),
@@ -299,6 +356,8 @@ async fn reconcile_workers(
                     omnuv_protocol::GatewayStatus {
                         id: spec.id.clone(),
                         state: omnuv_protocol::GatewayState::Error,
+                        retryable: None,
+                        waiting_on: None,
                         local_id: None,
                         overlay_address: None,
                         message: Some(e.to_string().chars().take(400).collect()),
@@ -324,6 +383,8 @@ async fn reconcile_workers(
                 .map(|_| WorkerStatus {
                     id: spec.id.clone(),
                     state: WorkerState::Offline,
+                    retryable: None,
+                    waiting_on: None,
                     local_id: None,
                     endpoint: None,
                     message: Some("deleted".into()),
@@ -347,6 +408,8 @@ async fn reconcile_workers(
             WorkerStatus {
                 id: spec.id.clone(),
                 state: WorkerState::Error,
+                retryable: None,
+                waiting_on: None,
                 local_id: None,
                 endpoint: None,
                 message: Some(e.to_string().chars().take(400).collect()),
@@ -388,6 +451,8 @@ async fn reconcile_workers(
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Stopped,
+                retryable: None,
+                waiting_on: None,
                 local_id: None,
                 private_ip: None,
                 message: Some("deleted".into()),
@@ -404,13 +469,20 @@ async fn reconcile_workers(
         };
         instances.push(result.unwrap_or_else(|e| {
             eprintln!("instance {}: {e}", spec.id);
+            let why = e.to_string();
+            // Why, and whether trying again could plausibly work. Without this
+            // Core has to poll to learn anything, and it will re-drive an
+            // impossible request until its horizon for no reason.
+            let retryable = !why.contains("is not offered by this provider");
             InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Error,
+                retryable: Some(retryable),
+                waiting_on: (!retryable).then(|| "a provider that offers this image".to_string()),
                 local_id: None,
                 private_ip: None,
-                message: Some(e.to_string().chars().take(400).collect()),
+                message: Some(why.chars().take(400).collect()),
             }
         }));
     }

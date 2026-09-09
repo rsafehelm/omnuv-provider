@@ -342,6 +342,8 @@ impl proxmox::Client {
                 return Ok(GatewayStatus {
                     id: spec.id.clone(),
                     state: GatewayState::Error,
+                    retryable: None,
+                    waiting_on: None,
                     local_id: None,
                     overlay_address: None,
                     message: Some(why),
@@ -423,6 +425,8 @@ impl proxmox::Client {
                     (true, false) => GatewayState::Deploying,
                     _ => GatewayState::Offline,
                 },
+                retryable: None,
+                waiting_on: None,
                 local_id: Some(vm.vmid.to_string()),
                 overlay_address: addr,
                 message: refreshed.then(|| "configuration refreshed; rebooting".to_string()),
@@ -433,6 +437,8 @@ impl proxmox::Client {
             return Ok(GatewayStatus {
                 id: spec.id.clone(),
                 state: GatewayState::Offline,
+                retryable: None,
+                waiting_on: None,
                 local_id: None,
                 overlay_address: None,
                 message: Some("not present".into()),
@@ -522,6 +528,8 @@ impl proxmox::Client {
         Ok(GatewayStatus {
             id: spec.id.clone(),
             state: GatewayState::Deploying,
+            retryable: None,
+            waiting_on: None,
             local_id: Some(vmid.to_string()),
             overlay_address: None,
             message: Some(format!("gateway vm {vmid} created and started")),
@@ -640,6 +648,7 @@ mod tests {
     fn a_refused_slice_is_not_written_into_cloud_init() {
         let spec = GatewaySpec {
             id: "abcdef12".into(),
+            budget_secs: None,
             network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
@@ -660,6 +669,7 @@ mod tests {
     fn a_slice_that_is_allowed_is_written() {
         let spec = GatewaySpec {
             id: "abcdef12".into(),
+            budget_secs: None,
             network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
@@ -736,6 +746,7 @@ mod tests {
         // A mismatch never reaches cloud-init: no forwarding is written.
         let spec = GatewaySpec {
             id: "abcdef12".into(),
+            budget_secs: None,
             network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),
@@ -755,6 +766,7 @@ mod tests {
     fn cloud_init_is_deterministic() {
         let spec = GatewaySpec {
             id: "abcdef12".into(),
+            budget_secs: None,
             network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
             lifecycle: Lifecycle::Running,
             management_url: "https://nb.example".into(),

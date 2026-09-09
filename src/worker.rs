@@ -205,6 +205,8 @@ impl Client {
             return Ok(WorkerStatus {
                 id: spec.id.clone(),
                 state: worker_state(running, endpoint.is_some(), serving),
+                retryable: None,
+                waiting_on: None,
                 local_id: Some(vm.vmid.to_string()),
                 endpoint: serving.then(|| endpoint.clone()).flatten(),
                 message: match (running, endpoint.is_some(), serving) {
@@ -268,6 +270,8 @@ impl Client {
         Ok(WorkerStatus {
             id: spec.id.clone(),
             state: WorkerState::Deploying,
+            retryable: None,
+            waiting_on: None,
             local_id: Some(vmid.to_string()),
             endpoint: None,
             message: Some(format!("vm {vmid} created and started")),
@@ -356,6 +360,7 @@ mod tests {
         use omnuv_protocol::{InferenceWorkerSpec, Lifecycle};
         let spec = InferenceWorkerSpec {
             id: "w1".into(),
+            budget_secs: None,
             lifecycle: Lifecycle::Running,
             image: "vllm/vllm-openai:latest".into(),
             model_repo: "org/model".into(),

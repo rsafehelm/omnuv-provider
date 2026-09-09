@@ -375,6 +375,8 @@ impl Client {
                     (true, false) => InstanceState::Provisioning,
                     (false, _) => InstanceState::Stopped,
                 },
+                retryable: None,
+                waiting_on: None,
                 local_id: Some(vm.vmid.to_string()),
                 private_ip,
                 message: None,
@@ -386,6 +388,8 @@ impl Client {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Stopped,
+                retryable: None,
+                waiting_on: None,
                 local_id: None,
                 private_ip: None,
                 message: Some("already removed".into()),
@@ -484,10 +488,45 @@ impl Client {
             id: spec.id.clone(),
             rebooted_token: None,
             state: InstanceState::Provisioning,
+            retryable: None,
+            waiting_on: None,
             local_id: Some(vmid.to_string()),
             private_ip: None,
             message: Some(format!("vm {vmid} created")),
         })
+    }
+
+    /// While Core is unreachable: **maintain, do not decide.**
+    ///
+    /// The desired state in hand is stale, and a buyer may have deleted the
+    /// very thing this would rebuild — so nothing is created and nothing is
+    /// destroyed. What is left is the part that is safe under any stale
+    /// instruction: a machine that was meant to be running, that already
+    /// exists here, and that has stopped, is started again. A Core outage must
+    /// not freeze a provider, and a stale instruction must not do damage.
+    pub async fn maintain(&self, node: &str, specs: &[InstanceSpec]) -> anyhow::Result<usize> {
+        let mut restarted = 0;
+        for spec in specs {
+            if !maintenance_may_touch(spec.lifecycle, true, false) {
+                continue;
+            }
+            // Never create: absence is exactly the case where the stale
+            // instruction might be wrong.
+            let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(&spec.id)).await? else {
+                continue;
+            };
+            let running = vm.status.as_deref() == Some("running");
+            if !maintenance_may_touch(spec.lifecycle, true, running) {
+                continue;
+            }
+            let upid: String = self
+                .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
+                .await?;
+            self.wait_task(node, &upid).await?;
+            audit::record("instance.maintain", "agent", &spec.id, "restarted", Some(&vm.vmid.to_string()));
+            restarted += 1;
+        }
+        Ok(restarted)
     }
 
     pub async fn delete_instance(&self, node: &str, id: &str) -> anyhow::Result<()> {
@@ -507,8 +546,33 @@ impl Client {
     }
 }
 
+/// The whole of what maintenance is allowed to do, as one rule.
+///
+/// While Core is unreachable the desired state in hand is stale, so the only
+/// safe action is the one that is right under *any* stale instruction: start a
+/// machine that was meant to be running and has stopped. Creating is deciding,
+/// because the buyer may have deleted it. Stopping and deleting are deciding
+/// for the same reason.
+pub(crate) fn maintenance_may_touch(lifecycle: Lifecycle, exists: bool, running: bool) -> bool {
+    lifecycle == Lifecycle::Running && exists && !running
+}
+
 #[cfg(test)]
 mod tests {
+    /// Maintenance restarts what crashed and does nothing else. Every other
+    /// combination is a decision, and decisions belong to Core.
+    #[test]
+    fn maintenance_only_restarts_what_crashed() {
+        use super::maintenance_may_touch;
+        use omnuv_protocol::Lifecycle;
+        assert!(maintenance_may_touch(Lifecycle::Running, true, false), "crashed: start it");
+        assert!(!maintenance_may_touch(Lifecycle::Running, true, true), "already running");
+        assert!(!maintenance_may_touch(Lifecycle::Running, false, false), "absent: creating is deciding");
+        assert!(!maintenance_may_touch(Lifecycle::Stopped, true, true), "stopping is deciding");
+        assert!(!maintenance_may_touch(Lifecycle::Deleted, true, true), "deleting is deciding");
+        assert!(!maintenance_may_touch(Lifecycle::Deleted, true, false), "a stale delete must not start it either");
+    }
+
     use super::*;
 
     #[test]
@@ -557,6 +621,7 @@ mod tests {
     fn spec_with_network() -> InstanceSpec {
         InstanceSpec {
             id: "abcdef12-0000-0000-0000-000000000000".into(),
+            budget_secs: None,
             lifecycle: Lifecycle::Running,
             name: "gpu-1".into(),
             image: omnuv_protocol::ImageSpec::default(),
