@@ -161,6 +161,23 @@ impl Client {
         }))
     }
 
+    /// Machines this agent built under the project's old name.
+    ///
+    /// Their tags no longer match what the agent looks for, so to it they are
+    /// invisible — and invisible reads as "not created yet". Converging on that
+    /// would build a second copy of every machine and orphan the first, still
+    /// holding its GPU. The agent refuses to converge while any are present.
+    pub(crate) async fn legacy_marketplace_vms(&self, node: &str) -> anyhow::Result<Vec<u32>> {
+        let vms: Vec<VmRef> = self.get_json(&format!("/nodes/{node}/qemu")).await?;
+        Ok(vms
+            .into_iter()
+            .filter(|v| {
+                v.tags.as_deref().is_some_and(crate::instance::is_legacy_marketplace_tag)
+            })
+            .map(|v| v.vmid)
+            .collect())
+    }
+
     async fn find_worker_vm(&self, node: &str, worker_id: &str) -> anyhow::Result<Option<VmRef>> {
         self.find_tagged_vm(node, TAG, &short_tag(worker_id)).await
     }

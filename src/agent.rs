@@ -261,6 +261,26 @@ async fn reconcile_workers(
     held: &Arc<Mutex<Option<DesiredState>>>,
 ) -> anyhow::Result<()> {
     let node = cfg.proxmox.node.as_deref().unwrap_or_default();
+
+    // Refuse rather than guess. Machines built before the project was renamed
+    // carry tags this agent no longer recognises, and to it they look like
+    // machines that were never created — so converging would build a second
+    // copy of each and orphan the first with its card still attached. The
+    // migration is a playbook; until it has run, this agent does nothing.
+    match driver.legacy_marketplace_vms(node).await {
+        Ok(vms) if !vms.is_empty() => {
+            anyhow::bail!(
+                "refusing to converge: {} machine(s) on this node still carry pre-rename tags                  ({}). They are invisible to this agent, so converging would create duplicates.                  Run deployment/ansible/rename-provider.yml first.",
+                vms.len(),
+                vms.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            );
+        }
+        Ok(_) => {}
+        // A hypervisor we cannot list is a separate problem; the fetch below
+        // will fail too and report it in its own words.
+        Err(e) => eprintln!("could not check for pre-rename machines: {e}"),
+    }
+
     let known = held.lock().ok().and_then(|h| h.as_ref().map(|d| d.version)).unwrap_or(0);
 
     let fetched: DesiredState =
@@ -492,6 +512,9 @@ async fn reconcile_workers(
 
     let report = StatusReport {
         protocol_version: omnuv_protocol::PROTOCOL_VERSION,
+        // What this agent actually did since the last report, in its own
+        // words. Bounded here and again at Core.
+        audit: audit::drain(100),
         workers: statuses,
         instances,
         gateways,

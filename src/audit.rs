@@ -22,6 +22,23 @@ const DEFAULT_PATH: &str = "/var/log/omnuv/audit.log";
 
 static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
+/// Records not yet sent to the marketplace.
+///
+/// The file on the provider's disk stays authoritative for the provider; this
+/// is the subset that travels up so Core can show them what was asked of their
+/// hardware in the same words, and so a buyer's timeline can say what actually
+/// happened rather than only what state a thing reached.
+///
+/// Bounded, and dropped oldest-first when full: an agent that cannot reach
+/// Core for a day must not grow a queue until it runs the host out of memory.
+/// Losing the tail here costs the marketplace's *copy* of a record, never the
+/// provider's, which is the right way round.
+static PENDING: Mutex<std::collections::VecDeque<omnuv_protocol::AuditEntry>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// How many unsent records the agent will hold.
+const PENDING_MAX: usize = 500;
+
 #[derive(Serialize)]
 struct Record<'a> {
     ts: String,
@@ -74,6 +91,32 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
             let _ = f.flush();
         }
     }
+
+    if let Ok(mut q) = PENDING.lock() {
+        while q.len() >= PENDING_MAX {
+            q.pop_front();
+        }
+        q.push_back(omnuv_protocol::AuditEntry {
+            at: ts,
+            action: action.to_string(),
+            actor: actor.to_string(),
+            subject: subject.to_string(),
+            outcome: outcome.to_string(),
+            detail: detail.map(str::to_string),
+        });
+    }
+}
+
+/// Takes the records waiting to go up, for one status report.
+///
+/// Destructive: a record that leaves here is not sent twice. If the report then
+/// fails, the marketplace never sees those lines — which is the correct trade,
+/// because the provider's own file has them and that is the copy that is
+/// supposed to be authoritative for the provider.
+pub fn drain(max: usize) -> Vec<omnuv_protocol::AuditEntry> {
+    let Ok(mut q) = PENDING.lock() else { return vec![] };
+    let take = max.min(q.len());
+    q.drain(..take).collect()
 }
 
 /// Redaction policy, stated once so it is not re-decided per call site.

@@ -546,6 +546,28 @@ impl Client {
     }
 }
 
+/// The tag prefix this agent used before the project was renamed.
+///
+/// A machine carries the marketplace's name in its tags, and that is how the
+/// agent recognises what it built. After the rename an agent looking for
+/// `omnuv-instance` finds nothing on a host whose machines say `omnu-instance`
+/// — and "nothing" is indistinguishable from "not created yet", so it would
+/// build a second copy of every machine and orphan the first, GPU and all.
+///
+/// So the agent refuses to reconcile while it can see the old name. Refusing is
+/// the only safe reading: the alternative is to guess, and the guess is
+/// expensive.
+pub const LEGACY_TAG_PREFIX: &str = "omnu-";
+
+/// Whether a tag list belongs to a machine this agent built under the old name.
+/// `omnu-instance` yes; `omnuv-instance` no, because the new prefix starts with
+/// the old one.
+pub(crate) fn is_legacy_marketplace_tag(tags: &str) -> bool {
+    tags.split(&[';', ','][..]).map(str::trim).any(|t| {
+        matches!(t, "omnu-instance" | "omnu-gateway" | "omnu-worker")
+    })
+}
+
 /// The whole of what maintenance is allowed to do, as one rule.
 ///
 /// While Core is unreachable the desired state in hand is stale, so the only
@@ -559,6 +581,21 @@ pub(crate) fn maintenance_may_touch(lifecycle: Lifecycle, exists: bool, running:
 
 #[cfg(test)]
 mod tests {
+    /// The rename guard has to tell the two prefixes apart, because one is a
+    /// prefix of the other and getting it wrong either blocks a healthy host
+    /// forever or lets the duplicate-machine accident through.
+    #[test]
+    fn the_old_tags_are_recognised_and_the_new_ones_are_not() {
+        use super::is_legacy_marketplace_tag;
+        assert!(is_legacy_marketplace_tag("omnu-42472e172c55;omnu-instance"));
+        assert!(is_legacy_marketplace_tag("gw-bfd571c2;omnu-gateway"));
+        assert!(is_legacy_marketplace_tag("omnu-worker"));
+        assert!(!is_legacy_marketplace_tag("omnuv-42472e172c55;omnuv-instance"));
+        assert!(!is_legacy_marketplace_tag("omnuv-gateway"));
+        assert!(!is_legacy_marketplace_tag(""));
+        assert!(!is_legacy_marketplace_tag("someone-elses-vm"));
+    }
+
     /// Maintenance restarts what crashed and does nothing else. Every other
     /// combination is a decision, and decisions belong to Core.
     #[test]
