@@ -27,6 +27,14 @@ pub(crate) struct VmRef {
     pub(crate) status: Option<String>,
 }
 
+/// The marketplace attaches a card with its option ROM hidden (`rombar=0`).
+///
+/// A marketplace GPU is a compute device: nothing ever draws on it, so the
+/// VBIOS the ROM bar exposes is never needed. Hiding it also makes a host's
+/// *boot* GPU usable, which is otherwise unusable — the firmware shadows that
+/// card's ROM and a guest driver reading it fails to initialize the adapter.
+/// Verified on Pluto's `0000:5d:00.0`, the boot card: with the ROM bar hidden
+/// the guest's driver loads and `nvidia-smi` lists the 3090.
 pub(crate) fn mapping_name(pci: &str) -> String {
     format!("omnu-gpu-{}", pci.replace([':', '.'], "-"))
 }
@@ -242,7 +250,7 @@ impl Client {
         // Mappings rather than raw addresses: a non-root token may only attach
         // a device the host has explicitly published.
         for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
-            config.push((format!("hostpci{i}"), format!("mapping={},pcie=1", mapping_name(pci))));
+            config.push((format!("hostpci{i}"), format!("mapping={},pcie=1,rombar=0", mapping_name(pci))));
         }
         self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
 

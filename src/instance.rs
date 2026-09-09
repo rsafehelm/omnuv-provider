@@ -451,7 +451,7 @@ impl Client {
         for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
             config.push((
                 format!("hostpci{i}"),
-                format!("mapping={},pcie=1", crate::worker::mapping_name(pci)),
+                format!("mapping={},pcie=1,rombar=0", crate::worker::mapping_name(pci)),
             ));
         }
         // The template's net0 sits on the provider's own bridge. A buyer
