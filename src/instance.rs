@@ -35,7 +35,11 @@ pub(crate) fn marketplace_bridge(net: &NetworkAttachment) -> String {
 /// LAN and cannot reach the host, other providers' machines or, with port
 /// isolation, another tenant's VM on the same bridge. Gateways and inference
 /// workers are marketplace-owned and stay on the provider's bridge.
-pub(crate) const EGRESS_BRIDGE: &str = "omnuvnat0";
+// Proxmox caps a vnet name at 8 characters, which is also why a marketplace
+// segment is `o` plus seven hex digits rather than something readable. The
+// rename produced `omnuvnat0`, which is nine and cannot exist; this is the same
+// idea inside the limit.
+pub(crate) const EGRESS_BRIDGE: &str = "onat0";
 
 /// A stable, locally-administered MAC for a machine's marketplace interface.
 ///
