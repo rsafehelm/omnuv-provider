@@ -38,6 +38,17 @@ const NO_FORM: &[(String, String)] = &[];
 
 pub const TAG: &str = "omnu-gateway";
 
+/// The gateway's root disk.
+///
+/// The template's own is 3.5 GB, of which 2.3 GB is the root partition, and a
+/// gateway then installs the overlay client and a resolver on top. Both of
+/// this lab's gateways reached 100% and cloud-init stopped running entirely —
+/// `[Errno 28] No space left on device` in `init-local` — which silently
+/// froze their configuration at whatever it was last time there was room.
+/// A full disk on the one machine that carries a buyer's traffic is not worth
+/// saving 6 GB over.
+const DISK_GIB: u32 = 8;
+
 /// Prefixes a gateway must never advertise, whatever it is told.
 ///
 /// Core checks this too, but the agent is the last place the decision can be
@@ -90,6 +101,68 @@ fn holds_its_slice(slice_address: &str, advertise_cidr: &str) -> bool {
 ///
 /// `netbird up` is idempotent, so a rebuilt gateway re-enrols with the same key
 /// and rejoins the same buyer's network without anyone intervening.
+const FENCE_RULES: &str = r#"# NetBird puts overlay routes in table 7120, but its own ip rule for that
+# table (pref 110) sits after the main table (pref 105, which only
+# suppresses the default route). So the /24 this gateway holds on the bridge
+# shadows the remote /32s and forwarded buyer traffic never reaches the
+# overlay — it is redirected back onto the bridge and dropped. Consult the
+# overlay table first for the whole marketplace pool: a remote machine's /32
+# wins, a local address misses table 7120 and falls back to the on-link /24.
+# Table 7120 is NetBird 0.78.1's default; del-then-add keeps it single per boot.
+ip rule del to 10.200.0.0/13 lookup 7120 pref 100 2>/dev/null || true
+ip rule add to 10.200.0.0/13 lookup 7120 pref 100
+# The gateway forwards buyer traffic into the overlay and nowhere else. It
+# has a default route out net0 onto the provider's LAN, so without this a
+# buyer that routed the LAN through .1 would be forwarded there. Likewise
+# the gateway itself answers the bridge only on its marketplace address.
+# Idempotent, and runs before the overlay client adds its own rules.
+iptables -C FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -I FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP
+iptables -C INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -I INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP
+# A member's own device reaches buyer machines through here too, from an
+# overlay address the machines have no route back to — their default route
+# is the internet, which drops it. Rewrite only such sources to this
+# gateway's marketplace address; buyer-to-buyer traffic keeps its source.
+# Replies then come back on the bridge as part of an established flow,
+# which the DROP above must let through.
+iptables -t nat -C POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE
+iptables -C FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# And outbound: traffic from the bridge bound for the overlay leaves with
+# this gateway's own overlay address as its source. The far gateway admits
+# traffic per peer, and a bridge address is no peer; it masquerades onto
+# its bridge in turn (the rule above), so neither machine needs a route
+# back to the overlay. Across providers a machine sees its peer's gateway
+# rather than the peer — the v0.1 masquerade trade the design allows.
+iptables -t nat -C POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE
+# The same boundary from the overlay side. A peer's client only sends what
+# its routes allow, but a member owns their device and could send anything
+# with the same key; this gateway forwards overlay traffic onto the bridge
+# and nowhere else, and answers it only on its marketplace address. In
+# mangle, which runs before the filter chain the overlay client fills with
+# its own accept rules at start-up, so ordering cannot undo it.
+iptables -t mangle -C FORWARD -i wt0 ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -t mangle -I FORWARD -i wt0 ! -d 10.200.0.0/13 -j DROP
+iptables -t mangle -C INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -t mangle -I INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP
+"#;
+
+/// The forwarding rules, as a script the gateway re-runs.
+///
+/// They cannot be applied once. The overlay client owns the firewall too, and
+/// when its routing changes it rebuilds the tables — taking with it the
+/// masquerade a member's device needs for a reply path, which fails silently
+/// and looks to a buyer exactly like the machine being down. Every line is
+/// `-C || -I`, so re-running it every minute costs nothing.
+fn fence_script(mac: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Managed by omnu-provider; re-run on a timer. Do not edit.\n\
+         {resolve}\n\
+         [ -n \"$DEV\" ] || exit 0\n\
+         sysctl -qw net.ipv4.ip_forward=1\n\
+{rules}",
+        resolve = crate::instance::resolve_dev(mac),
+        rules = FENCE_RULES,
+    )
+}
+
 fn cloud_init(spec: &GatewaySpec) -> String {
     let keys: String = spec
         .ssh_keys
@@ -119,53 +192,36 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # from the overlay and would be dropped instead of forwarded onto the bridge.
     sysctl -w net.ipv4.ip_forward=1
     printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-omnu.conf
-    # NetBird puts overlay routes in table 7120, but its own ip rule for that
-    # table (pref 110) sits after the main table (pref 105, which only
-    # suppresses the default route). So the /24 this gateway holds on the bridge
-    # shadows the remote /32s and forwarded buyer traffic never reaches the
-    # overlay — it is redirected back onto the bridge and dropped. Consult the
-    # overlay table first for the whole marketplace pool: a remote machine's /32
-    # wins, a local address misses table 7120 and falls back to the on-link /24.
-    # Table 7120 is NetBird 0.78.1's default; del-then-add keeps it single per boot.
-    ip rule del to 10.200.0.0/13 lookup 7120 pref 100 2>/dev/null || true
-    ip rule add to 10.200.0.0/13 lookup 7120 pref 100
-    # The gateway forwards buyer traffic into the overlay and nowhere else. It
-    # has a default route out net0 onto the provider's LAN, so without this a
-    # buyer that routed the LAN through .1 would be forwarded there. Likewise
-    # the gateway itself answers the bridge only on its marketplace address.
-    # Idempotent, and runs before the overlay client adds its own rules.
-    iptables -C FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -I FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP
-    iptables -C INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -I INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP
-    # A member's own device reaches buyer machines through here too, from an
-    # overlay address the machines have no route back to — their default route
-    # is the internet, which drops it. Rewrite only such sources to this
-    # gateway's marketplace address; buyer-to-buyer traffic keeps its source.
-    # Replies then come back on the bridge as part of an established flow,
-    # which the DROP above must let through.
-    iptables -t nat -C POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE
-    iptables -C FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    # And outbound: traffic from the bridge bound for the overlay leaves with
-    # this gateway's own overlay address as its source. The far gateway admits
-    # traffic per peer, and a bridge address is no peer; it masquerades onto
-    # its bridge in turn (the rule above), so neither machine needs a route
-    # back to the overlay. Across providers a machine sees its peer's gateway
-    # rather than the peer — the v0.1 masquerade trade the design allows.
-    iptables -t nat -C POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE
-    # The same boundary from the overlay side. A peer's client only sends what
-    # its routes allow, but a member owns their device and could send anything
-    # with the same key; this gateway forwards overlay traffic onto the bridge
-    # and nowhere else, and answers it only on its marketplace address. In
-    # mangle, which runs before the filter chain the overlay client fills with
-    # its own accept rules at start-up, so ordering cannot undo it.
-    iptables -t mangle -C FORWARD -i wt0 ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -t mangle -I FORWARD -i wt0 ! -d 10.200.0.0/13 -j DROP
-    iptables -t mangle -C INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP 2>/dev/null || iptables -t mangle -I INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP
     # Declarative copy so systemd-networkd owns the interface across reboots.
     printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={addr}\nIPForward=yes\n' > /etc/systemd/network/10-omnu.network
     systemctl enable systemd-networkd 2>/dev/null || true
+    # Install the fence and put it on a timer. Here, in bootcmd, rather than in
+    # write_files: that module runs on a machine's first boot only, so a
+    # gateway that already exists would never receive it, and the whole point
+    # is that existing gateways converge.
+    #
+    # The timer is not for drift of its own making. The overlay client owns the
+    # firewall too, and when its routing changes it rebuilds the tables —
+    # taking these with them, which silently costs every member device its
+    # reply path, because a buyer machine has no route back to an overlay
+    # address. Applying them once is not enough; they have to be true
+    # continuously. Every line is check-then-insert, so re-running is free.
+    echo {fence} | base64 -d > /usr/local/sbin/omnu-gateway-fence
+    chmod 0755 /usr/local/sbin/omnu-gateway-fence
+    printf '[Unit]\nDescription=Re-assert the Omnu gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnu-gateway-fence\n' > /etc/systemd/system/omnu-gateway-fence.service
+    printf '[Unit]\nDescription=Keep the Omnu gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnu-gateway-fence.timer
+    systemctl daemon-reload
+    systemctl enable --now --no-block omnu-gateway-fence.timer 2>/dev/null || true
+    /usr/local/sbin/omnu-gateway-fence || true
 "#,
             addr = addr,
             mac = crate::instance::marketplace_mac(&spec.id),
             resolve = crate::instance::resolve_dev(&crate::instance::marketplace_mac(&spec.id)),
+            fence = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .encode(fence_script(&crate::instance::marketplace_mac(&spec.id)))
+            },
         ),
         _ => String::new(),
     };
@@ -238,6 +294,8 @@ bootcmd:
   # runcmd is the final stage, after packages: both are installed by then.
   - [ sh, -c, \"systemctl enable --now qemu-guest-agent || true\" ]
   - [ sh, -c, \"systemctl enable --now dnsmasq || true\" ]
+  # 150 MB of package lists on a small disk, for packages already installed.
+  - [ sh, -c, \"apt-get clean || true\" ]
   # Enrol against the marketplace control plane over the LAN. The curl install
   # is time-bounded so it can never hang the boot.
   - [ sh, -c, \"command -v netbird >/dev/null || timeout 60 bash -c 'curl -fsSL https://pkgs.netbird.io/install.sh | sh' || true\" ]
@@ -406,6 +464,14 @@ impl proxmox::Client {
             )
             .await?;
         self.wait_task(node, &upid).await?;
+
+        // Room to run. Cloud-init grows the partition on the next boot, which
+        // is this machine's first.
+        self.put_form::<serde_json::Value>(
+            &format!("/nodes/{node}/qemu/{vmid}/resize"),
+            &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{DISK_GIB}G"))],
+        )
+        .await?;
 
         self.post_form::<serde_json::Value>(
             &format!("/nodes/{node}/qemu/{vmid}/config"),
@@ -612,22 +678,35 @@ mod tests {
         assert!(ci.contains("listen-address=10.200.7.1\n"));
         assert!(ci.contains("hostsdir=/etc/omnu/hosts.d"));
         assert!(ci.contains("10.200.7.11 gpu-2.internal"));
+        // The rules ride as a script the gateway re-runs, so they are asserted
+        // where they actually live rather than in the document that carries
+        // them. The timer is what makes them true continuously: the overlay
+        // client rebuilds the firewall when its routing changes, and applying
+        // these once at boot loses them without a word.
+        assert!(ci.contains("/usr/local/sbin/omnu-gateway-fence"));
+        assert!(ci.contains("omnu-gateway-fence.timer"));
+        assert!(ci.contains("OnUnitActiveSec=60s"));
+        let fence = fence_script("02:09:a4:76:f8:ee");
         // The gateway must never be a path from the bridge to the provider's
         // LAN: forwarding and the gateway's own services are pool-only.
-        assert!(ci.contains("iptables -I FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP"));
-        assert!(ci.contains("iptables -I INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP"));
+        assert!(fence.contains("iptables -I FORWARD -i $DEV ! -d 10.200.0.0/13 -j DROP"));
+        assert!(fence.contains("iptables -I INPUT -i $DEV ! -d 10.200.0.0/13 -j DROP"));
         // Device traffic is rewritten to the gateway's address, buyer traffic
         // is not, and the reply path through the DROP is open.
-        assert!(ci.contains("POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE"));
+        assert!(fence.contains("POSTROUTING -o $DEV ! -s 10.200.0.0/13 -j MASQUERADE"));
         // And bridge traffic leaves for the overlay as this gateway: the far
         // side admits per peer, so a machine's own address would be dropped.
-        assert!(ci.contains("POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE"));
-        assert!(ci.contains("-I FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"));
-        assert!(ci.find("-j DROP").unwrap() < ci.find("ESTABLISHED,RELATED -j ACCEPT").unwrap());
+        assert!(fence.contains("POSTROUTING -o wt0 -s 10.200.0.0/13 -j MASQUERADE"));
+        assert!(fence.contains("-I FORWARD -i $DEV -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"));
+        assert!(fence.find("-j DROP").unwrap() < fence.find("ESTABLISHED,RELATED -j ACCEPT").unwrap());
         // And the overlay side is fenced the same way, ahead of the client's
         // own chains.
-        assert!(ci.contains("iptables -t mangle -I FORWARD -i wt0 ! -d 10.200.0.0/13 -j DROP"));
-        assert!(ci.contains("iptables -t mangle -I INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP"));
+        assert!(fence.contains("iptables -t mangle -I FORWARD -i wt0 ! -d 10.200.0.0/13 -j DROP"));
+        assert!(fence.contains("iptables -t mangle -I INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP"));
+        // Every rule is check-then-insert, which is what lets a timer re-run it.
+        for line in fence.lines().filter(|l| l.trim_start().starts_with("iptables ")) {
+            assert!(line.contains(" -C ") && line.contains("||"), "not idempotent: {line}");
+        }
         // The slice address and forwarding land in bootcmd, before the config
         // stage where apt (which needs internet this VM may not have) runs.
         assert!(ci.contains("10.200.7.1/24"));
