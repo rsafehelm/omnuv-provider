@@ -122,12 +122,10 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
         // `systemd-networkd-wait-online` waits for *every* managed link: the
         // project one gets its address from the provider's gateway, which is
         // not always there first. When that wait fails cloud-init carries on
-        // anyway, the first curl fails, and `runcmd` gives up — taking the
-        // whole recipe with it, silently, on a machine that is otherwise fine.
+        // anyway and the first curl pays for it.
         //
-        // That is exactly how two gaming machines came up with no streaming
-        // host and no explanation. So wait for the thing actually needed
-        // rather than for networkd's opinion of the interfaces.
+        // So wait for the thing actually needed rather than for networkd's
+        // opinion of the interfaces.
         WAIT_FOR_INTERNET.into(),
         "curl -fsSL https://get.docker.com | sh".into(),
     ];
@@ -143,10 +141,35 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     for cmd in &recipe.post_up {
         steps.push(format!("cd {RECIPE_DIR} && {cmd}"));
     }
-    steps
+    // One runcmd entry, not one per step, and this is the whole point.
+    //
+    // cloud-init writes runcmd as `#!/bin/sh` with **no `set -e`**, so a
+    // failing entry is skipped and every later one runs anyway. A gaming rig
+    // came up with Steam and a streaming host but no display manager, because
+    // the step that installs the session hit one package that no longer exists
+    // on this release and was quietly stepped over. Worse, cloud-init's own
+    // status reflects only the *last* command, so the machine reported success.
+    //
+    // Collapsing the recipe into one script under `set -e` makes a failing step
+    // stop the recipe and makes the failure visible in `cloud-init status`,
+    // which is the only thing outside the guest that can see any of this.
+    let body: String = steps
         .iter()
-        .map(|script| format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(script)))
-        .collect()
+        .enumerate()
+        .map(|(i, script)| {
+            format!(
+                "echo \"omnuv: recipe step {}/{}\"\necho {} | base64 -d | bash\n",
+                i + 1,
+                steps.len(),
+                b64(script)
+            )
+        })
+        .collect();
+
+    format!(
+        "  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n",
+        b64(&format!("set -e\n{body}echo \"omnuv: recipe finished\"\n"))
+    )
 }
 
 /// cloud-init for a buyer VM. Only public keys go in; Omnuv never has a private
@@ -645,6 +668,17 @@ mod tests {
 
     use super::*;
 
+    /// The recipe's steps, decoded out of the single script runcmd carries.
+    fn inner(script: &str) -> Vec<String> {
+        use base64::Engine as _;
+        script
+            .lines()
+            .filter_map(|l| l.strip_prefix("echo ")?.strip_suffix(" | base64 -d | bash"))
+            .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect()
+    }
+
     #[test]
     fn recipe_is_written_and_brought_up_at_first_boot() {
         let mut spec = spec_with_network();
@@ -676,15 +710,30 @@ mod tests {
             })
             .map(|b| String::from_utf8_lossy(&b).to_string())
             .collect();
+        // One entry, so a failing step stops the recipe. Without `set -e`
+        // cloud-init skips the failure and runs everything after it, which is
+        // how a machine ends up half-installed and reporting success.
+        assert_eq!(scripts.len(), 1, "the recipe is one script, not one per step");
+        let script = &scripts[0];
+        assert!(script.starts_with("set -e\n"), "a failing step must stop the recipe");
+
         // The wait comes first, and it is the whole point: runcmd does not
-        // reliably have the internet, and without this the first curl fails
-        // and cloud-init abandons every step after it.
-        assert!(scripts[0].contains("get.docker.com") && scripts[0].contains("sleep 5"),
+        // reliably have the internet when it starts.
+        let order: Vec<usize> = ["sleep 5", "get.docker.com | sh", "nvidia-container-toolkit",
+                                 "docker compose up -d", "docker compose exec -T app true"]
+            .iter()
+            .map(|needle| {
+                // Each step is base64 inside the one script, so decode them all
+                // and find which one carries it.
+                inner(script)
+                    .iter()
+                    .position(|s| s.contains(needle))
+                    .unwrap_or_else(|| panic!("no step contains {needle}"))
+            })
+            .collect();
+        assert_eq!(order, vec![0, 1, 2, 3, 4], "steps must keep their order");
+        assert!(inner(script)[0].contains("get.docker.com") && inner(script)[0].contains("sleep 5"),
                 "the first step must wait for the internet, not use it");
-        assert!(scripts[1].contains("get.docker.com | sh"));
-        assert!(scripts[2].contains("nvidia-container-toolkit"));
-        assert!(scripts[3].contains("docker compose up -d"));
-        assert!(scripts[4].contains("docker compose exec -T app true"));
         // Without a GPU, no toolkit.
         spec.recipe.as_mut().unwrap().gpu = false;
         assert!(!cloud_init(&spec).contains(&{
@@ -747,14 +796,20 @@ echo 'single' "double" `backtick` \$escaped
             serde_yaml_ng::from_str(&ci).expect("cloud-init must still be valid YAML");
         assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
         // And it is recoverable: what boots is exactly what the catalog holds.
+        // Two layers now — the recipe is one script under `set -e`, and each of
+        // its steps is encoded inside that.
         use base64::Engine as _;
         let line = ci.lines().find(|l| l.contains("base64 -d")).expect("an encoded step");
         let b64 = line.split("echo ").nth(1).unwrap().split(' ').next().unwrap();
-        let decoded = String::from_utf8(
+        let outer = String::from_utf8(
             base64::engine::general_purpose::STANDARD.decode(b64).expect("decodes"),
         )
         .unwrap();
-        assert!(decoded.contains("docker") || decoded.contains("nvidia") || decoded.contains("APPS"));
+        let steps = inner(&outer);
+        assert!(!steps.is_empty(), "the outer script carries the encoded steps");
+        assert!(steps.iter().any(|s| s.contains("docker")
+            || s.contains("nvidia")
+            || s.contains("APPS")));
     }
 
     /// The bug this whole fix exists for: the marketplace address must be set in
