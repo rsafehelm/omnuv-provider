@@ -1,0 +1,42 @@
+[Unit]
+Description=Omnuv Provider Agent
+Documentation=https://github.com/rsafehelm/omnuv-provider
+# pve-guests is a Proxmox unit and is simply absent elsewhere, which systemd
+# treats as satisfied. The package must install on a host that is not Proxmox,
+# because the driver layer exists so a second runtime can arrive.
+After=network-online.target pve-guests.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omnuv-provider agent --config /etc/omnuv/agent.yaml
+# The agent refuses a plaintext Core URL: its credentials and this provider's
+# inventory would cross the network in the clear. A development loop can opt in
+# by dropping a file in /etc/systemd/system/omnuv-provider.service.d/ that sets
+# OMNUV_ALLOW_PLAINTEXT_CORE=1, which is deliberately more effort than a flag.
+User=omnuv
+Group=omnuv
+Restart=always
+RestartSec=10s
+
+# It talks to a local hypervisor API and to Core. It does not need root, and
+# later phases that touch host devices should widen this deliberately rather
+# than find it already open.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/omnuv /var/log/omnuv
+# The audit log is the provider's own record of what Core asked this machine to
+# do. It survives restarts and is readable without Omnuv's help.
+LogsDirectory=omnuv
+LogsDirectoryMode=0755
+StateDirectory=omnuv
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -48,10 +48,31 @@ Proxmox VE is the reference implementation and the one in production. The driver
 layer exists so that K3s with KubeVirt, OpenStack and others fit behind the same
 contract without the marketplace learning anything about them.
 
+## Installing
+
+```bash
+sudo apt install ./omnuv-provider_<version>_amd64.deb
+sudo omnuv-provider join --token <your enrolment token>
+```
+
+The package installs the binary, a systemd unit and an unprivileged service
+account. It **does not** require Proxmox, or any other hypervisor: the driver
+layer exists so that a second runtime can arrive, and a package that checks for
+one at install time cannot be installed on a provider running something else.
+What kind of host this is, is a question for `join`, not for the packager.
+
+Your configuration is not a packaged file. `join` writes it, which means an
+upgrade can never ask you what to do about a file you did not edit.
+
+Removing the package takes away the software. Purging takes the configuration
+too. Neither touches `/var/log/omnuv`: that is your record of what this
+marketplace did on your hardware, and it is not ours to delete.
+
 ## Building
 
 ```bash
-cargo build --release
+cargo build --release            # the agent
+./packaging/build-deb.sh 0.1.0   # the package, in a container
 ```
 
 The wire contract lives in a separate crate,

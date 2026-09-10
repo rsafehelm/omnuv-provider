@@ -1,0 +1,48 @@
+#!/bin/sh
+# Deliberately does not check what hypervisor this is.
+#
+# The driver layer exists so that a second runtime can arrive, and a package
+# whose postinst runs `pveversion` is a package that cannot be installed on a
+# Kubernetes provider. What kind of host this is, is the agent's question at
+# join time, not the packager's at install time.
+set -e
+
+case "$1" in
+  configure)
+    if ! getent group omnuv >/dev/null; then
+        addgroup --system omnuv
+    fi
+    if ! getent passwd omnuv >/dev/null; then
+        adduser --system --ingroup omnuv --no-create-home \
+                --home /var/lib/omnuv --shell /usr/sbin/nologin omnuv
+    fi
+
+    # Readable by the agent, writable only by root: it holds this provider's
+    # own hypervisor credentials, which never leave this machine.
+    mkdir -p /etc/omnuv
+    chown root:omnuv /etc/omnuv
+    chmod 0750 /etc/omnuv
+
+    for d in /var/lib/omnuv /var/log/omnuv; do
+        mkdir -p "$d"
+        chown omnuv:omnuv "$d"
+    done
+
+    # Enabled, but not started: there is nothing to start until `join` has
+    # written a configuration, and a service that restart-loops on a fresh
+    # install teaches an operator to ignore it.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        systemctl enable omnuv-provider.service >/dev/null 2>&1 || true
+        if [ -f /etc/omnuv/agent.yaml ]; then
+            systemctl restart omnuv-provider.service || true
+        else
+            echo "omnuv-provider installed. Enrol this machine with:"
+            echo
+            echo "    sudo omnuv-provider join --token <your enrolment token>"
+            echo
+        fi
+    fi
+    ;;
+esac
+exit 0

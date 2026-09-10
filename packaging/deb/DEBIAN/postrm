@@ -1,0 +1,16 @@
+#!/bin/sh
+# Removal takes away the software. Purge takes away the configuration too, and
+# nothing takes away the audit log: it is the provider's record of what was done
+# on their hardware, and it is not ours to delete.
+set -e
+case "$1" in
+  purge)
+    rm -rf /etc/omnuv /var/lib/omnuv
+    if getent passwd omnuv >/dev/null; then deluser --system omnuv || true; fi
+    if getent group omnuv >/dev/null; then delgroup --system omnuv || true; fi
+    echo "The audit log in /var/log/omnuv has been left in place. It is your"
+    echo "record of what this marketplace did on this machine."
+    ;;
+esac
+if [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi
+exit 0
