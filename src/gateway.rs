@@ -864,6 +864,11 @@ impl crate::proxmox::Client {
         let mut out = vec![
             about(peer_connectivity(netbird), gateway_id),
             about(peer_reachability(netbird), gateway_id),
+            // Connected and reachable is not the same as reached *directly*: a
+            // relayed gateway means cross-provider buyer traffic crosses the
+            // platform, twice, on the link Edge Rule 3 calls the most expensive
+            // in the system.
+            about(peer_paths(netbird), gateway_id),
             about(adapter_presence("wt0", links), gateway_id),
         ];
 
