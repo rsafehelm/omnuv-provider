@@ -11,8 +11,16 @@
 # Proxmox is a package that cannot be installed on a Kubernetes provider.
 set -euo pipefail
 
-VERSION="${1:-0.1.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# One source of truth. The agent reports CARGO_PKG_VERSION to Core, so a version
+# passed on the command line would produce a package whose number disagreed with
+# what the running agent says it is — which is precisely the number the runtime
+# compatibility profiles are written against.
+VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+if [ -n "${1:-}" ] && [ "$1" != "$VERSION" ]; then
+    echo "Cargo.toml says $VERSION, not $1. Bump the crate version instead." >&2
+    exit 2
+fi
 OUT="$ROOT/dist"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 STAGE="$OUT/.deb"
