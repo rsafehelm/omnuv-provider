@@ -23,7 +23,7 @@ VM.GuestAgent.Audit,Mapping.Audit,Mapping.Use,SDN.Audit,SDN.Use";
 
 /// The pool a gateway lands in, and the pool a buyer's machine lands in. The
 /// agent's extra privileges are granted on these and nowhere else.
-const GATEWAY_POOL: &str = "omnuv";
+pub(crate) const GATEWAY_POOL: &str = "omnuv";
 const BUYER_POOL: &str = "omnuv-buyers";
 /// The marketplace's own SDN zone, and the buyer egress bridge beside it.
 /// Eight characters is the Proxmox limit for a vnet name, which is why the
@@ -176,7 +176,16 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         )?;
     }
     for (role, privs, pool) in [
-        ("OmnuvGatewayFiles", "VM.GuestAgent.FileWrite", GATEWAY_POOL),
+        // Write, to keep a gateway's generated configuration current; and read,
+        // because a gateway that cannot be *read* cannot report whether it can
+        // reach anything. Without the read the self-check is permanently
+        // "unknown" — truthful, and useless, which is how a gateway that had
+        // lost the overlay looked healthy for a whole afternoon.
+        //
+        // Still `FileRead` and never `Unrestricted`: the latter is arbitrary
+        // command execution inside the guest, and the marketplace has no
+        // business holding that on any machine.
+        ("OmnuvGatewayFiles", "VM.GuestAgent.FileWrite,VM.GuestAgent.FileRead", GATEWAY_POOL),
         ("OmnuvConsole", "VM.Console", BUYER_POOL),
         // Reads one file: the outcome a recipe writes about its own install.
         // Deliberately `FileRead` and not `Unrestricted` — the latter is

@@ -104,15 +104,22 @@ write_files:
 
       [Service]
       Type=simple
+      # Fetches its own binary when it is missing, so a machine converges on a
+      # reboot rather than only at first boot. cloud-init's runcmd runs once per
+      # *instance*, so a machine built before this existed would never acquire
+      # it — and "rebuild every worker" is not a convergence story.
+      ExecStartPre=/bin/sh -c 'test -x /usr/local/bin/omnuv-workloadd || (curl -fsSL -o /usr/local/bin/omnuv-workloadd.new {core_url}/downloads/omnuv-workloadd && chmod 0755 /usr/local/bin/omnuv-workloadd.new && mv /usr/local/bin/omnuv-workloadd.new /usr/local/bin/omnuv-workloadd)'
       Environment=OMNUV_WORKLOAD_ID={worker_id}
       Environment=OMNUV_VLLM_URL=http://127.0.0.1:{port}
       Environment=OMNUV_CACHE_DIR=/opt/omnuv/hf
       ExecStart=/usr/local/bin/omnuv-workloadd
       Restart=always
       RestartSec=10s
-      # It writes one file and opens no socket. Nothing it can reach is worth
-      # reaching, so it does not run as root.
-      DynamicUser=yes
+      # It writes one file and opens no socket, so it is confined rather than
+      # trusted: no new privileges, a private tmp, and the only writable path
+      # is the one it reports through.
+      NoNewPrivileges=yes
+      PrivateTmp=yes
       RuntimeDirectory=omnuv
       ReadWritePaths=/run/omnuv
 
@@ -314,6 +321,13 @@ impl Client {
                     ("name".to_string(), format!("omnuv-worker-{}", &spec.id[..8])),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
+                    // Into the marketplace's own pool, where the file-read
+                    // grant lives. Without it a worker is in no pool at all,
+                    // the agent's token has no privilege on it, and its
+                    // Workload Agent's report can never be collected — the
+                    // reporter runs perfectly and nothing upstream ever sees a
+                    // word of it.
+                    ("pool".to_string(), crate::join::GATEWAY_POOL.to_string()),
                 ],
             )
             .await?;
@@ -605,6 +619,7 @@ mod workload_agent_tests {
             model: Some(ModelProgress { stage, cached_bytes: cached, delta_bytes: delta }),
             gpus: vec![],
             serving: None,
+            observed: vec![],
         }
     }
 
@@ -635,5 +650,58 @@ mod workload_agent_tests {
         let mut r = loading(ModelStage::Loading, 0, 0);
         r.model = None;
         assert!(super::loading_detail(Some(&r)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod workload_unit_tests {
+    use omnuv_protocol::{InferenceWorkerSpec, Lifecycle};
+
+    fn ci() -> String {
+        super::cloud_init(
+            &InferenceWorkerSpec {
+                id: "worker_abc".into(),
+                lifecycle: Lifecycle::Running,
+                image: "vllm/vllm-openai:latest".into(),
+                model_repo: "org/model".into(),
+                vllm_args: vec!["--model".into(), "org/model".into()],
+                vcpus: 8,
+                memory_mib: 32768,
+                disk_gib: 120,
+                gpu_local_ids: vec![],
+                port: 8000,
+                budget_secs: None,
+            },
+            "https://api.omnuv.com",
+        )
+    }
+
+    /// cloud-init's runcmd runs once per *instance*, so a machine built before
+    /// a feature existed never acquires it — and "rebuild every worker" is not
+    /// a convergence story. The unit fetches its own binary when it is absent,
+    /// so a reboot is enough.
+    #[test]
+    fn the_unit_installs_its_own_binary_when_missing() {
+        let ci = ci();
+        assert!(ci.contains("ExecStartPre="), "no self-install");
+        let pre = ci
+            .lines()
+            .find(|l| l.contains("ExecStartPre="))
+            .expect("ExecStartPre");
+        assert!(pre.contains("test -x /usr/local/bin/omnuv-workloadd"), "{pre}");
+        assert!(pre.contains("/downloads/omnuv-workloadd"), "{pre}");
+        // Written aside and renamed: overwriting a running binary in place is
+        // ETXTBSY, which turns a restart into a permanent failure loop.
+        assert!(pre.contains(".new"), "must not overwrite in place: {pre}");
+    }
+
+    /// It writes to /usr/local/bin, so DynamicUser cannot work — but it must
+    /// still be confined rather than simply trusted.
+    #[test]
+    fn the_reporter_is_confined() {
+        let ci = ci();
+        assert!(ci.contains("NoNewPrivileges=yes"));
+        assert!(ci.contains("ReadWritePaths=/run/omnuv"));
+        assert!(!ci.contains("DynamicUser=yes"), "cannot install its own binary");
     }
 }

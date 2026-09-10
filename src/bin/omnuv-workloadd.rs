@@ -35,7 +35,8 @@
 //! providers rather than the number of machines.
 
 use omnuv_protocol::{
-    GpuTelemetry, ModelProgress, ModelStage, ServingStats, WorkloadHealth, WorkloadReport,
+    GpuTelemetry, ModelProgress, ModelStage, ObservedPeer, ServingStats, WorkloadHealth,
+    WorkloadReport,
 };
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -257,13 +258,125 @@ fn write_atomically(path: &str, report: &WorkloadReport) -> std::io::Result<()> 
     std::fs::rename(&tmp, path)
 }
 
+/// Connections this machine is *receiving*, read from the kernel.
+///
+/// The responder's half of the reachability handshake. Two things shape it:
+///
+/// This process listens on nothing, deliberately — so it cannot answer a probe
+/// itself. It does not need to: the thing that accepts the connection is the
+/// workload's own service, which is also exactly what a buyer reaches, so
+/// probing anything else would prove strictly less.
+///
+/// And it reads `/proc/net/tcp` rather than shelling out to `ss`, because the
+/// file is always there and `ss` is not installed on a minimal cloud image.
+///
+/// Only established connections *to* the service port are reported. Outbound
+/// connections are this machine reaching the world, which is not the direction
+/// in question and would be a small privacy leak to send upward.
+fn observed_peers(port: u16) -> Vec<ObservedPeer> {
+    // 01 is TCP_ESTABLISHED. A half-open socket has not proved a path.
+    const ESTABLISHED: &str = "01";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(body) = std::fs::read_to_string(path) else { continue };
+        for line in body.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 4 || f[3] != ESTABLISHED {
+                continue;
+            }
+            let Some((local, remote)) = f.get(1).zip(f.get(2)) else { continue };
+            let Some((_, lport)) = local.rsplit_once(':') else { continue };
+            if u16::from_str_radix(lport, 16).ok() != Some(port) {
+                continue;
+            }
+            let Some((rhex, _)) = remote.rsplit_once(':') else { continue };
+            let Some(peer) = hex_addr(rhex) else { continue };
+            if out.iter().any(|o: &ObservedPeer| o.peer == peer) {
+                continue;
+            }
+            out.push(ObservedPeer { peer, port, at_unix: now });
+        }
+    }
+    // A busy worker has many connections and Core needs a sample, not a census.
+    out.truncate(32);
+    out
+}
+
+/// `/proc/net/tcp` writes addresses as hex in the host's byte order, which for
+/// IPv4 on a little-endian machine means the octets arrive reversed. Getting
+/// this backwards produces plausible-looking addresses that never match a
+/// prober's, so the handshake would silently never corroborate.
+fn hex_addr(hex: &str) -> Option<String> {
+    match hex.len() {
+        8 => {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            let b = v.to_le_bytes();
+            Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+        }
+        32 => {
+            let mut groups = Vec::with_capacity(8);
+            // Four little-endian 32-bit words, each holding two groups.
+            for w in 0..4 {
+                let word = u32::from_str_radix(&hex[w * 8..w * 8 + 8], 16).ok()?;
+                let b = word.to_le_bytes();
+                groups.push(u16::from_be_bytes([b[0], b[1]]));
+                groups.push(u16::from_be_bytes([b[2], b[3]]));
+            }
+            Some(
+                groups
+                    .iter()
+                    .map(|g| format!("{g:x}"))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            )
+        }
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // reqwest is built with `rustls-no-provider`, and its builder *panics*
+    // without one — even here, where every request is plain HTTP to localhost
+    // and no TLS is ever negotiated. Missing it, this process exit-101'd on
+    // start and systemd restarted it forever: a whole tier silently absent on
+    // every machine, with the failure visible only inside the guest.
+    //
+    // Not caught by any test, because a unit test never builds a Client. The
+    // check for that is `--help` below: it constructs one, so the binary
+    // cannot ship in a state where starting it panics.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // A start-up self-check, in the spirit of every other agent here: prove the
+    // things that panic or exit at start, at a moment when a person is
+    // watching, rather than at 3am inside a guest nobody can see.
+    if std::env::args().any(|a| a == "--check") {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .map_err(|e| anyhow::anyhow!("http client: {e}"))?;
+        println!("omnuv-workloadd: ok");
+        return Ok(());
+    }
+
     let cfg = Config::from_env()?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
     let started = Instant::now();
+    // The port a buyer's traffic actually arrives on, which is the only one
+    // worth watching for arrivals.
+    let service_port: u16 = cfg
+        .vllm_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse().ok())
+        .unwrap_or(8000);
     let mut last_bytes = dir_bytes(&cfg.cache_dir);
     let mut last_health: Option<WorkloadHealth> = None;
 
@@ -288,6 +401,9 @@ async fn main() -> anyhow::Result<()> {
             }),
             gpus: read_gpus(),
             serving,
+            // Who reached us. Without this a probe that "succeeded" cannot be
+            // told apart from something answering in this machine's place.
+            observed: observed_peers(service_port),
         };
 
         if let Err(e) = write_atomically(STATUS_PATH, &report) {
@@ -407,6 +523,7 @@ mod write_tests {
             model: None,
             gpus: vec![],
             serving: None,
+            observed: vec![],
         };
         write_atomically(p, &report).expect("writes");
 
@@ -434,9 +551,48 @@ mod write_tests {
             model: None,
             gpus: vec![],
             serving: None,
+            observed: vec![],
         };
         write_atomically(path.to_str().unwrap(), &report).expect("creates the directory");
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod observed_tests {
+    use super::*;
+
+    /// `/proc/net/tcp` writes IPv4 little-endian, so the octets arrive
+    /// reversed. Getting this backwards yields plausible addresses that never
+    /// match a prober's — the handshake would simply never corroborate, which
+    /// is the worst kind of wrong: quiet.
+    #[test]
+    fn ipv4_comes_out_of_proc_in_the_right_order() {
+        // 100.93.27.247 → f71b5d64 little-endian.
+        assert_eq!(hex_addr("F71B5D64").as_deref(), Some("100.93.27.247"));
+        assert_eq!(hex_addr("0100007F").as_deref(), Some("127.0.0.1"));
+        // 10.200.99.10
+        assert_eq!(hex_addr("0A63C80A").as_deref(), Some("10.200.99.10"));
+    }
+
+    #[test]
+    fn nonsense_is_none_rather_than_a_guess() {
+        assert_eq!(hex_addr(""), None);
+        assert_eq!(hex_addr("XYZ"), None);
+        assert_eq!(hex_addr("F71B5D"), None);
+    }
+
+    #[test]
+    fn an_ipv6_address_parses_to_eight_groups() {
+        let a = hex_addr(&"0".repeat(32)).expect("v6");
+        assert_eq!(a.split(':').count(), 8);
+    }
+
+    /// A machine with no /proc (or a test host) reports nothing rather than
+    /// failing: absent observations are Unknown at the far end, not guilt.
+    #[test]
+    fn observing_never_panics() {
+        let _ = observed_peers(8000);
     }
 }

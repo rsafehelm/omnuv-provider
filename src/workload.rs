@@ -121,6 +121,7 @@ mod tests {
             model: None,
             gpus: vec![],
             serving: None,
+            observed: vec![],
         }
     }
 

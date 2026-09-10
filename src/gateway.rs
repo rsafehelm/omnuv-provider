@@ -211,7 +211,10 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     printf '[Unit]\nDescription=Re-assert the Omnuv gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-fence\n' > /etc/systemd/system/omnuv-gateway-fence.service
     printf '[Unit]\nDescription=Keep the Omnuv gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-fence.timer
     # The gateway says, out loud and continuously, whether it can actually reach
-    # anything.
+    # anything — and *how*. `--detail` is what carries `Connection type: P2P`
+    # or `Relayed` per peer, which is the difference between cross-provider
+    # traffic going straight over the LAN and going through the marketplace's
+    # own host at every byte.
     #
     # A gateway that exists and is running can be unable to register with the
     # overlay, and nothing above it can tell: the VM is there, the interface is
@@ -223,7 +226,7 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # report needs, and far short of the unrestricted exec that running a
     # command in here would require. /run is tmpfs, so a stale file cannot
     # outlive a reboot and pretend to be current.
-    printf '#!/bin/sh\nmkdir -p /run/omnuv\n( netbird status; echo ---; ip -br addr; echo ---; ip -br route ) > /run/omnuv/gateway-status.txt.new 2>&1\nmv /run/omnuv/gateway-status.txt.new /run/omnuv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
+    printf '#!/bin/sh\nmkdir -p /run/omnuv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route ) > /run/omnuv/gateway-status.txt.new 2>&1\nmv /run/omnuv/gateway-status.txt.new /run/omnuv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
     chmod 0755 /usr/local/sbin/omnuv-gateway-selfcheck
     printf '[Unit]\nDescription=Report what the Omnuv gateway can actually reach\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-selfcheck\n' > /etc/systemd/system/omnuv-gateway-selfcheck.service
     printf '[Unit]\nDescription=Keep the Omnuv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-selfcheck.timer

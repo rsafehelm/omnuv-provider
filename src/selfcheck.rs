@@ -124,6 +124,85 @@ pub fn adapter_presence(name: &str, interfaces: &str) -> SelfCheck {
     }
 }
 
+/// One peer as `netbird status --detail` describes it.
+struct Peer {
+    name: String,
+    relayed: bool,
+}
+
+/// Peers and how each is actually reached.
+///
+/// The output is a block per peer: a `name.netbird.selfhosted:` header, then
+/// indented fields including `Connection type: P2P` or `Relayed`.
+fn peers_in(detail: &str) -> Vec<Peer> {
+    let mut out: Vec<Peer> = Vec::new();
+    for line in detail.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_suffix(':').filter(|n| n.contains(".netbird.")) {
+            out.push(Peer {
+                name: name.split('.').next().unwrap_or(name).to_string(),
+                relayed: false,
+            });
+        } else if let Some(kind) = t.strip_prefix("Connection type:")
+            && let Some(last) = out.last_mut()
+        {
+            last.relayed = kind.trim().eq_ignore_ascii_case("relayed");
+        }
+    }
+    out
+}
+
+/// Whether buyer traffic between providers is crossing the platform.
+///
+/// **Relayed means two different things and only one is a fault.** A gateway
+/// reached through the relay is cross-provider buyer traffic going through the
+/// marketplace's own host — every byte twice on the most expensive link in the
+/// system, which is what Edge Rule 2 exists to prevent. A *client device*
+/// reached through the relay is ordinary: a laptop behind NAT often cannot
+/// hole-punch, and relaying is the fallback working as designed.
+///
+/// Failing on the second would be a check that fires on correct behaviour,
+/// which is how people learn to ignore a check.
+pub fn peer_paths(detail: &str) -> SelfCheck {
+    let peers = peers_in(detail);
+    if peers.is_empty() {
+        return unknown(
+            "gateway.peers.direct",
+            CheckKind::Connectivity,
+            "no peer detail reported",
+        );
+    }
+
+    let gateways_relayed: Vec<&str> = peers
+        .iter()
+        .filter(|p| p.relayed && p.name.starts_with("omnuv-gw-"))
+        .map(|p| p.name.as_str())
+        .collect();
+    let clients_relayed = peers
+        .iter()
+        .filter(|p| p.relayed && !p.name.starts_with("omnuv-gw-"))
+        .count();
+    let direct = peers.iter().filter(|p| !p.relayed).count();
+
+    let note = format!(
+        "{direct} direct, {} relayed ({clients_relayed} of them clients, which is expected)",
+        peers.len() - direct
+    );
+
+    if gateways_relayed.is_empty() {
+        pass("gateway.peers.direct", CheckKind::Connectivity, note)
+    } else {
+        fail(
+            "gateway.peers.direct",
+            CheckKind::Connectivity,
+            format!(
+                "cross-provider traffic is being relayed through the platform via {}: {note}",
+                gateways_relayed.join(", ")
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +278,68 @@ Peers count: 2/2 Connected";
     fn a_check_can_name_what_it_is_about() {
         let c = about(pass("gateway.vm", CheckKind::Presence, "vmid 103"), "gw-cc8d3ca7");
         assert_eq!(c.subject.as_deref(), Some("gw-cc8d3ca7"));
+    }
+}
+
+#[cfg(test)]
+mod peer_path_tests {
+    use super::*;
+
+    /// Real output, trimmed. Provider-to-provider is direct on the LAN; the
+    /// laptop behind campus NAT relays; the platform's own relay peer relays by
+    /// definition.
+    const REAL: &str = "\
+Peers detail:
+ omnuv-relay-c4d90fd2.netbird.selfhosted:
+  Status: Connected
+  Connection type: Relayed
+ omnuv-gw-55a24373.netbird.selfhosted:
+  Status: Connected
+  Connection type: P2P
+  ICE candidate endpoints (Local/Remote): 10.200.99.1:51820/192.168.100.109:51820
+ hermes.netbird.selfhosted:
+  Status: Connected
+  Connection type: Relayed
+";
+
+    #[test]
+    fn a_relayed_laptop_is_not_a_fault() {
+        let c = peer_paths(REAL);
+        assert_eq!(c.result, CheckResult::Pass, "{:?}", c.detail);
+        let d = c.detail.unwrap();
+        assert!(d.contains("1 direct"), "{d}");
+        assert!(d.contains("clients, which is expected"), "{d}");
+    }
+
+    /// The one that matters: a gateway reached through the relay means
+    /// cross-provider buyer traffic is crossing the marketplace's own host —
+    /// every byte twice, on the link Edge Rule 3 calls the most expensive in
+    /// the system.
+    #[test]
+    fn a_relayed_gateway_is_a_fault_and_says_which() {
+        let relayed_gw = REAL.replace(
+            " omnuv-gw-55a24373.netbird.selfhosted:\n  Status: Connected\n  Connection type: P2P",
+            " omnuv-gw-55a24373.netbird.selfhosted:\n  Status: Connected\n  Connection type: Relayed",
+        );
+        let c = peer_paths(&relayed_gw);
+        assert_eq!(c.result, CheckResult::Fail);
+        assert!(c.detail.unwrap().contains("omnuv-gw-55a24373"));
+    }
+
+    #[test]
+    fn peers_and_their_paths_are_read_correctly() {
+        let p = peers_in(REAL);
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[1].name, "omnuv-gw-55a24373");
+        assert!(!p[1].relayed);
+        assert!(p[0].relayed && p[2].relayed);
+    }
+
+    /// Nothing to read is not a failure — a gateway still booting has not
+    /// started relaying anything.
+    #[test]
+    fn no_detail_is_unknown() {
+        assert_eq!(peer_paths("").result, CheckResult::Unknown);
+        assert_eq!(peer_paths("Peers detail:").result, CheckResult::Unknown);
     }
 }
