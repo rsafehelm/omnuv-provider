@@ -85,12 +85,11 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
     // The journal copy means the record survives even if the file is missing.
     println!("audit {line}");
 
-    if let Ok(mut guard) = SINK.lock() {
-        if let Some(f) = guard.as_mut() {
+    if let Ok(mut guard) = SINK.lock()
+        && let Some(f) = guard.as_mut() {
             let _ = writeln!(f, "{line}");
             let _ = f.flush();
         }
-    }
 
     if let Ok(mut q) = PENDING.lock() {
         while q.len() >= PENDING_MAX {

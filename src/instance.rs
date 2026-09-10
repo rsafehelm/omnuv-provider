@@ -348,8 +348,8 @@ impl Client {
 
             // One-shot: performed here and echoed back so Core can clear it.
             let mut rebooted_token = None;
-            if running && spec.lifecycle == Lifecycle::Running {
-                if let Some(token) = &spec.reboot_token {
+            if running && spec.lifecycle == Lifecycle::Running
+                && let Some(token) = &spec.reboot_token {
                     let upid: String = self
                         .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
                         .await?;
@@ -357,7 +357,6 @@ impl Client {
                     audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
                     rebooted_token = Some(token.clone());
                 }
-            }
 
             // The guest agent answering (any IPv4) is the liveness signal. But
             // the buyer-visible address is the *marketplace* one Core assigned,
@@ -568,7 +567,8 @@ pub const LEGACY_TAG_PREFIX: &str = "omnu-";
 /// the old one.
 pub(crate) fn is_legacy_marketplace_tag(tags: &str) -> bool {
     tags.split(&[';', ','][..]).map(str::trim).any(|t| {
-        matches!(t, "omnu-instance" | "omnu-gateway" | "omnu-worker")
+        t.starts_with(LEGACY_TAG_PREFIX)
+            && matches!(t, "omnu-instance" | "omnu-gateway" | "omnu-worker")
     })
 }
 

@@ -557,7 +557,7 @@ impl proxmox::Client {
             }
             let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
             self.wait_task(node, &upid).await?;
-            audit::record("gateway.reap", "agent", &tags, "ok", Some(&vm.vmid.to_string()));
+            audit::record("gateway.reap", "agent", tags, "ok", Some(&vm.vmid.to_string()));
             reaped += 1;
         }
         Ok(reaped)

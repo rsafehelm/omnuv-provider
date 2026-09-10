@@ -137,6 +137,10 @@ fn pci_slot(raw: &str) -> String {
 }
 
 impl Client {
+    // Eight, because a hypervisor client needs all eight to exist at all: where
+    // it is, how to trust it, who it is, and what this provider offers. Bundling
+    // them into a struct would move the same arguments one line further away.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_url: &str,
         fingerprint: Option<&str>,
@@ -522,8 +526,10 @@ mod tests {
         use crate::config::Contribution;
         use std::collections::HashMap;
 
-        let mut c = Contribution::default();
-        c.gpu_vram_mib = HashMap::from([("0000:21:00.0".to_string(), 31337u64)]);
+        let c = Contribution {
+            gpu_vram_mib: HashMap::from([("0000:21:00.0".to_string(), 31337u64)]),
+            ..Default::default()
+        };
 
         // The operator can see the card; we can only guess from its name.
         let resolve = |slot: &str, model: &str| -> u64 {
