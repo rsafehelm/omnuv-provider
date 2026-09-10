@@ -91,6 +91,23 @@ fn recipe_files(recipe: &omnuv_protocol::RecipeSpec) -> String {
     )
 }
 
+/// Waits until this machine can actually fetch something, or gives up after
+/// five minutes. DNS and a route are what every later step needs, and asking
+/// for both at once is the only test that means anything.
+///
+/// Bounded rather than infinite: a machine whose internet never arrives should
+/// fail with a recipe that did not install, not sit in a loop forever looking
+/// like it is still working.
+const WAIT_FOR_INTERNET: &str = r#"for i in $(seq 1 60); do
+  if getent hosts get.docker.com >/dev/null 2>&1 && curl -fsS -m 10 -o /dev/null https://get.docker.com; then
+    echo "omnuv: internet reachable after ${i} attempt(s)"
+    exit 0
+  fi
+  sleep 5
+done
+echo "omnuv: no internet after five minutes; the recipe cannot install" >&2
+exit 1"#;
+
 /// Brings the recipe up in runcmd: Docker from its own installer, the NVIDIA
 /// container toolkit when the containers reserve a GPU (the image already
 /// carries the driver), then `compose up` and the recipe's finishing steps.
@@ -100,6 +117,18 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     use base64::Engine as _;
     let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
     let mut steps: Vec<String> = vec![
+        // Nothing below works without the internet, and runcmd does not
+        // reliably have it. A buyer machine has two interfaces, and
+        // `systemd-networkd-wait-online` waits for *every* managed link: the
+        // project one gets its address from the provider's gateway, which is
+        // not always there first. When that wait fails cloud-init carries on
+        // anyway, the first curl fails, and `runcmd` gives up — taking the
+        // whole recipe with it, silently, on a machine that is otherwise fine.
+        //
+        // That is exactly how two gaming machines came up with no streaming
+        // host and no explanation. So wait for the thing actually needed
+        // rather than for networkd's opinion of the interfaces.
+        WAIT_FOR_INTERNET.into(),
         "curl -fsSL https://get.docker.com | sh".into(),
     ];
     if recipe.gpu {
@@ -647,10 +676,15 @@ mod tests {
             })
             .map(|b| String::from_utf8_lossy(&b).to_string())
             .collect();
-        assert!(scripts[0].contains("get.docker.com"));
-        assert!(scripts[1].contains("nvidia-container-toolkit"));
-        assert!(scripts[2].contains("docker compose up -d"));
-        assert!(scripts[3].contains("docker compose exec -T app true"));
+        // The wait comes first, and it is the whole point: runcmd does not
+        // reliably have the internet, and without this the first curl fails
+        // and cloud-init abandons every step after it.
+        assert!(scripts[0].contains("get.docker.com") && scripts[0].contains("sleep 5"),
+                "the first step must wait for the internet, not use it");
+        assert!(scripts[1].contains("get.docker.com | sh"));
+        assert!(scripts[2].contains("nvidia-container-toolkit"));
+        assert!(scripts[3].contains("docker compose up -d"));
+        assert!(scripts[4].contains("docker compose exec -T app true"));
         // Without a GPU, no toolkit.
         spec.recipe.as_mut().unwrap().gpu = false;
         assert!(!cloud_init(&spec).contains(&{
