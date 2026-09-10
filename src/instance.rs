@@ -95,6 +95,21 @@ fn recipe_files(recipe: &omnuv_protocol::RecipeSpec) -> String {
     )
 }
 
+/// Whether a recipe actually runs containers.
+///
+/// `services: {}` is a real recipe shape — the gaming ones install packages and
+/// configure a desktop session, and run nothing in Docker. Parsed rather than
+/// pattern-matched, because "does this compose file have any services" is a
+/// question about YAML and guessing at it with string matching is how a recipe
+/// that works becomes one that mysteriously does not.
+fn has_containers(compose: &str) -> bool {
+    let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(compose) else {
+        // Unparseable: assume it means something and let compose say why.
+        return true;
+    };
+    doc.get("services").and_then(|s| s.as_mapping()).is_some_and(|m| !m.is_empty())
+}
+
 /// Waits until this machine can actually fetch something, or gives up after
 /// five minutes. DNS and a route are what every later step needs, and asking
 /// for both at once is the only test that means anything.
@@ -131,9 +146,20 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
         // So wait for the thing actually needed rather than for networkd's
         // opinion of the interfaces.
         WAIT_FOR_INTERNET.into(),
-        "curl -fsSL https://get.docker.com | sh".into(),
     ];
-    if recipe.gpu {
+
+    // A recipe with no containers needs no container runtime. The gaming
+    // recipes install packages and configure a session; `docker compose up -d`
+    // on `services: {}` fails, and with the steps now chained under `set -e`
+    // that failure took the rest of the recipe with it — which is how a rig
+    // came up with no display manager and no streaming host.
+    //
+    // Skipping Docker for these also saves minutes on every gaming machine
+    // that was previously spent installing something nothing would use.
+    if has_containers(&recipe.compose) {
+        steps.push("curl -fsSL https://get.docker.com | sh".into());
+    }
+    if recipe.gpu && has_containers(&recipe.compose) {
         steps.push(
             "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
              curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
@@ -141,7 +167,9 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
                 .into(),
         );
     }
-    steps.push(format!("cd {RECIPE_DIR} && docker compose up -d"));
+    if has_containers(&recipe.compose) {
+        steps.push(format!("cd {RECIPE_DIR} && docker compose up -d"));
+    }
     for cmd in &recipe.post_up {
         steps.push(format!("cd {RECIPE_DIR} && {cmd}"));
     }
@@ -760,6 +788,48 @@ mod tests {
     }
 
     #[test]
+    fn a_recipe_with_no_containers_skips_docker_entirely() {
+        // The gaming recipes install packages and configure a session. Docker
+        // is not merely unnecessary there — `compose up` on an empty services
+        // map fails, and under `set -e` that took the whole recipe with it.
+        let mut spec = spec_with_network();
+        spec.recipe = Some(omnuv_protocol::RecipeSpec {
+            id: "steam-gaming".into(),
+            compose: "services: {}\n".into(),
+            gpu: true,
+            post_up: vec!["apt-get install -y lightdm".into()],
+        });
+        let ci = cloud_init(&spec);
+        assert!(!ci.contains("get.docker.com") || {
+            // It rides encoded, so check the decoded steps rather than the YAML.
+            let line = ci.lines().find(|l| l.contains("base64 -d")).unwrap();
+            let b = line.split("echo ").nth(1).unwrap().split(' ').next().unwrap();
+            use base64::Engine as _;
+            let outer =
+                String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b).unwrap())
+                    .unwrap();
+            let steps = inner(&outer);
+            assert!(
+                !steps.iter().any(|s| s.contains("get.docker.com | sh")),
+                "no containers, so no container runtime"
+            );
+            assert!(
+                !steps.iter().any(|s| s.contains("docker compose up")),
+                "compose up on an empty services map fails and takes the recipe with it"
+            );
+            assert!(
+                steps.iter().any(|s| s.contains("lightdm")),
+                "the recipe's own steps still run"
+            );
+            true
+        });
+
+        // And the opposite: a recipe that does have containers still gets them.
+        spec.recipe.as_mut().unwrap().compose = "services:\n  app:\n    image: x\n".into();
+        assert!(super::has_containers(&spec.recipe.as_ref().unwrap().compose));
+    }
+
+    #[test]
     fn recipe_is_written_and_brought_up_at_first_boot() {
         let mut spec = spec_with_network();
         spec.recipe = Some(omnuv_protocol::RecipeSpec {
@@ -970,25 +1040,5 @@ echo 'single' "double" `backtick` \$escaped
         // The first entry, past any comment lines.
         let first = after.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
         assert!(first.starts_with("- ["), "bootcmd has at least one item, got {first:?}");
-    }
-}
-
-#[cfg(test)]
-mod render_check {
-    #[test]
-    fn dump() {
-        let mut spec = super::tests::spec_with_network();
-        spec.recipe = Some(omnuv_protocol::RecipeSpec {
-            id: "steam-gaming".into(),
-            compose: "services: {}\n".into(),
-            gpu: true,
-            post_up: vec!["echo hi".into()],
-        });
-        let ci = super::cloud_init(&spec);
-        let line = ci.lines().find(|l| l.contains("base64 -d")).unwrap();
-        let b = line.split("echo ").nth(1).unwrap().split(char::is_whitespace).next().unwrap();
-        use base64::Engine as _;
-        let out = base64::engine::general_purpose::STANDARD.decode(b).unwrap();
-        std::fs::write("/out/rendered-recipe.sh", out).unwrap();
     }
 }
