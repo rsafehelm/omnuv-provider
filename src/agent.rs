@@ -408,6 +408,7 @@ async fn reconcile_workers(
                     local_id: None,
                     endpoint: None,
                     message: Some("deleted".into()),
+                    telemetry: None,
                 }),
             _ => {
                 driver
@@ -417,6 +418,7 @@ async fn reconcile_workers(
                         storage,
                         &cfg.proxmox.snippet_dir,
                         spec,
+                        &cfg.core.url,
                     )
                     .await
             }
@@ -433,6 +435,7 @@ async fn reconcile_workers(
                 local_id: None,
                 endpoint: None,
                 message: Some(e.to_string().chars().take(400).collect()),
+                telemetry: None,
             }
         }));
     }

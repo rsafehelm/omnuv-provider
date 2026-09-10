@@ -42,7 +42,7 @@ pub(crate) fn mapping_name(pci: &str) -> String {
 /// cloud-init that brings up the NVIDIA stack and serves the model.
 /// The HF cache lives on the VM disk; a shared per-node cache is a later
 /// optimisation, not something to fake now.
-fn cloud_init(spec: &InferenceWorkerSpec) -> String {
+fn cloud_init(spec: &InferenceWorkerSpec, core_url: &str) -> String {
     // One argument per line, base64-encoded into the bootcmd.
     //
     // Shell-quoting these was wrong twice over: `$(cat file)` does not perform
@@ -94,6 +94,30 @@ write_files:
         --gpus all --ipc=host -p {port}:8000 \
         -v /opt/omnuv/hf:/root/.cache/huggingface \
         "$IMAGE" "${{ARGS[@]}}"
+  - path: /etc/systemd/system/omnuv-workloadd.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Omnuv Workload Agent
+      # Deliberately not After=omnuv-vllm: the minutes before vLLM serves are
+      # exactly the window this exists to describe.
+
+      [Service]
+      Type=simple
+      Environment=OMNUV_WORKLOAD_ID={worker_id}
+      Environment=OMNUV_VLLM_URL=http://127.0.0.1:{port}
+      Environment=OMNUV_CACHE_DIR=/opt/omnuv/hf
+      ExecStart=/usr/local/bin/omnuv-workloadd
+      Restart=always
+      RestartSec=10s
+      # It writes one file and opens no socket. Nothing it can reach is worth
+      # reaching, so it does not run as root.
+      DynamicUser=yes
+      RuntimeDirectory=omnuv
+      ReadWritePaths=/run/omnuv
+
+      [Install]
+      WantedBy=multi-user.target
   - path: /etc/systemd/system/omnuv-vllm.service
     permissions: '0644'
     content: |
@@ -119,7 +143,13 @@ write_files:
       WantedBy=multi-user.target
 runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent ]
-  - [ bash, -c, "mkdir -p /opt/omnuv/hf /etc/omnuv" ]
+  - [ bash, -c, "mkdir -p /opt/omnuv/hf /etc/omnuv /run/omnuv" ]
+  # The Workload Agent. Statically linked, so it does not care that this guest's
+  # glibc is older than the one it was built against. Failure to fetch it is not
+  # fatal: it reports, it does not serve, and a worker that cannot describe
+  # itself is still a worker that answers requests.
+  - [ bash, -c, "curl -fsSL -o /usr/local/bin/omnuv-workloadd {core_url}/downloads/omnuv-workloadd && chmod 0755 /usr/local/bin/omnuv-workloadd || echo 'omnuv-workloadd unavailable; continuing without telemetry'" ]
+  - [ bash, -c, "command -v /usr/local/bin/omnuv-workloadd && systemctl enable --now omnuv-workloadd.service || true" ]
   - [ bash, -c, "curl -fsSL https://get.docker.com | sh" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list" ]
@@ -138,9 +168,31 @@ runcmd:
   - [ bash, -c, "systemctl reboot" ]
 "#,
         port = spec.port,
+        worker_id = spec.id,
+        core_url = core_url.trim_end_matches('/'),
         args_b64 = args_b64,
         image_b64 = base64::engine::general_purpose::STANDARD.encode(&spec.image),
     )
+}
+
+/// What a machine is doing while it is not yet serving, in words a person can
+/// act on. `Downloading` with a byte count that keeps rising is patience;
+/// `Downloading` with a count that stopped is a stall, and the two used to look
+/// identical from the host.
+fn loading_detail(t: Option<&omnuv_protocol::WorkloadReport>) -> Option<String> {
+    let m = t?.model.as_ref()?;
+    let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0));
+    Some(match m.stage {
+        omnuv_protocol::ModelStage::Downloading => format!(
+            "downloading the model; {} cached, {} since the last check",
+            gib(m.cached_bytes),
+            gib(m.delta_bytes)
+        ),
+        omnuv_protocol::ModelStage::Loading => {
+            format!("loading {} of weights into the card", gib(m.cached_bytes))
+        }
+        omnuv_protocol::ModelStage::Loaded => "loaded; waiting to serve".to_string(),
+    })
 }
 
 impl Client {
@@ -189,6 +241,7 @@ impl Client {
         storage: &str,
         snippet_dir: &str,
         spec: &InferenceWorkerSpec,
+        core_url: &str,
     ) -> anyhow::Result<WorkerStatus> {
         if let Some(vm) = self.find_worker_vm(node, &spec.id).await? {
             let mut running = vm.status.as_deref() == Some("running");
@@ -212,6 +265,10 @@ impl Client {
             }
 
             let endpoint = if running { self.worker_endpoint(node, vm.vmid, spec.port).await } else { None };
+            // From inside the machine, through the hypervisor. Adds detail to
+            // the state below; never decides it. A machine with no Workload
+            // Agent, or one still booting, simply reports None.
+            let telemetry = if running { self.workload_telemetry(node, vm.vmid).await } else { None };
             // READY must mean "will serve a request", not "has an IP". A VM
             // boots minutes before vLLM finishes loading weights, and routing
             // traffic in that window fails every request.
@@ -219,6 +276,7 @@ impl Client {
                 Some(url) => self.worker_serving(url).await,
                 None => false,
             };
+            let telemetry_ref = telemetry.as_ref();
             return Ok(WorkerStatus {
                 id: spec.id.clone(),
                 state: worker_state(running, endpoint.is_some(), serving),
@@ -228,15 +286,22 @@ impl Client {
                 endpoint: serving.then(|| endpoint.clone()).flatten(),
                 message: match (running, endpoint.is_some(), serving) {
                     (true, false, _) => Some("booting; no address yet".into()),
-                    (true, true, false) => Some("address up; model still loading".into()),
+                    // "still loading" was all the host could ever say. The
+                    // guest can say which of the three things it is doing, and
+                    // roughly how far in, which is the whole point of the tier.
+                    (true, true, false) => Some(
+                        loading_detail(telemetry_ref)
+                            .unwrap_or_else(|| "address up; model still loading".into()),
+                    ),
                     _ => vm.name,
                 },
+                telemetry: telemetry.clone(),
             });
         }
 
         // Snippet must exist before the VM references it.
         let file = format!("omnuv-{}.yaml", spec.id);
-        std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec))
+        std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec, core_url))
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
@@ -292,6 +357,7 @@ impl Client {
             local_id: Some(vmid.to_string()),
             endpoint: None,
             message: Some(format!("vm {vmid} created and started")),
+            telemetry: None,
         })
     }
 
@@ -305,6 +371,32 @@ impl Client {
         let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
         self.wait_task(node, &upid).await?;
         Ok(())
+    }
+
+    /// Reads what the Workload Agent inside the machine last wrote.
+    ///
+    /// Through `agent/file-read`, which needs only `VM.GuestAgent.FileRead` —
+    /// not the unrestricted `exec` privilege. Best-effort by construction: no
+    /// guest agent, no file, a half-written file, or an image that predates the
+    /// Workload Agent all return None, and None means *not known*, never
+    /// *unhealthy*.
+    pub(crate) async fn workload_telemetry(
+        &self,
+        node: &str,
+        vmid: u32,
+    ) -> Option<omnuv_protocol::WorkloadReport> {
+        #[derive(serde::Deserialize)]
+        struct FileRead {
+            content: String,
+        }
+        let read: FileRead = self
+            .get_json(&format!(
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file={}",
+                crate::workload::WORKLOAD_STATUS
+            ))
+            .await
+            .ok()?;
+        crate::workload::parse_report(&read.content)
     }
 
     /// True when the worker's OpenAI-compatible server answers. Deliberately
@@ -388,7 +480,7 @@ mod tests {
             gpu_local_ids: vec![],
             port: 8000,
         };
-        let ci = super::cloud_init(&spec);
+        let ci = super::cloud_init(&spec, "https://api.example.com/");
 
         // bootcmd runs on every boot; write_files runs once. The distinction is
         // the whole point: changing a flag must be a reboot, not a rebuild that
@@ -441,5 +533,107 @@ mod tests {
         assert_eq!(t, "omnuv-b48aedfb205d");
         assert!(!t.contains('-') || t.starts_with("omnuv-"));
         assert!(t.len() <= 20);
+    }
+}
+
+#[cfg(test)]
+mod workload_agent_tests {
+    use omnuv_protocol::{InferenceWorkerSpec, Lifecycle, ModelProgress, ModelStage, WorkloadHealth, WorkloadReport};
+
+    fn spec() -> InferenceWorkerSpec {
+        InferenceWorkerSpec {
+            id: "worker_abc".into(),
+            lifecycle: Lifecycle::Running,
+            image: "vllm/vllm-openai:latest".into(),
+            model_repo: "org/model".into(),
+            vllm_args: vec!["--model".into(), "org/model".into()],
+            vcpus: 8,
+            memory_mib: 32768,
+            disk_gib: 120,
+            gpu_local_ids: vec![],
+            port: 8000,
+            budget_secs: None,
+        }
+    }
+
+    #[test]
+    fn the_worker_is_built_with_a_workload_agent() {
+        let ci = super::cloud_init(&spec(), "https://api.omnuv.com/");
+        assert!(ci.contains("omnuv-workloadd.service"));
+        // Fetched from Core, which already serves /downloads over TLS. The
+        // trailing slash must not survive into a doubled one.
+        assert!(ci.contains("https://api.omnuv.com/downloads/omnuv-workloadd"));
+        assert!(!ci.contains("omnuv.com//downloads"));
+        // It is told which workload it is. Inventing an id would attribute
+        // telemetry to a machine that does not exist.
+        assert!(ci.contains("OMNUV_WORKLOAD_ID=worker_abc"));
+        assert!(ci.contains("OMNUV_VLLM_URL=http://127.0.0.1:8000"));
+    }
+
+    /// A worker that cannot fetch the reporter must still become a worker.
+    /// Telemetry is detail; serving is the product.
+    #[test]
+    fn a_missing_workload_agent_does_not_stop_the_worker() {
+        let ci = super::cloud_init(&spec(), "https://api.omnuv.com");
+        let fetch = ci.lines().find(|l| l.contains("omnuv-workloadd &&")).expect("fetch line");
+        assert!(fetch.contains("||"), "the download must not be able to fail the boot");
+    }
+
+    /// It must describe the window *before* vLLM serves — so ordering it after
+    /// vLLM would remove the only thing it was built to see.
+    #[test]
+    fn the_reporter_does_not_wait_for_the_thing_it_reports_on() {
+        let ci = super::cloud_init(&spec(), "https://api.omnuv.com");
+        let unit = ci
+            .split("omnuv-workloadd.service")
+            .nth(1)
+            .and_then(|s| s.split("omnuv-vllm.service").next())
+            .unwrap_or("");
+        // A directive, not a substring: the unit's own comment says
+        // "Deliberately not After=omnuv-vllm", and a naive contains() finds it.
+        assert!(
+            !unit.lines().any(|l| l.trim_start().starts_with("After=omnuv-vllm")),
+            "the reporter must start before the thing it reports on"
+        );
+    }
+
+    fn loading(stage: ModelStage, cached: u64, delta: u64) -> WorkloadReport {
+        WorkloadReport {
+            workload_id: "w".into(),
+            uptime_s: 30,
+            health: WorkloadHealth::Starting,
+            model: Some(ModelProgress { stage, cached_bytes: cached, delta_bytes: delta }),
+            gpus: vec![],
+            serving: None,
+        }
+    }
+
+    /// The host could only ever say "still loading". These are the three
+    /// different things that were hiding behind that one sentence, and the
+    /// difference between the first two is the difference between waiting and
+    /// intervening.
+    #[test]
+    fn loading_says_which_of_the_three_things_is_happening() {
+        let gib = 1024u64 * 1024 * 1024;
+
+        let downloading = super::loading_detail(Some(&loading(ModelStage::Downloading, 6 * gib, gib))).unwrap();
+        assert!(downloading.contains("downloading"), "{downloading}");
+        assert!(downloading.contains("6.0 GiB"), "{downloading}");
+
+        // Same stage, nothing arriving: a stall, and it must not read the same.
+        let stalled = super::loading_detail(Some(&loading(ModelStage::Downloading, 6 * gib, 0))).unwrap();
+        assert!(stalled.contains("0.0 GiB since"), "{stalled}");
+        assert_ne!(downloading, stalled);
+
+        let into_vram = super::loading_detail(Some(&loading(ModelStage::Loading, 16 * gib, 0))).unwrap();
+        assert!(into_vram.contains("into the card"), "{into_vram}");
+    }
+
+    #[test]
+    fn no_telemetry_means_no_detail_rather_than_a_guess() {
+        assert!(super::loading_detail(None).is_none());
+        let mut r = loading(ModelStage::Loading, 0, 0);
+        r.model = None;
+        assert!(super::loading_detail(Some(&r)).is_none());
     }
 }
