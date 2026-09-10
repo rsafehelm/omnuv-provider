@@ -2,7 +2,7 @@
 name = "omnuv-provider"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/rsafehelm/omnuv-provider"
 description = "Omnuv Provider Agent. Executes normalized marketplace intent on a provider runtime."
 

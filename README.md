@@ -58,4 +58,11 @@ The wire contract lives in a separate crate,
 [omnuv-protocol](https://github.com/rsafehelm/omnuv-protocol), which both this
 agent and the marketplace depend on. Neither imports the other's source.
 
-Licensed under Apache-2.0.
+## Licence
+
+GNU General Public License, version 3 or later.
+
+Copyleft rather than permissive, deliberately. This program runs on hardware you
+own and can create machines, attach your GPUs and configure your networking on
+it. If somebody ships you a modified build of it, you should be able to read
+what they changed, for exactly the reason you can read this one.
