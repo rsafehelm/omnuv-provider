@@ -50,7 +50,7 @@ Priority: optional
 Architecture: $ARCH
 Depends: libc6, adduser
 Installed-Size: $size
-Maintainer: Omnuv <ops@omnuv.dev>
+Maintainer: Omnuv <ops@omnuv.com>
 Homepage: https://github.com/rsafehelm/omnuv-provider
 Description: Omnuv Provider Agent
  Marketplace-owned software that runs inside a provider's own environment,

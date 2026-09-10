@@ -40,8 +40,8 @@ a one-shot debugging command that prints a report instead of sending it.
 
 Prints a normalized InventoryReport as JSON on stdout. Pipe it into core:
 
-    omnuv-provider discover --provider pve-titan | \\
-        omnuv-core ingest --name Titan --region eu-west
+    omnuv-provider discover --provider my-proxmox | \\
+        omnuv-core ingest --name my-proxmox --region eu-west
 
 Credentials come from the environment, named by the provider's tokenEnv entry.
 ";
