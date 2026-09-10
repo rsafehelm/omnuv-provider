@@ -435,6 +435,13 @@ impl Client {
                 local_id: Some(vm.vmid.to_string()),
                 private_ip,
                 message: None,
+                // Only asked for a machine that was given a recipe, and only
+                // while it is up: there is nothing to ask otherwise.
+                recipe_progress: if running && spec.recipe.is_some() {
+                    self.recipe_progress(node, vm.vmid).await
+                } else {
+                    None
+                },
             });
         }
 
@@ -448,6 +455,7 @@ impl Client {
                 local_id: None,
                 private_ip: None,
                 message: Some("already removed".into()),
+                recipe_progress: None,
             });
         }
 
@@ -548,7 +556,92 @@ impl Client {
             local_id: Some(vmid.to_string()),
             private_ip: None,
             message: Some(format!("vm {vmid} created")),
+            // Just created: first boot has not started, let alone finished.
+            recipe_progress: None,
         })
+    }
+
+    /// How the recipe's install is going, asked of the guest itself.
+    ///
+    /// This is the hypervisor asking the guest through the channel it already
+    /// uses for the machine's address — not marketplace software running inside
+    /// a buyer's machine, which is a boundary that must not move. It is
+    /// best-effort by construction: a guest with no agent, a guest that refuses,
+    /// or an image without cloud-init all return None, and None means "not
+    /// known", never "failed".
+    async fn recipe_progress(&self, node: &str, vmid: u32) -> Option<omnuv_protocol::RecipeProgress> {
+        let out = self.guest_exec(node, vmid, &["cloud-init", "status", "--long"]).await?;
+
+        // cloud-init prints `status: <word>` first. Everything after is detail.
+        let status = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("status:"))
+            .map(|w| w.trim().to_string())?;
+
+        let mut progress = omnuv_protocol::RecipeProgress { status, step: None, detail: None };
+        if !progress.failed() {
+            return Some(progress);
+        }
+
+        // It failed, so say which step and in whose words. The recipe announces
+        // itself before each step, so the last announcement is where it stopped.
+        if let Some(log) = self
+            .guest_exec(node, vmid, &["sh", "-c", "grep -a 'omnuv: recipe step' /var/log/cloud-init-output.log | tail -1"])
+            .await
+        {
+            progress.step = log.split("recipe step").nth(1).map(|s| s.trim().to_string());
+        }
+        if let Some(tail) = self
+            .guest_exec(node, vmid, &["sh", "-c", "tail -c 2000 /var/log/cloud-init-output.log"])
+            .await
+        {
+            // The last few lines are where the reason is. Trimmed to something
+            // an event can carry without becoming a log shipper.
+            let detail: Vec<&str> = tail.lines().rev().filter(|l| !l.trim().is_empty()).take(6).collect();
+            progress.detail = Some(detail.into_iter().rev().collect::<Vec<_>>().join("\n"));
+        }
+        Some(progress)
+    }
+
+    /// Runs one command in the guest and waits briefly for its output.
+    ///
+    /// Proxmox splits this in two: `agent/exec` starts it and returns a pid,
+    /// `agent/exec-status` collects it. Nothing here retries — a status report
+    /// must not block on a guest that is busy installing.
+    async fn guest_exec(&self, node: &str, vmid: u32, argv: &[&str]) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct Started {
+            pid: i64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Finished {
+            #[serde(default)]
+            exited: i64,
+            #[serde(default, rename = "out-data")]
+            out: Option<String>,
+        }
+
+        let form: Vec<(&str, String)> =
+            argv.iter().map(|a| ("command", (*a).to_string())).collect();
+        let started: Started = self
+            .post_form(&format!("/nodes/{node}/qemu/{vmid}/agent/exec"), &form)
+            .await
+            .ok()?;
+
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let done: Finished = self
+                .get_json(&format!(
+                    "/nodes/{node}/qemu/{vmid}/agent/exec-status?pid={}",
+                    started.pid
+                ))
+                .await
+                .ok()?;
+            if done.exited != 0 {
+                return done.out;
+            }
+        }
+        None
     }
 
     /// While Core is unreachable: **maintain, do not decide.**

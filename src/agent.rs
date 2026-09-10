@@ -476,6 +476,7 @@ async fn reconcile_workers(
                 local_id: None,
                 private_ip: None,
                 message: Some("deleted".into()),
+                recipe_progress: None,
             }),
             // The image names a template this provider must have. Refusing
             // here, with the reason reported, is what keeps the scheduler's
@@ -503,6 +504,7 @@ async fn reconcile_workers(
                 local_id: None,
                 private_ip: None,
                 message: Some(why.chars().take(400).collect()),
+                recipe_progress: None,
             }
         }));
     }
