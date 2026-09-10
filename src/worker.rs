@@ -33,8 +33,8 @@ pub(crate) struct VmRef {
 /// VBIOS the ROM bar exposes is never needed. Hiding it also makes a host's
 /// *boot* GPU usable, which is otherwise unusable — the firmware shadows that
 /// card's ROM and a guest driver reading it fails to initialize the adapter.
-/// Verified on Pluto's `0000:5d:00.0`, the boot card: with the ROM bar hidden
-/// the guest's driver loads and `nvidia-smi` lists the 3090.
+/// Verified on hardware against an RTX 3090 that was its host's boot display:
+/// with the ROM bar hidden the guest's driver loads and `nvidia-smi` lists it.
 pub(crate) fn mapping_name(pci: &str) -> String {
     format!("omnuv-gpu-{}", pci.replace([':', '.'], "-"))
 }
