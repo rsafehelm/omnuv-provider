@@ -178,6 +178,12 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     for (role, privs, pool) in [
         ("OmnuvGatewayFiles", "VM.GuestAgent.FileWrite", GATEWAY_POOL),
         ("OmnuvConsole", "VM.Console", BUYER_POOL),
+        // Reads one file: the outcome a recipe writes about its own install.
+        // Deliberately `FileRead` and not `Unrestricted` — the latter is
+        // arbitrary command execution inside a buyer's machine, which is
+        // exactly what the marketplace must never be able to do. Scoped to the
+        // pool of machines the marketplace built, never the host.
+        ("OmnuvRecipeStatus", "VM.GuestAgent.FileRead", BUYER_POOL),
     ] {
         step(
             &format!("role {role}"),

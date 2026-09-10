@@ -81,6 +81,10 @@ pub(crate) fn short_tag(id: &str) -> String {
 /// Where a recipe's compose file lives in the machine.
 const RECIPE_DIR: &str = "/opt/omnuv/recipe";
 
+/// Where a recipe records how its own install went. One file, one known path,
+/// read with `VM.GuestAgent.FileRead` and nothing wider — see `recipe_progress`.
+const RECIPE_STATUS: &str = "/etc/omnuv/recipe-status";
+
 /// The recipe's compose file, written before any package runs. Base64: a
 /// compose file is YAML inside YAML, and escaping it would be a bug farm.
 fn recipe_files(recipe: &omnuv_protocol::RecipeSpec) -> String {
@@ -158,7 +162,7 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
         .enumerate()
         .map(|(i, script)| {
             format!(
-                "echo \"omnuv: recipe step {}/{}\"\necho {} | base64 -d | bash\n",
+                "STEP={}/{}\necho \"omnuv: recipe step $STEP\"\necho {} | base64 -d | bash\n",
                 i + 1,
                 steps.len(),
                 b64(script)
@@ -166,10 +170,26 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
         })
         .collect();
 
-    format!(
-        "  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n",
-        b64(&format!("set -e\n{body}echo \"omnuv: recipe finished\"\n"))
-    )
+    // The recipe says how it went, in one file, written whatever happens.
+    //
+    // This is the only thing outside the machine that can tell a finished
+    // install from an abandoned one, and it is written *by the recipe* rather
+    // than inferred from outside. The provider reads this one path and nothing
+    // else: reading a known file needs `VM.GuestAgent.FileRead`, while asking
+    // the guest to run `cloud-init status` would need
+    // `VM.GuestAgent.Unrestricted` — arbitrary command execution inside a
+    // buyer's machine, which the marketplace must never be able to do.
+    let script = format!(
+        "set -e\n\
+         mkdir -p /etc/omnuv\n\
+         STEP=starting\n\
+         trap 'rc=$?; printf \"step=%s\\nrc=%s\\n\" \"$STEP\" \"$rc\" > {RECIPE_STATUS}' EXIT\n\
+         {body}\
+         STEP=finished\n\
+         echo \"omnuv: recipe finished\"\n"
+    );
+
+    format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(&script))
 }
 
 /// cloud-init for a buyer VM. Only public keys go in; Omnuv never has a private
@@ -561,87 +581,54 @@ impl Client {
         })
     }
 
-    /// How the recipe's install is going, asked of the guest itself.
+    /// How the recipe's install went, read from the one file the recipe writes.
     ///
-    /// This is the hypervisor asking the guest through the channel it already
-    /// uses for the machine's address — not marketplace software running inside
-    /// a buyer's machine, which is a boundary that must not move. It is
-    /// best-effort by construction: a guest with no agent, a guest that refuses,
-    /// or an image without cloud-init all return None, and None means "not
-    /// known", never "failed".
+    /// The recipe reports its own outcome — the step it reached and the exit
+    /// code — and this reads that single path and nothing else. Reading a known
+    /// file needs `VM.GuestAgent.FileRead`; asking the guest to run
+    /// `cloud-init status` instead would need `VM.GuestAgent.Unrestricted`,
+    /// which is arbitrary command execution inside a machine the buyer owns.
+    /// The marketplace must never be able to do that, so it does not ask for it.
+    ///
+    /// Best-effort by construction: a guest with no agent, a machine still
+    /// installing, or an image that never wrote the file all return None, and
+    /// None means "not known", never "failed".
     async fn recipe_progress(&self, node: &str, vmid: u32) -> Option<omnuv_protocol::RecipeProgress> {
-        let out = self.guest_exec(node, vmid, &["cloud-init", "status", "--long"]).await?;
-
-        // cloud-init prints `status: <word>` first. Everything after is detail.
-        let status = out
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("status:"))
-            .map(|w| w.trim().to_string())?;
-
-        let mut progress = omnuv_protocol::RecipeProgress { status, step: None, detail: None };
-        if !progress.failed() {
-            return Some(progress);
-        }
-
-        // It failed, so say which step and in whose words. The recipe announces
-        // itself before each step, so the last announcement is where it stopped.
-        if let Some(log) = self
-            .guest_exec(node, vmid, &["sh", "-c", "grep -a 'omnuv: recipe step' /var/log/cloud-init-output.log | tail -1"])
-            .await
-        {
-            progress.step = log.split("recipe step").nth(1).map(|s| s.trim().to_string());
-        }
-        if let Some(tail) = self
-            .guest_exec(node, vmid, &["sh", "-c", "tail -c 2000 /var/log/cloud-init-output.log"])
-            .await
-        {
-            // The last few lines are where the reason is. Trimmed to something
-            // an event can carry without becoming a log shipper.
-            let detail: Vec<&str> = tail.lines().rev().filter(|l| !l.trim().is_empty()).take(6).collect();
-            progress.detail = Some(detail.into_iter().rev().collect::<Vec<_>>().join("\n"));
-        }
-        Some(progress)
-    }
-
-    /// Runs one command in the guest and waits briefly for its output.
-    ///
-    /// Proxmox splits this in two: `agent/exec` starts it and returns a pid,
-    /// `agent/exec-status` collects it. Nothing here retries — a status report
-    /// must not block on a guest that is busy installing.
-    async fn guest_exec(&self, node: &str, vmid: u32, argv: &[&str]) -> Option<String> {
         #[derive(serde::Deserialize)]
-        struct Started {
-            pid: i64,
-        }
-        #[derive(serde::Deserialize)]
-        struct Finished {
-            #[serde(default)]
-            exited: i64,
-            #[serde(default, rename = "out-data")]
-            out: Option<String>,
+        struct FileRead {
+            content: String,
         }
 
-        let form: Vec<(&str, String)> =
-            argv.iter().map(|a| ("command", (*a).to_string())).collect();
-        let started: Started = self
-            .post_form(&format!("/nodes/{node}/qemu/{vmid}/agent/exec"), &form)
+        let read: FileRead = self
+            .get_json(&format!(
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file={RECIPE_STATUS}"
+            ))
             .await
             .ok()?;
 
-        for _ in 0..10 {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            let done: Finished = self
-                .get_json(&format!(
-                    "/nodes/{node}/qemu/{vmid}/agent/exec-status?pid={}",
-                    started.pid
-                ))
-                .await
-                .ok()?;
-            if done.exited != 0 {
-                return done.out;
+        // step=3/6\nrc=100 — written by the recipe's own EXIT trap.
+        let mut step = None;
+        let mut rc = None;
+        for line in read.content.lines() {
+            match line.split_once('=') {
+                Some(("step", v)) => step = Some(v.trim().to_string()),
+                Some(("rc", v)) => rc = v.trim().parse::<i32>().ok(),
+                _ => {}
             }
         }
-        None
+
+        let rc = rc?;
+        Some(omnuv_protocol::RecipeProgress {
+            status: match (rc, step.as_deref()) {
+                (0, _) => "done",
+                _ => "error",
+            }
+            .to_string(),
+            // "finished" is not a step anyone needs to see.
+            step: step.filter(|s| s != "finished" && s != "starting"),
+            detail: (rc != 0)
+                .then(|| format!("The recipe stopped with exit code {rc}. Its output is in the machine's own /var/log/cloud-init-output.log.")),
+        })
     }
 
     /// While Core is unreachable: **maintain, do not decide.**
@@ -827,6 +814,15 @@ mod tests {
         assert_eq!(order, vec![0, 1, 2, 3, 4], "steps must keep their order");
         assert!(inner(script)[0].contains("get.docker.com") && inner(script)[0].contains("sleep 5"),
                 "the first step must wait for the internet, not use it");
+
+        // The recipe reports its own outcome, and the path must be the real one
+        // rather than an un-interpolated placeholder — a broken trap line would
+        // disable the only signal anyone outside the machine gets.
+        assert!(script.contains(RECIPE_STATUS), "the trap must write the status file");
+        assert!(!script.contains("{RECIPE_STATUS}"), "the path must be interpolated");
+        assert!(script.contains("trap ") && script.contains("EXIT"),
+                "written whatever happens, including on failure");
+        assert!(script.contains("STEP=1/"), "each step names itself for the trap");
         // Without a GPU, no toolkit.
         spec.recipe.as_mut().unwrap().gpu = false;
         assert!(!cloud_init(&spec).contains(&{
@@ -974,5 +970,25 @@ echo 'single' "double" `backtick` \$escaped
         // The first entry, past any comment lines.
         let first = after.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
         assert!(first.starts_with("- ["), "bootcmd has at least one item, got {first:?}");
+    }
+}
+
+#[cfg(test)]
+mod render_check {
+    #[test]
+    fn dump() {
+        let mut spec = super::tests::spec_with_network();
+        spec.recipe = Some(omnuv_protocol::RecipeSpec {
+            id: "steam-gaming".into(),
+            compose: "services: {}\n".into(),
+            gpu: true,
+            post_up: vec!["echo hi".into()],
+        });
+        let ci = super::cloud_init(&spec);
+        let line = ci.lines().find(|l| l.contains("base64 -d")).unwrap();
+        let b = line.split("echo ").nth(1).unwrap().split(char::is_whitespace).next().unwrap();
+        use base64::Engine as _;
+        let out = base64::engine::general_purpose::STANDARD.decode(b).unwrap();
+        std::fs::write("/out/rendered-recipe.sh", out).unwrap();
     }
 }
