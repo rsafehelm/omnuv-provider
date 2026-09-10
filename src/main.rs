@@ -11,6 +11,7 @@ mod tls;
 mod tunnel;
 mod console;
 mod worker;
+mod selfcheck;
 mod workload;
 
 const USAGE: &str = "\

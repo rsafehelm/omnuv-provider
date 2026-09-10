@@ -210,9 +210,28 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     chmod 0755 /usr/local/sbin/omnuv-gateway-fence
     printf '[Unit]\nDescription=Re-assert the Omnuv gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-fence\n' > /etc/systemd/system/omnuv-gateway-fence.service
     printf '[Unit]\nDescription=Keep the Omnuv gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-fence.timer
+    # The gateway says, out loud and continuously, whether it can actually reach
+    # anything.
+    #
+    # A gateway that exists and is running can be unable to register with the
+    # overlay, and nothing above it can tell: the VM is there, the interface is
+    # there, the config is there. That state lasted hours and every published
+    # endpoint answered 502 while the machines behind them were healthy.
+    #
+    # Written to a file rather than answered on a port, because the agent reads
+    # it with VM.GuestAgent.FileRead — the same privilege the Workload Agent's
+    # report needs, and far short of the unrestricted exec that running a
+    # command in here would require. /run is tmpfs, so a stale file cannot
+    # outlive a reboot and pretend to be current.
+    printf '#!/bin/sh\nmkdir -p /run/omnuv\n( netbird status; echo ---; ip -br addr; echo ---; ip -br route ) > /run/omnuv/gateway-status.txt.new 2>&1\nmv /run/omnuv/gateway-status.txt.new /run/omnuv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
+    chmod 0755 /usr/local/sbin/omnuv-gateway-selfcheck
+    printf '[Unit]\nDescription=Report what the Omnuv gateway can actually reach\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-selfcheck\n' > /etc/systemd/system/omnuv-gateway-selfcheck.service
+    printf '[Unit]\nDescription=Keep the Omnuv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-selfcheck.timer
     systemctl daemon-reload
     systemctl enable --now --no-block omnuv-gateway-fence.timer 2>/dev/null || true
+    systemctl enable --now --no-block omnuv-gateway-selfcheck.timer 2>/dev/null || true
     /usr/local/sbin/omnuv-gateway-fence || true
+    /usr/local/sbin/omnuv-gateway-selfcheck || true
 "#,
             addr = addr,
             mac = crate::instance::marketplace_mac(&spec.id),
@@ -791,5 +810,70 @@ mod tests {
         let t = short_tag("b784148b-e05c-4df4-80a8-4d085f9f9aa4");
         assert_eq!(t, short_tag("b784148b-e05c-4df4-80a8-4d085f9f9aa4"));
         assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+}
+
+impl crate::proxmox::Client {
+    /// What this gateway can actually reach, read from inside it.
+    ///
+    /// Best-effort by construction. A gateway still booting, one whose guest
+    /// agent has not started, or one built before the self-check existed all
+    /// return `Unknown` — which is neither a pass nor a failure, and that
+    /// distinction is most of the value of asking at all.
+    pub(crate) async fn gateway_checks(
+        &self,
+        node: &str,
+        vmid: u32,
+        gateway_id: &str,
+    ) -> Vec<omnuv_protocol::SelfCheck> {
+        use crate::selfcheck::*;
+        use omnuv_protocol::CheckKind;
+
+        #[derive(serde::Deserialize)]
+        struct FileRead {
+            content: String,
+        }
+
+        let read: Option<FileRead> = self
+            .get_json(&format!(
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file=/run/omnuv/gateway-status.txt"
+            ))
+            .await
+            .ok();
+
+        let Some(read) = read else {
+            return vec![about(
+                unknown(
+                    "gateway.selfcheck",
+                    CheckKind::Connectivity,
+                    "no self-check yet: still booting, no guest agent, or built before this existed",
+                ),
+                gateway_id,
+            )];
+        };
+
+        // netbird status, then interfaces, then routes.
+        let mut parts = read.content.split("\n---\n");
+        let netbird = parts.next().unwrap_or("");
+        let links = parts.next().unwrap_or("");
+        let routes = parts.next().unwrap_or("");
+
+        let mut out = vec![
+            about(peer_connectivity(netbird), gateway_id),
+            about(peer_reachability(netbird), gateway_id),
+            about(adapter_presence("wt0", links), gateway_id),
+        ];
+
+        // A default route is the difference between a gateway that can forward
+        // and one that can only talk to its own subnet.
+        out.push(about(
+            if routes.lines().any(|l| l.trim_start().starts_with("default")) {
+                pass("gateway.route.default", CheckKind::Connectivity, "default route present")
+            } else {
+                fail("gateway.route.default", CheckKind::Connectivity, "no default route")
+            },
+            gateway_id,
+        ));
+        out
     }
 }
