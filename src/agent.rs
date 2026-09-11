@@ -404,6 +404,7 @@ async fn reconcile_workers(
     // run on the overlay, so a broken gateway is a degraded buyer network,
     // not a degraded provider.
     let mut checks: Vec<omnuv_protocol::SelfCheck> = Vec::new();
+    let mut links: Vec<omnuv_protocol::LinkReport> = Vec::new();
     let mut gateways = Vec::new();
     for spec in &desired.gateways {
         let status = if spec.lifecycle == Lifecycle::Deleted {
@@ -415,6 +416,7 @@ async fn reconcile_workers(
                     waiting_on: None,
                     local_id: None,
                     overlay_address: None,
+                    adapters: Vec::new(),
                     message: Some("deleted".into()),
                 },
                 Err(e) => {
@@ -435,6 +437,7 @@ async fn reconcile_workers(
                         waiting_on: None,
                         local_id: None,
                         overlay_address: None,
+                        adapters: Vec::new(),
                         message: Some(e.to_string().chars().take(400).collect()),
                     }
                 })
@@ -446,6 +449,10 @@ async fn reconcile_workers(
             && let Some(vmid) = status.local_id.as_deref().and_then(|v| v.parse::<u32>().ok())
         {
             checks.extend(driver.gateway_checks(node, vmid, &spec.id).await);
+            // The same status file, read for its numbers rather than its
+            // yes/no answers: which peers this gateway has, whether each is
+            // direct, and how far away it feels.
+            links.extend(driver.gateway_links(node, vmid, &spec.id).await);
         }
         gateways.push(status);
     }
@@ -470,6 +477,7 @@ async fn reconcile_workers(
                     waiting_on: None,
                     local_id: None,
                     endpoint: None,
+                    adapters: Vec::new(),
                     message: Some("deleted".into()),
                     telemetry: None,
                 }),
@@ -497,6 +505,7 @@ async fn reconcile_workers(
                 waiting_on: None,
                 local_id: None,
                 endpoint: None,
+                adapters: Vec::new(),
                 message: Some(e.to_string().chars().take(400).collect()),
                 telemetry: None,
             }
@@ -541,6 +550,7 @@ async fn reconcile_workers(
                 waiting_on: None,
                 local_id: None,
                 private_ip: None,
+                adapters: Vec::new(),
                 message: Some("deleted".into()),
                 recipe_progress: None,
             }),
@@ -569,6 +579,7 @@ async fn reconcile_workers(
                 waiting_on: (!retryable).then(|| "a provider that offers this image".to_string()),
                 local_id: None,
                 private_ip: None,
+                adapters: Vec::new(),
                 message: Some(why.chars().take(400).collect()),
                 recipe_progress: None,
             }
@@ -590,6 +601,10 @@ async fn reconcile_workers(
         // is only sent on failure is indistinguishable from one that stopped
         // running.
         checks,
+        // How each gateway actually reaches its peers, with the latency it
+        // measured. Same rule: sent every pass, so an empty list means "no
+        // links seen" rather than "nothing changed".
+        links,
     };
     let res = core.post("/provider/v1/status", Some(serde_json::to_value(&report)?)).await?;
     if !res.status().is_success() {

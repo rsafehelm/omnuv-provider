@@ -7,7 +7,7 @@ repository = "https://github.com/rsafehelm/omnuv-provider"
 description = "Omnuv Provider Agent. Executes normalized marketplace intent on a provider runtime."
 
 [dependencies]
-omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.4.0" }
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.5.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
@@ -19,6 +19,6 @@ base64 = "0.22"
 sha2 = "0.11"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "stream"] }
 futures-util = "0.3"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 
 [workspace]

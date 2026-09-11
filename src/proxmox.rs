@@ -89,6 +89,8 @@ struct PciEntry {
 struct VmEntry {
     vmid: u32,
     status: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
 }
 
 /// Which guests currently lay claim to a PCI device.
@@ -100,6 +102,19 @@ struct PciClaims {
     /// offers it, because the conflict is theirs to accept: the stopped guest
     /// will simply fail to start while the device is allocated elsewhere.
     stopped: HashSet<String>,
+    /// What guests the marketplace did not create have already been given.
+    ///
+    /// A provider advertises capacity and the ledger books against that number
+    /// alone, so a host advertising 64 cores while its owner runs a 60-core
+    /// workload passes every oversell check we have and the first sign of
+    /// trouble is a buyer's machine that will not start. This is the other half
+    /// of that sum, collected on the pass that already reads every guest config
+    /// for PCI claims — no extra call, and nothing recorded about *what* those
+    /// guests are, which is the provider's business.
+    ///
+    /// `None` when enumeration failed: an unmeasured commitment must never read
+    /// as zero.
+    committed: Option<omnuv_protocol::HostCommitment>,
     /// False if enumeration failed. Nothing is offered when we cannot prove
     /// a device is free.
     complete: bool,
@@ -353,6 +368,12 @@ impl Client {
     /// break the guest the moment its owner starts it again.
     async fn claimed_pci(&self, node: &str) -> PciClaims {
         let mut claims = PciClaims { complete: true, ..Default::default() };
+        let mut foreign = omnuv_protocol::HostCommitment {
+            cpu_cores: 0,
+            memory_mib: 0,
+            disk_gib: 0,
+            guests: 0,
+        };
         let vms: Vec<VmEntry> = match self.get(&format!("/nodes/{node}/qemu")).await {
             Ok(v) => v,
             // Without VM.Audit we cannot prove a device is free, so nothing is
@@ -375,6 +396,16 @@ impl Client {
                     }
                 };
             let Some(map) = cfg.as_object() else { continue };
+
+            // Anything the marketplace did not create is the provider's own,
+            // and what it has been given is capacity nobody should sell twice.
+            if !is_marketplace(vm.tags.as_deref()) {
+                foreign.guests += 1;
+                foreign.cpu_cores += configured_cores(map);
+                foreign.memory_mib += map.get("memory").and_then(as_u64).unwrap_or(0);
+                foreign.disk_gib += configured_disk_gib(map);
+            }
+
             for (k, v) in map {
                 if !k.starts_with("hostpci") {
                     continue;
@@ -389,6 +420,9 @@ impl Client {
                 }
             }
         }
+        // Only when every guest was readable. A partial survey undercounts,
+        // and an undercount here reads as free capacity.
+        claims.committed = claims.complete.then_some(foreign);
         claims
     }
 
@@ -493,6 +527,7 @@ impl Client {
                 memory_mib: c.memory_mib.min(physical_mib),
                 disk_gib: c.disk_gib.min(avail_gib),
                 gpus,
+                committed: claims.committed,
             });
         }
 
@@ -576,5 +611,118 @@ mod tests {
         assert_eq!(pci_slot("05:00"), pci_slot("0000:05:00.1"));
         assert_eq!(pci_slot("0000:5d:00,pcie=1,x-vga=1"), "0000:5d:00");
         assert_ne!(pci_slot("0000:21:00.0"), pci_slot("0000:22:00.0"));
+    }
+}
+
+/// Whether a guest is one the marketplace created.
+///
+/// The three tags are the only claim of ownership that exists, and they are
+/// what `reap_stale_gateways` and the worker finder already trust. Anything
+/// without one belongs to the provider — including, deliberately, a guest with
+/// no tags at all: the safe reading of "we do not know whose this is" is "not
+/// ours", because counting someone else's machine as marketplace capacity is
+/// how a host gets oversold.
+fn is_marketplace(tags: Option<&str>) -> bool {
+    let Some(tags) = tags else { return false };
+    tags.split(&[';', ','][..]).map(str::trim).any(|t| {
+        t == crate::worker::TAG
+            || t == crate::gateway::TAG
+            || t == crate::instance::TAG
+            || crate::instance::is_legacy_marketplace_tag(t)
+    })
+}
+
+/// Proxmox writes numbers as numbers or as strings depending on the field and
+/// the version; both mean the same thing.
+fn as_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str()?.parse().ok())
+}
+
+/// `cores` is per socket. A two-socket guest with `cores: 8` has sixteen.
+fn configured_cores(map: &serde_json::Map<String, serde_json::Value>) -> u32 {
+    let cores = map.get("cores").and_then(as_u64).unwrap_or(0);
+    let sockets = map.get("sockets").and_then(as_u64).unwrap_or(1).max(1);
+    (cores * sockets) as u32
+}
+
+/// Every disk a guest has been given, summed. `scsi0: local-lvm:vm-100-disk-0,size=32G`.
+///
+/// Sizes below a gibibyte round to zero rather than up: a handful of cloud-init
+/// drives must not add a phantom gigabyte each to what the provider is said to
+/// owe.
+fn configured_disk_gib(map: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    const BUSES: [&str; 4] = ["scsi", "virtio", "sata", "ide"];
+    map.iter()
+        .filter(|(k, _)| {
+            BUSES.iter().any(|b| k.strip_prefix(b).is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()))
+        })
+        .filter_map(|(_, v)| size_gib(v.as_str()?))
+        .sum()
+}
+
+fn size_gib(raw: &str) -> Option<u64> {
+    let field = raw.split(',').find_map(|p| p.trim().strip_prefix("size="))?;
+    let (num, unit) = field.split_at(field.find(|c: char| c.is_ascii_alphabetic())?);
+    let n: f64 = num.parse().ok()?;
+    Some(match unit {
+        "T" => (n * 1024.0) as u64,
+        "G" => n as u64,
+        "M" => (n / 1024.0) as u64,
+        "K" => (n / (1024.0 * 1024.0)) as u64,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod host_commitment_tests {
+    use super::*;
+
+    #[test]
+    fn an_untagged_guest_belongs_to_the_provider() {
+        assert!(!is_marketplace(None));
+        assert!(!is_marketplace(Some("")));
+        assert!(!is_marketplace(Some("backup;prod")));
+    }
+
+    #[test]
+    fn a_marketplace_guest_is_recognised_by_any_of_its_three_tags() {
+        assert!(is_marketplace(Some("omnuv-worker;w-abcd1234")));
+        assert!(is_marketplace(Some("omnuv-gateway;g-1")));
+        assert!(is_marketplace(Some("omnuv-instance;i-1")));
+    }
+
+    #[test]
+    fn cores_are_per_socket() {
+        let m = serde_json::json!({"cores": 8, "sockets": 2});
+        assert_eq!(configured_cores(m.as_object().unwrap()), 16);
+        let one = serde_json::json!({"cores": 4});
+        assert_eq!(configured_cores(one.as_object().unwrap()), 4);
+    }
+
+    #[test]
+    fn every_disk_counts_and_nothing_else_does() {
+        let m = serde_json::json!({
+            "scsi0": "local-lvm:vm-100-disk-0,size=32G",
+            "virtio1": "local-lvm:vm-100-disk-1,size=1T",
+            "ide2": "local:iso/ubuntu.iso,media=cdrom",
+            "scsihw": "virtio-scsi-pci",
+            "net0": "virtio=AA:BB:CC:DD:EE:FF",
+        });
+        // 32 + 1024; the cdrom has no size and the controller is not a disk.
+        assert_eq!(configured_disk_gib(m.as_object().unwrap()), 1056);
+    }
+
+    /// A cloud-init drive is a few megabytes. Rounding each one up to a
+    /// gibibyte would invent capacity the provider does not owe.
+    #[test]
+    fn a_tiny_drive_rounds_to_nothing_rather_than_to_one() {
+        assert_eq!(size_gib("local-lvm:vm-100-cloudinit,size=4M"), Some(0));
+        assert_eq!(size_gib("local:iso/x.iso,media=cdrom"), None);
+    }
+
+    #[test]
+    fn proxmox_numbers_are_read_whether_quoted_or_not() {
+        let m = serde_json::json!({"cores": "4", "sockets": "1"});
+        assert_eq!(configured_cores(m.as_object().unwrap()), 4);
     }
 }

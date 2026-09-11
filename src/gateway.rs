@@ -226,7 +226,7 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # report needs, and far short of the unrestricted exec that running a
     # command in here would require. /run is tmpfs, so a stale file cannot
     # outlive a reboot and pretend to be current.
-    printf '#!/bin/sh\nmkdir -p /run/omnuv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route ) > /run/omnuv/gateway-status.txt.new 2>&1\nmv /run/omnuv/gateway-status.txt.new /run/omnuv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
+    printf '#!/bin/sh\nmkdir -p /run/omnuv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route; echo ---; netbird status --json ) > /run/omnuv/gateway-status.txt.new 2>&1\nmv /run/omnuv/gateway-status.txt.new /run/omnuv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
     chmod 0755 /usr/local/sbin/omnuv-gateway-selfcheck
     printf '[Unit]\nDescription=Report what the Omnuv gateway can actually reach\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-selfcheck\n' > /etc/systemd/system/omnuv-gateway-selfcheck.service
     printf '[Unit]\nDescription=Keep the Omnuv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-selfcheck.timer
@@ -368,6 +368,7 @@ impl proxmox::Client {
                     waiting_on: None,
                     local_id: None,
                     overlay_address: None,
+                    adapters: Vec::new(),
                     message: Some(why),
                 });
             }
@@ -425,12 +426,17 @@ impl proxmox::Client {
                 }
             }
 
-            let addr = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+            // The guest answering is the liveness signal, and only that. The
+            // address it hands back is the gateway's LAN address; calling that
+            // the overlay address is the bug this replaced.
+            let reachable = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+            let overlay = if running { self.gateway_overlay(node, vm.vmid).await } else { None };
+            let addr = overlay.clone();
 
             // Keep the resolver's map current. dnsmasq watches the directory,
             // so replacing the file is the whole update; the write is idempotent
             // and cheap, and needs only the pool-scoped file-write privilege.
-            if addr.is_some()
+            if reachable.is_some()
                 && let Err(e) = self
                     .guest_file_write(node, vm.vmid, DNS_HOSTS_PATH, &hosts_file(&spec.dns_records))
                     .await
@@ -442,15 +448,25 @@ impl proxmox::Client {
                 id: spec.id.clone(),
                 // READY means the guest is answering, not merely that a VM
                 // exists: a gateway that never booted is not carrying traffic.
-                state: match (running, addr.is_some() && !refreshed) {
+                // READY still means the guest is answering, not that it has an
+                // overlay address: a gateway whose overlay client is still
+                // enrolling is up and reachable, and reporting it Offline
+                // because one field is late would be a regression.
+                state: match (running, reachable.is_some() && !refreshed) {
                     (true, true) => GatewayState::Ready,
                     (true, false) => GatewayState::Deploying,
                     _ => GatewayState::Offline,
                 },
                 retryable: None,
-                waiting_on: None,
+                waiting_on: match (running, reachable.is_some(), overlay.is_some()) {
+                    (true, true, false) => Some("the overlay client to enrol".to_string()),
+                    (true, false, _) => Some("first boot to finish".to_string()),
+                    (false, _, _) => Some("the gateway to start".to_string()),
+                    _ => None,
+                },
                 local_id: Some(vm.vmid.to_string()),
                 overlay_address: addr,
+                adapters: self.observed_adapters(node, vm.vmid, reachable.as_deref()).await,
                 message: refreshed.then(|| "configuration refreshed; rebooting".to_string()),
             });
         }
@@ -463,6 +479,7 @@ impl proxmox::Client {
                 waiting_on: None,
                 local_id: None,
                 overlay_address: None,
+                adapters: Vec::new(),
                 message: Some("not present".into()),
             });
         }
@@ -554,6 +571,7 @@ impl proxmox::Client {
             waiting_on: None,
             local_id: Some(vmid.to_string()),
             overlay_address: None,
+            adapters: Vec::new(),
             message: Some(format!("gateway vm {vmid} created and started")),
         })
     }
@@ -823,6 +841,42 @@ impl crate::proxmox::Client {
     /// agent has not started, or one built before the self-check existed all
     /// return `Unknown` — which is neither a pass nor a failure, and that
     /// distinction is most of the value of asking at all.
+    /// The whole gateway status file, if the guest can be read.
+    async fn gateway_status_file(&self, node: &str, vmid: u32) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct FileRead {
+            content: String,
+        }
+        let r: FileRead = self
+            .get_json(&format!(
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file=/run/omnuv/gateway-status.txt"
+            ))
+            .await
+            .ok()?;
+        Some(r.content)
+    }
+
+    /// The gateway's address **on the overlay**, read from the overlay client
+    /// rather than from the guest's primary NIC.
+    pub(crate) async fn gateway_overlay(&self, node: &str, vmid: u32) -> Option<String> {
+        let content = self.gateway_status_file(node, vmid).await?;
+        crate::selfcheck::overlay_address_in(json_section(&content)?)
+    }
+
+    /// Every overlay link this gateway can currently see, with the latency it
+    /// measured. Empty for a gateway built before the status file carried JSON,
+    /// which is the point of appending a section rather than replacing one.
+    pub(crate) async fn gateway_links(
+        &self,
+        node: &str,
+        vmid: u32,
+        gateway_id: &str,
+    ) -> Vec<omnuv_protocol::LinkReport> {
+        let Some(content) = self.gateway_status_file(node, vmid).await else { return Vec::new() };
+        let Some(json) = json_section(&content) else { return Vec::new() };
+        crate::selfcheck::links_in(json, gateway_id, crate::worker::now_unix())
+    }
+
     pub(crate) async fn gateway_checks(
         &self,
         node: &str,
@@ -883,5 +937,36 @@ impl crate::proxmox::Client {
             gateway_id,
         ));
         out
+    }
+}
+
+/// The fourth section of the gateway status file: `netbird status --json`.
+///
+/// Absent on a gateway built before it was added, which must read as "no links
+/// reported" and never as a failure — the first three sections still answer
+/// every check they answered yesterday.
+fn json_section(content: &str) -> Option<&str> {
+    let s = content.split("\n---\n").nth(3)?.trim();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(test)]
+mod status_file_sections {
+    use super::json_section;
+
+    #[test]
+    fn an_older_gateway_has_three_sections_and_no_json() {
+        assert_eq!(json_section("netbird\n---\naddrs\n---\nroutes"), None);
+    }
+
+    #[test]
+    fn the_fourth_section_is_the_json_one() {
+        let f = "netbird\n---\naddrs\n---\nroutes\n---\n{\"netbirdIp\":\"100.93.1.1/16\"}";
+        assert_eq!(json_section(f), Some("{\"netbirdIp\":\"100.93.1.1/16\"}"));
+    }
+
+    #[test]
+    fn an_empty_fourth_section_is_not_a_document() {
+        assert_eq!(json_section("a\n---\nb\n---\nc\n---\n   "), None);
     }
 }

@@ -510,7 +510,11 @@ impl Client {
                     _ => None,
                 },
                 local_id: Some(vm.vmid.to_string()),
-                private_ip,
+                // Kept: an older Core reads only this, and the console still
+                // shows the marketplace address rather than whichever NIC the
+                // host happened to resolve first.
+                private_ip: private_ip.clone(),
+                adapters: self.observed_adapters(node, vm.vmid, private_ip.as_deref()).await,
                 message: None,
                 // Only asked for a machine that was given a recipe, and only
                 // while it is up: there is nothing to ask otherwise.
@@ -531,6 +535,7 @@ impl Client {
                 waiting_on: None,
                 local_id: None,
                 private_ip: None,
+                adapters: Vec::new(),
                 message: Some("already removed".into()),
                 recipe_progress: None,
             });
@@ -632,6 +637,7 @@ impl Client {
             waiting_on: None,
             local_id: Some(vmid.to_string()),
             private_ip: None,
+            adapters: Vec::new(),
             message: Some(format!("vm {vmid} created")),
             // Just created: first boot has not started, let alone finished.
             recipe_progress: None,

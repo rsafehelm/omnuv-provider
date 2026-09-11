@@ -343,3 +343,173 @@ Peers detail:
         assert_eq!(peer_paths("Peers detail:").result, CheckResult::Unknown);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Links, from the overlay client's own JSON
+// ---------------------------------------------------------------------------
+
+/// What the gateway's overlay client says about itself and its peers.
+///
+/// The text form above answers yes/no questions — connected, relayed, adapter
+/// present — and that was the strongest thing the map could draw: "both ends
+/// report peers", which is a statement about paperwork. It survives a tunnel
+/// that has not completed a handshake in an hour, and it cannot tell a direct
+/// path from one relayed twice through the platform at 90 ms.
+///
+/// The JSON form carries the numbers. It is appended as a fourth section of the
+/// same status file rather than replacing the text, so a gateway built before
+/// this change keeps passing exactly the checks it passed yesterday and simply
+/// reports no links — an upgrade that cannot regress what it does not touch.
+///
+/// Field names are NetBird's, verified against `client/status/status.go` at the
+/// version this lab runs (0.78.1) rather than recalled: `netbirdIp`,
+/// `connectionType`, `latency`, `lastWireguardHandshake`.
+pub fn links_in(json: &str, gateway_id: &str, at_unix: u64) -> Vec<omnuv_protocol::LinkReport> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let Some(details) = v.get("peers").and_then(|p| p.get("details")).and_then(|d| d.as_array())
+    else {
+        return Vec::new();
+    };
+    details
+        .iter()
+        .filter_map(|p| {
+            let peer = p.get("fqdn")?.as_str()?;
+            Some(omnuv_protocol::LinkReport {
+                gateway_id: gateway_id.to_string(),
+                // The short name, as every other surface here spells it.
+                peer: peer.split('.').next().unwrap_or(peer).to_string(),
+                peer_address: p
+                    .get("netbirdIp")
+                    .and_then(|a| a.as_str())
+                    .map(|a| a.split('/').next().unwrap_or(a).to_string()),
+                relayed: p
+                    .get("connectionType")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.eq_ignore_ascii_case("relayed")),
+                rtt_ms: p.get("latency").and_then(latency_ms),
+                last_handshake_unix: p
+                    .get("lastWireguardHandshake")
+                    .and_then(|h| h.as_str())
+                    .and_then(rfc3339_unix),
+                at_unix,
+            })
+        })
+        .collect()
+}
+
+/// The gateway's own overlay address, which is *not* the address on its primary
+/// NIC.
+///
+/// Until 11 September `overlay_address` was filled from the guest agent's first
+/// IPv4 — the provider's LAN address. It looked entirely plausible, it was
+/// never on the overlay, and it made the map draw an overlay link between two
+/// addresses that could not reach each other that way.
+pub fn overlay_address_in(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let raw = v.get("netbirdIp")?.as_str()?;
+    let addr = raw.split('/').next().unwrap_or(raw);
+    (!addr.is_empty()).then(|| addr.to_string())
+}
+
+/// Go renders `time.Duration` as an integer of nanoseconds. Some builds render
+/// it as `"41.2ms"`, so both are accepted and anything else is *not measured*
+/// rather than zero — a link reported at 0 ms reads as instant, which is a
+/// worse answer than no answer.
+fn latency_ms(v: &serde_json::Value) -> Option<u32> {
+    if let Some(ns) = v.as_u64() {
+        return (ns > 0).then(|| (ns / 1_000_000).max(1) as u32);
+    }
+    let s = v.as_str()?;
+    let (num, scale) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1.0)
+    } else if let Some(n) = s.strip_suffix("µs").or_else(|| s.strip_suffix("us")) {
+        (n, 0.001)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000.0)
+    } else {
+        return None;
+    };
+    let ms = num.parse::<f64>().ok()? * scale;
+    (ms > 0.0).then(|| ms.round().max(1.0) as u32)
+}
+
+fn rfc3339_unix(s: &str) -> Option<u64> {
+    // NetBird's zero time is a handshake that never happened, not one at the
+    // dawn of the epoch.
+    if s.starts_with("0001-01-01") {
+        return None;
+    }
+    let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
+    u64::try_from(t.unix_timestamp()).ok()
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    const STATUS: &str = r#"{
+      "peers": {"total":2,"connected":2,"details":[
+        {"fqdn":"omnuv-gw-abcd1234.netbird.selfhosted","netbirdIp":"100.93.1.5/16",
+         "connectionType":"P2P","latency":4200000,
+         "lastWireguardHandshake":"2026-09-11T10:00:00Z"},
+        {"fqdn":"rmartins-laptop.netbird.selfhosted","netbirdIp":"100.93.9.9/16",
+         "connectionType":"Relayed","latency":"41.2ms",
+         "lastWireguardHandshake":"0001-01-01T00:00:00Z"}
+      ]},
+      "netbirdIp":"100.93.220.239/16"
+    }"#;
+
+    #[test]
+    fn a_direct_gateway_and_a_relayed_client_are_told_apart() {
+        let l = links_in(STATUS, "g1", 99);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].peer, "omnuv-gw-abcd1234");
+        assert!(!l[0].relayed);
+        assert!(l[1].relayed);
+        // Directional: both are what g1 sees.
+        assert!(l.iter().all(|x| x.gateway_id == "g1" && x.at_unix == 99));
+    }
+
+    #[test]
+    fn latency_is_read_in_both_shapes_go_emits() {
+        let l = links_in(STATUS, "g1", 0);
+        assert_eq!(l[0].rtt_ms, Some(4), "4.2 ms as nanoseconds");
+        assert_eq!(l[1].rtt_ms, Some(41), "41.2ms as a string");
+    }
+
+    /// A sub-millisecond link is fast, not instant. Rounding it to zero would
+    /// render as "0 ms", which reads as a broken measurement.
+    #[test]
+    fn a_very_fast_link_is_never_reported_as_instant() {
+        let v = serde_json::json!(300_000u64); // 0.3 ms
+        assert_eq!(latency_ms(&v), Some(1));
+    }
+
+    #[test]
+    fn an_unmeasured_latency_stays_unmeasured() {
+        assert_eq!(latency_ms(&serde_json::json!(0)), None);
+        assert_eq!(latency_ms(&serde_json::json!("")), None);
+        assert_eq!(latency_ms(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn a_handshake_that_never_happened_is_not_a_handshake_in_the_year_one() {
+        let l = links_in(STATUS, "g1", 0);
+        assert!(l[0].last_handshake_unix.is_some());
+        assert_eq!(l[1].last_handshake_unix, None);
+    }
+
+    #[test]
+    fn the_gateways_own_address_comes_off_the_overlay_not_the_lan() {
+        assert_eq!(overlay_address_in(STATUS).as_deref(), Some("100.93.220.239"));
+    }
+
+    /// A gateway built before this change writes three sections and no JSON.
+    /// It must report no links, not fail.
+    #[test]
+    fn an_older_gateway_reports_no_links_rather_than_breaking() {
+        assert!(links_in("", "g1", 0).is_empty());
+        assert!(links_in("Peers detail:\n  none", "g1", 0).is_empty());
+        assert_eq!(overlay_address_in("not json"), None);
+    }
+}

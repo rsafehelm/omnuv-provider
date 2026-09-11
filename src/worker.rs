@@ -22,8 +22,6 @@ pub(crate) struct VmRef {
     #[serde(default)]
     pub(crate) tags: Option<String>,
     #[serde(default)]
-    pub(crate) name: Option<String>,
-    #[serde(default)]
     pub(crate) status: Option<String>,
 }
 
@@ -291,6 +289,7 @@ impl Client {
                 waiting_on: None,
                 local_id: Some(vm.vmid.to_string()),
                 endpoint: serving.then(|| endpoint.clone()).flatten(),
+                adapters: self.observed_adapters(node, vm.vmid, None).await,
                 message: match (running, endpoint.is_some(), serving) {
                     (true, false, _) => Some("booting; no address yet".into()),
                     // "still loading" was all the host could ever say. The
@@ -300,7 +299,12 @@ impl Client {
                         loading_detail(telemetry_ref)
                             .unwrap_or_else(|| "address up; model still loading".into()),
                     ),
-                    _ => vm.name,
+                    // Nothing. This was `vm.name`, so a worker that was serving
+                    // perfectly reported `omnuv-worker-dd6161d1` here — and Core
+                    // stores this column as `last_error` and the console paints
+                    // it in a warning box. A healthy machine sat behind a ⚠ for
+                    // a day because a free-looking field was filled in.
+                    _ => None,
                 },
                 telemetry: telemetry.clone(),
             });
@@ -370,6 +374,8 @@ impl Client {
             waiting_on: None,
             local_id: Some(vmid.to_string()),
             endpoint: None,
+            // Just created: nothing has been on the network yet to observe.
+            adapters: Vec::new(),
             message: Some(format!("vm {vmid} created and started")),
             telemetry: None,
         })
@@ -451,9 +457,37 @@ impl Client {
             })
     }
 
+    /// Every adapter on a machine, and whether the host has seen traffic from
+    /// it — see `neighbours` for why the host is a better witness than the
+    /// guest.
+    ///
+    /// The neighbour table is re-read per machine rather than threaded through
+    /// the reconcile. It is one small file read against a pass that already
+    /// makes several HTTP round trips per machine, so the saving would be
+    /// invisible and the signature churn would not.
+    pub(crate) async fn observed_adapters(
+        &self,
+        node: &str,
+        vmid: u32,
+        believed: Option<&str>,
+    ) -> Vec<omnuv_protocol::AdapterStatus> {
+        let Ok(cfg) = self.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config")).await
+        else {
+            return Vec::new();
+        };
+        crate::neighbours::adapters(&cfg, &crate::neighbours::Neighbours::read(), believed, now_unix())
+    }
+
     async fn worker_endpoint(&self, node: &str, vmid: u32, port: u16) -> Option<String> {
         self.guest_ipv4(node, vmid).await.map(|ip| format!("http://{ip}:{port}"))
     }
+}
+
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 /// Maps observed facts to a normalized worker state. Pure, so the rules are
