@@ -532,7 +532,7 @@ async fn reconcile_workers(
     let mut instances = Vec::new();
     for spec in &desired.instances {
         let result = match spec.lifecycle {
-            Lifecycle::Deleted => driver.delete_instance(node, &spec.id).await.map(|_| InstanceStatus {
+            Lifecycle::Deleted => driver.delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir).await.map(|_| InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Stopped,

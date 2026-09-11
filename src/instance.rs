@@ -479,7 +479,24 @@ impl Client {
                     (false, _) => InstanceState::Stopped,
                 },
                 retryable: None,
-                waiting_on: None,
+                // The protocol asks for this in its own words: *"'Waiting'
+                // without 'for what' is not information."* We were sending
+                // exactly that.
+                //
+                // The two cases below are distinguishable right here and were
+                // being collapsed into one word. On 11 September a machine sat
+                // in `Provisioning` for 9m14s of a 10m budget — booted,
+                // networked, installing the guest agent over apt — and looked
+                // identical to one that had just been asked for. Core has the
+                // column, the console renders it; nothing was putting anything
+                // in it.
+                waiting_on: match (running, guest_ip.is_some()) {
+                    (true, false) => Some("first boot to finish".to_string()),
+                    (false, _) if spec.lifecycle == Lifecycle::Running => {
+                        Some("the machine to start".to_string())
+                    }
+                    _ => None,
+                },
                 local_id: Some(vm.vmid.to_string()),
                 private_ip,
                 message: None,
@@ -692,7 +709,31 @@ impl Client {
         Ok(restarted)
     }
 
-    pub async fn delete_instance(&self, node: &str, id: &str) -> anyhow::Result<()> {
+    pub async fn delete_instance(
+        &self,
+        node: &str,
+        id: &str,
+        snippet_dir: &str,
+    ) -> anyhow::Result<()> {
+        // The cloud-init snippet goes with the machine.
+        //
+        // It was written on create and released by nothing: `CLAUDE.md`'s
+        // Deletion list names CPU, RAM, disk, GPU, the private IP, edge
+        // mappings and the relay peer, and never named this. So they piled up —
+        // 17 across two providers by 11 September — each holding a deleted
+        // machine's SSH keys, its private addressing and its hashed console
+        // password, in a directory nothing tracked.
+        //
+        // Removed first, and best-effort: a snippet left behind must never stop
+        // a machine being deleted, because a VM that outlives its delete is far
+        // worse than a file that does.
+        let snippet = format!("{snippet_dir}/omnuv-instance-{id}.yaml");
+        if let Err(e) = std::fs::remove_file(&snippet)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("instance {id}: cloud-init snippet not removed: {e}");
+        }
+
         let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(id)).await? else {
             return Ok(());
         };
