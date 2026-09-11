@@ -290,6 +290,9 @@ impl Client {
                 local_id: Some(vm.vmid.to_string()),
                 endpoint: serving.then(|| endpoint.clone()).flatten(),
                 adapters: self.observed_adapters(node, vm.vmid, None).await,
+                diagnostics: Some(
+                    self.diagnose(node, vm.vmid, serving, Some(endpoint.is_some())).await,
+                ),
                 message: match (running, endpoint.is_some(), serving) {
                     (true, false, _) => Some("booting; no address yet".into()),
                     // "still loading" was all the host could ever say. The
@@ -374,8 +377,11 @@ impl Client {
             waiting_on: None,
             local_id: Some(vmid.to_string()),
             endpoint: None,
-            // Just created: nothing has been on the network yet to observe.
+            // Just created: nothing has been on the network yet to observe,
+            // and the hypervisor has nothing to say that the create task did
+            // not already say.
             adapters: Vec::new(),
+            diagnostics: None,
             message: Some(format!("vm {vmid} created and started")),
             telemetry: None,
         })
@@ -476,6 +482,43 @@ impl Client {
             return Vec::new();
         };
         crate::neighbours::adapters(&cfg, &crate::neighbours::Neighbours::read(), believed, now_unix())
+    }
+
+    /// Everything the hypervisor will say about a marketplace machine.
+    ///
+    /// Two calls on the healthy path — status and config, and the config is one
+    /// the adapter reading already needed — plus the task log only when the
+    /// machine is *not* healthy. That last one is the point: the answer to
+    /// "what went wrong" usually already exists in the hypervisor's own task
+    /// log, and until now nothing carried it upward, so every root-cause
+    /// analysis of a failed clone or a refused start began with an ssh.
+    pub(crate) async fn diagnose(
+        &self,
+        node: &str,
+        vmid: u32,
+        healthy: bool,
+        guest_agent_answered: Option<bool>,
+    ) -> omnuv_protocol::Diagnostics {
+        let current = self
+            .get_json::<crate::diagnostics::Current>(&format!(
+                "/nodes/{node}/qemu/{vmid}/status/current"
+            ))
+            .await
+            .ok();
+        let config =
+            self.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config")).await.ok();
+        let failure = if healthy {
+            None
+        } else {
+            self.get_json::<Vec<crate::diagnostics::Task>>(&format!(
+                "/nodes/{node}/tasks?vmid={vmid}&limit=10&errors=1"
+            ))
+            .await
+            .ok()
+            .as_deref()
+            .and_then(crate::diagnostics::failure_in)
+        };
+        crate::diagnostics::build(node, current, config.as_ref(), guest_agent_answered, failure)
     }
 
     async fn worker_endpoint(&self, node: &str, vmid: u32, port: u16) -> Option<String> {

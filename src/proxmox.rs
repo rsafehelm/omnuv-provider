@@ -133,6 +133,9 @@ pub struct Client {
     /// The package mirror machines built here should use. See
     /// `config::ProxmoxRuntime::apt_mirror`.
     pub(crate) apt_mirror: Option<String>,
+    /// Whether this provider has opted in to disclosing what its host has
+    /// already given its own guests. See `config::ProxmoxRuntime::showall`.
+    showall: bool,
 }
 
 impl ComputeDriver for Client {
@@ -147,7 +150,7 @@ impl ComputeDriver for Client {
 
 /// Proxmox writes passthrough as `0000:05:00` while the PCI listing says
 /// `0000:05:00.0`. Compare on domain:bus:device and ignore the function.
-fn pci_slot(raw: &str) -> String {
+pub(crate) fn pci_slot(raw: &str) -> String {
     let addr = raw.split(',').next().unwrap_or(raw).trim();
     let addr = addr.split('.').next().unwrap_or(addr);
     let full = if addr.matches(':').count() == 1 { format!("0000:{addr}") } else { addr.to_string() };
@@ -169,6 +172,7 @@ impl Client {
         location: Option<omnuv_protocol::GeoLocation>,
         city: Option<String>,
         apt_mirror: Option<String>,
+        showall: bool,
     ) -> anyhow::Result<Self> {
         let tls = crate::tls::config(fingerprint)?;
         Ok(Self {
@@ -181,6 +185,7 @@ impl Client {
             location,
             city,
             apt_mirror,
+            showall,
         })
     }
 
@@ -197,8 +202,10 @@ impl Client {
             None,
             None,
             // The debug `discover` command reads inventory and builds nothing,
-            // so it has no cloud-init to write and no mirror to name.
+            // so it has no cloud-init to write and no mirror to name — and it
+            // discloses nothing about the provider's own guests either.
             None,
+            false,
         )
     }
 
@@ -420,9 +427,17 @@ impl Client {
                 }
             }
         }
-        // Only when every guest was readable. A partial survey undercounts,
-        // and an undercount here reads as free capacity.
-        claims.committed = claims.complete.then_some(foreign);
+        // Only when every guest was readable — a partial survey undercounts,
+        // and an undercount here reads as free capacity — and only when this
+        // provider asked for it to be sent at all.
+        //
+        // The survey itself always runs: it is the same pass that proves a GPU
+        // is free, and it never leaves this process unless `showall` is set.
+        // What the flag gates is *disclosure*, not measurement.
+        claims.committed = (claims.complete && self.showall).then_some(foreign);
+        if self.showall && claims.complete {
+            disclosure_noted(node, &foreign);
+        }
         claims
     }
 
@@ -725,4 +740,47 @@ mod host_commitment_tests {
         let m = serde_json::json!({"cores": "4", "sockets": "1"});
         assert_eq!(configured_cores(m.as_object().unwrap()), 4);
     }
+}
+
+/// Record, on the provider's own side, that host usage was disclosed.
+///
+/// The audit entry is written here rather than only at Core because the party
+/// giving something up should be able to see that they did, in their own
+/// journal, without asking the marketplace. It flows upward with the report as
+/// well — `audit::record` does both — so the trail exists on both sides and
+/// neither can quietly lose it.
+///
+/// Hourly while the flag stays on, plus once whenever the figure changes.
+/// Every pass would bury the audit stream in 720 entries a day; silence after
+/// the first would let a diagnostic flag become permanent without anyone
+/// noticing. Repeating is meant to be slightly annoying: `showall` is for
+/// diagnosing a host that keeps refusing placements, and then for turning off.
+fn disclosure_noted(node: &str, c: &omnuv_protocol::HostCommitment) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<(Instant, omnuv_protocol::HostCommitment)>> = Mutex::new(None);
+
+    let mut last = match LAST.lock() {
+        Ok(l) => l,
+        Err(e) => e.into_inner(),
+    };
+    let due = match last.as_ref() {
+        None => true,
+        Some((at, was)) => was != c || at.elapsed() >= Duration::from_secs(3600),
+    };
+    if !due {
+        return;
+    }
+    *last = Some((Instant::now(), *c));
+    crate::audit::record(
+        "host.usage.disclosed",
+        "agent",
+        node,
+        "ok",
+        Some(&format!(
+            "showall is on: reporting {} vCPU, {} MiB and {} GiB committed to {} guest(s) \
+             this provider runs itself",
+            c.cpu_cores, c.memory_mib, c.disk_gib, c.guests
+        )),
+    );
 }

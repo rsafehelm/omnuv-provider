@@ -515,6 +515,10 @@ impl Client {
                 // host happened to resolve first.
                 private_ip: private_ip.clone(),
                 adapters: self.observed_adapters(node, vm.vmid, private_ip.as_deref()).await,
+                diagnostics: Some(
+                    self.diagnose(node, vm.vmid, running && guest_ip.is_some(), Some(guest_ip.is_some()))
+                        .await,
+                ),
                 message: None,
                 // Only asked for a machine that was given a recipe, and only
                 // while it is up: there is nothing to ask otherwise.
@@ -536,6 +540,7 @@ impl Client {
                 local_id: None,
                 private_ip: None,
                 adapters: Vec::new(),
+                diagnostics: None,
                 message: Some("already removed".into()),
                 recipe_progress: None,
             });
@@ -638,6 +643,7 @@ impl Client {
             local_id: Some(vmid.to_string()),
             private_ip: None,
             adapters: Vec::new(),
+            diagnostics: None,
             message: Some(format!("vm {vmid} created")),
             // Just created: first boot has not started, let alone finished.
             recipe_progress: None,

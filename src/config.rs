@@ -191,6 +191,35 @@ pub struct ProxmoxRuntime {
     /// returns `archive.ubuntu.com` here.
     #[serde(default)]
     pub apt_mirror: Option<String>,
+
+    /// Disclose what this host has already given to guests the marketplace did
+    /// not create. **Off by default, and off is the right default.**
+    ///
+    /// The marketplace books against advertised capacity and nothing else, so a
+    /// host advertising 64 cores while its owner runs a 60-core workload of
+    /// their own passes every oversell check Core has, and the first sign of
+    /// trouble is a buyer's machine that will not start. Knowing the figure
+    /// would let Core see that coming.
+    ///
+    /// It is still off by default, because the figure is a fact about the
+    /// provider's own business. What a provider runs on their own hardware
+    /// beside the marketplace's workloads is theirs, and a marketplace that
+    /// collects it by default has decided something on their behalf. Even
+    /// aggregated — four integers, no names, no identifiers — a guest count and
+    /// a memory total say things about an operation that its owner may not have
+    /// chosen to publish.
+    ///
+    /// So it is opt-in, per provider, and turning it on is *recorded by this
+    /// agent* in its own audit log — `host.usage.disclosed` — so the disclosure
+    /// has a trail on the provider's side rather than only on ours. The party
+    /// giving something up should be able to see that they did.
+    ///
+    /// Turn it on to diagnose a host that keeps refusing placements, and turn
+    /// it off afterwards. While it is on the agent says so, hourly, in the
+    /// audit stream that flows up with every report — which is meant to be
+    /// slightly annoying.
+    #[serde(default)]
+    pub showall: bool,
     /// Physical location of this hardware, for marketplace maps and for
     /// latency-aware placement later. Optional.
     pub city: Option<String>,

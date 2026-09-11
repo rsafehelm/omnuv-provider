@@ -4,6 +4,7 @@ mod config;
 mod gateway;
 mod instance;
 mod join;
+mod diagnostics;
 mod driver;
 mod proxmox;
 mod sdn;

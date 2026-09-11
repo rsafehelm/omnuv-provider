@@ -369,6 +369,7 @@ impl proxmox::Client {
                     local_id: None,
                     overlay_address: None,
                     adapters: Vec::new(),
+                    diagnostics: None,
                     message: Some(why),
                 });
             }
@@ -467,6 +468,9 @@ impl proxmox::Client {
                 local_id: Some(vm.vmid.to_string()),
                 overlay_address: addr,
                 adapters: self.observed_adapters(node, vm.vmid, reachable.as_deref()).await,
+                diagnostics: Some(
+                    self.diagnose(node, vm.vmid, reachable.is_some(), Some(reachable.is_some())).await,
+                ),
                 message: refreshed.then(|| "configuration refreshed; rebooting".to_string()),
             });
         }
@@ -480,6 +484,7 @@ impl proxmox::Client {
                 local_id: None,
                 overlay_address: None,
                 adapters: Vec::new(),
+                diagnostics: None,
                 message: Some("not present".into()),
             });
         }
@@ -572,6 +577,7 @@ impl proxmox::Client {
             local_id: Some(vmid.to_string()),
             overlay_address: None,
             adapters: Vec::new(),
+            diagnostics: None,
             message: Some(format!("gateway vm {vmid} created and started")),
         })
     }

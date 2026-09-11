@@ -144,6 +144,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         },
         cfg.proxmox.city.clone(),
         cfg.proxmox.apt_mirror.clone(),
+        cfg.proxmox.showall,
     )?);
     let core = Core::new(&cfg.core.url, &cfg.core.token)?;
 
@@ -417,6 +418,7 @@ async fn reconcile_workers(
                     local_id: None,
                     overlay_address: None,
                     adapters: Vec::new(),
+                    diagnostics: None,
                     message: Some("deleted".into()),
                 },
                 Err(e) => {
@@ -438,6 +440,7 @@ async fn reconcile_workers(
                         local_id: None,
                         overlay_address: None,
                         adapters: Vec::new(),
+                        diagnostics: None,
                         message: Some(e.to_string().chars().take(400).collect()),
                     }
                 })
@@ -478,6 +481,7 @@ async fn reconcile_workers(
                     local_id: None,
                     endpoint: None,
                     adapters: Vec::new(),
+                    diagnostics: None,
                     message: Some("deleted".into()),
                     telemetry: None,
                 }),
@@ -506,6 +510,7 @@ async fn reconcile_workers(
                 local_id: None,
                 endpoint: None,
                 adapters: Vec::new(),
+                diagnostics: None,
                 message: Some(e.to_string().chars().take(400).collect()),
                 telemetry: None,
             }
@@ -551,6 +556,7 @@ async fn reconcile_workers(
                 local_id: None,
                 private_ip: None,
                 adapters: Vec::new(),
+                diagnostics: None,
                 message: Some("deleted".into()),
                 recipe_progress: None,
             }),
@@ -580,6 +586,7 @@ async fn reconcile_workers(
                 local_id: None,
                 private_ip: None,
                 adapters: Vec::new(),
+                diagnostics: None,
                 message: Some(why.chars().take(400).collect()),
                 recipe_progress: None,
             }
