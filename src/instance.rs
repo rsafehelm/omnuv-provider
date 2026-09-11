@@ -222,7 +222,18 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
 
 /// cloud-init for a buyer VM. Only public keys go in; Omnuv never has a private
 /// key to inject even if it wanted to.
-fn cloud_init(spec: &InstanceSpec) -> String {
+fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>) -> String {
+    // Written before `packages:` so cloud-init rewrites sources.list first.
+    // Empty when the provider has not named one, which leaves the image's own
+    // default — correct for a provider who has not been asked yet, and slow
+    // where the default pool is slow.
+    let apt = match apt_mirror {
+        Some(m) if !m.trim().is_empty() => format!(
+            "apt:\n  primary:\n    - arches: [default]\n      uri: {}\n",
+            m.trim()
+        ),
+        _ => String::new(),
+    };
     // Two indent levels, because the same list appears at two depths. Getting
     // this wrong parses the keys as a sibling of the users list instead of the
     // user's keys, and cloud-init then silently creates an account nobody can
@@ -255,7 +266,7 @@ users:
 # Applies to the default user.
 ssh_authorized_keys:
 {top}
-{password}packages:
+{password}{apt}packages:
   - qemu-guest-agent
 {recipe_files}# The marketplace network is configured in bootcmd, which cloud-init runs in
 # the init stage on EVERY boot — before the config stage where apt runs, and
@@ -272,6 +283,7 @@ bootcmd:
 runcmd:
   - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
 {network_final}{recipe_final}"#,
+        apt = apt,
         name = spec.name,
         recipe_files = spec.recipe.as_ref().map(recipe_files).unwrap_or_default(),
         recipe_final = spec.recipe.as_ref().map(recipe_runcmd).unwrap_or_default(),
@@ -439,7 +451,7 @@ impl Client {
                         vm.vmid,
                         snippet_dir,
                         &format!("omnuv-instance-{}.yaml", spec.id),
-                        &cloud_init(spec),
+                        &cloud_init(spec, self.apt_mirror.as_deref()),
                     )
                     .await
             {
@@ -528,7 +540,7 @@ impl Client {
         // implemented; a Cloudbase-Init image is refused here with the reason
         // reported, never built wrong. Adding Windows is this one arm.
         let user_data = match spec.image.first_boot {
-            FirstBoot::CloudInit => cloud_init(spec),
+            FirstBoot::CloudInit => cloud_init(spec, self.apt_mirror.as_deref()),
             FirstBoot::CloudbaseInit => anyhow::bail!(
                 "image {}: Cloudbase-Init first boot is not implemented in this agent version",
                 spec.image.id
@@ -840,7 +852,7 @@ mod tests {
             gpu: true,
             post_up: vec!["apt-get install -y lightdm".into()],
         });
-        let ci = cloud_init(&spec);
+        let ci = cloud_init(&spec, None);
         assert!(!ci.contains("get.docker.com") || {
             // It rides encoded, so check the decoded steps rather than the YAML.
             let line = ci.lines().find(|l| l.contains("base64 -d")).unwrap();
@@ -879,7 +891,7 @@ mod tests {
             gpu: true,
             post_up: vec!["docker compose exec -T app true".into()],
         });
-        let ci = cloud_init(&spec);
+        let ci = cloud_init(&spec, None);
         let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid cloud-config");
         // The compose file rides as base64 so its YAML can never break ours.
         let files = parsed["write_files"].as_sequence().expect("write_files");
@@ -936,7 +948,7 @@ mod tests {
         assert!(script.contains("STEP=1/"), "each step names itself for the trap");
         // Without a GPU, no toolkit.
         spec.recipe.as_mut().unwrap().gpu = false;
-        assert!(!cloud_init(&spec).contains(&{
+        assert!(!cloud_init(&spec, None).contains(&{
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode("nvidia")[..6].to_string()
         }) || true);
@@ -988,12 +1000,25 @@ echo 'single' "double" `backtick` \$escaped
             gpu: true,
             post_up: vec![nasty.to_string()],
         });
-        let ci = cloud_init(&spec);
+        let ci = cloud_init(&spec, None);
         // None of it appears literally, so none of it can be parsed as YAML.
         assert!(!ci.contains("APPS"), "the script must ride encoded, not inline");
         assert!(!ci.contains("bigpicture"));
         let doc: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&ci).expect("cloud-init must still be valid YAML");
+        // The mirror block, when a provider named one, must not break the
+        // document it is spliced into.
+        let mirrored = cloud_init(&spec, Some("http://mirrors.up.pt/ubuntu"));
+        let m: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&mirrored).expect("a mirror must not break the YAML");
+        assert_eq!(
+            m["apt"]["primary"][0]["uri"].as_str(),
+            Some("http://mirrors.up.pt/ubuntu"),
+            "cloud-init must be told the mirror before the package stage runs"
+        );
+        // And an unset one leaves the image's own default alone rather than
+        // writing an empty key that cloud-init would read as a mirror of "".
+        assert!(doc.get("apt").is_none(), "no mirror configured, no apt block");
         assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
         // And it is recoverable: what boots is exactly what the catalog holds.
         // Two layers now — the recipe is one script under `set -e`, and each of
@@ -1017,7 +1042,7 @@ echo 'single' "double" `backtick` \$escaped
     /// in runcmd (first boot only, after a slow apt that may not have finished).
     #[test]
     fn marketplace_network_is_in_bootcmd_before_runcmd() {
-        let ci = cloud_init(&spec_with_network());
+        let ci = cloud_init(&spec_with_network(), None);
         let boot = ci.find("bootcmd:").expect("has bootcmd");
         let run = ci.find("runcmd:").expect("has runcmd");
         let addr = ci.find("10.200.99.10/32").expect("configures the /32");
@@ -1057,7 +1082,7 @@ echo 'single' "double" `backtick` \$escaped
     /// `contains()` check cannot see that; parsing as YAML can.
     #[test]
     fn cloud_init_is_valid_yaml() {
-        let ci = cloud_init(&spec_with_network());
+        let ci = cloud_init(&spec_with_network(), None);
         let doc: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&ci).expect("cloud-init must be valid YAML");
         let boot = doc.get("bootcmd").expect("has bootcmd");
@@ -1075,7 +1100,7 @@ echo 'single' "double" `backtick` \$escaped
     fn no_network_still_has_a_bootcmd_body() {
         let mut spec = spec_with_network();
         spec.network = None;
-        let ci = cloud_init(&spec);
+        let ci = cloud_init(&spec, None);
         let boot = ci.find("bootcmd:").expect("has bootcmd");
         let after = &ci[boot + "bootcmd:".len()..];
         // The first entry, past any comment lines.

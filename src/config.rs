@@ -177,6 +177,20 @@ pub struct ProxmoxRuntime {
     /// with `snippets` content, owned by the agent's user.
     #[serde(default = "default_snippet_dir")]
     pub snippet_dir: String,
+    /// The Debian/Ubuntu package mirror a machine built here should use.
+    ///
+    /// Unset means the image's own default, which is `archive.ubuntu.com` — a
+    /// global round-robin, and on 11 September it served this provider at
+    /// **32 KB/s** while a mirror 30 km away served 34 MB/s from the same host
+    /// in the same second. A 200 KB package took nine minutes, because
+    /// `apt-get update` drags several megabytes of indices through it first.
+    ///
+    /// Configured per provider rather than chosen by the marketplace: which
+    /// mirror is close is a fact about where this hardware sits, and a provider
+    /// knows it. Ubuntu's own geo-routing does not — `mirrors.ubuntu.com`
+    /// returns `archive.ubuntu.com` here.
+    #[serde(default)]
+    pub apt_mirror: Option<String>,
     /// Physical location of this hardware, for marketplace maps and for
     /// latency-aware placement later. Optional.
     pub city: Option<String>,

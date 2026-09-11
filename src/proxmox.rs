@@ -115,6 +115,9 @@ pub struct Client {
     contribute: Contribution,
     location: Option<omnuv_protocol::GeoLocation>,
     city: Option<String>,
+    /// The package mirror machines built here should use. See
+    /// `config::ProxmoxRuntime::apt_mirror`.
+    pub(crate) apt_mirror: Option<String>,
 }
 
 impl ComputeDriver for Client {
@@ -150,6 +153,7 @@ impl Client {
         contribute: Contribution,
         location: Option<omnuv_protocol::GeoLocation>,
         city: Option<String>,
+        apt_mirror: Option<String>,
     ) -> anyhow::Result<Self> {
         let tls = crate::tls::config(fingerprint)?;
         Ok(Self {
@@ -161,6 +165,7 @@ impl Client {
             contribute,
             location,
             city,
+            apt_mirror,
         })
     }
 
@@ -175,6 +180,9 @@ impl Client {
             target.node.clone(),
             target.contribute.clone(),
             None,
+            None,
+            // The debug `discover` command reads inventory and builds nothing,
+            // so it has no cloud-init to write and no mirror to name.
             None,
         )
     }

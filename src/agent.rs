@@ -143,6 +143,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             _ => None,
         },
         cfg.proxmox.city.clone(),
+        cfg.proxmox.apt_mirror.clone(),
     )?);
     let core = Core::new(&cfg.core.url, &cfg.core.token)?;
 
