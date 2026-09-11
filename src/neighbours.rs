@@ -31,9 +31,14 @@ use std::collections::HashMap;
 /// opposite of an observation and must never be read as one.
 const ATF_COM: u32 = 0x2;
 
-/// Address and bridge, keyed by the MAC the host resolved them to.
+/// Every address the host has resolved, grouped by MAC.
+///
+/// One MAC, many addresses — which is not a corner case. VM 105 on Pluto had
+/// two entries for one NIC within a minute of this shipping: a live lease and a
+/// dead one the kernel had not yet aged out. Keying this one-to-one picked
+/// whichever arrived last and called a silent address "observed".
 #[derive(Debug, Default, Clone)]
-pub(crate) struct Neighbours(HashMap<String, (String, String)>);
+pub(crate) struct Neighbours(HashMap<String, Vec<String>>);
 
 impl Neighbours {
     /// Read the host's table. A host that cannot be read yields an empty table,
@@ -56,13 +61,14 @@ impl Neighbours {
             if flags & ATF_COM == 0 {
                 continue;
             }
-            out.insert(normalise(mac), (ip.to_string(), device.to_string()));
+            let _ = device;
+            out.entry(normalise(mac)).or_insert_with(Vec::new).push(ip.to_string());
         }
         Self(out)
     }
 
-    pub(crate) fn get(&self, mac: &str) -> Option<&(String, String)> {
-        self.0.get(&normalise(mac))
+    pub(crate) fn get(&self, mac: &str) -> &[String] {
+        self.0.get(&normalise(mac)).map(Vec::as_slice).unwrap_or_default()
     }
 }
 
@@ -90,18 +96,51 @@ pub(crate) fn adapters(
         }
         let Some(raw) = value.as_str() else { continue };
         let Some(mac) = mac_of(raw) else { continue };
-        let hit = seen.get(&mac);
+        let resolved = seen.get(&mac);
+
+        // Only one adapter can claim the believed address: the guest agent
+        // reports the machine's primary, and attaching it to every NIC would
+        // invent addresses.
+        let mine = believed.filter(|_| out.is_empty());
+
+        // **An observation corroborates a belief; it never silently replaces
+        // it.** The host's table holds entries the kernel has not aged out, so
+        // an address in it may be a dead lease — Pluto held one for a minute
+        // after this shipped, and substituting it would have replaced a working
+        // address with a silent one and stamped it `observed`.
+        //
+        // So: if the host has seen the address we believe, that is
+        // corroboration and the adapter is observed. If it has seen only
+        // *other* addresses, the belief stands unobserved and the others are
+        // reported as a note — a divergence for a person to read, never a
+        // substitution nobody was told about.
+        let corroborated = mine.is_some_and(|b| resolved.iter().any(|a| a == b));
+        let address = match (mine, resolved.first()) {
+            (Some(b), _) => Some(b.to_string()),
+            // No belief at all: the host's reading is the only thing we have,
+            // and reporting it unobserved is better than reporting nothing.
+            (None, Some(first)) => Some(first.clone()),
+            (None, None) => None,
+        };
+        let also: Vec<&String> =
+            resolved.iter().filter(|a| Some(a.as_str()) != address.as_deref()).collect();
+
         out.push(AdapterStatus {
-            name: key.clone(),
-            address: hit
-                .map(|(ip, _)| ip.clone())
-                // Only one adapter can claim the believed address, and the
-                // guest agent reports the machine's primary. Attaching it to
-                // every NIC would invent addresses.
-                .or_else(|| believed.filter(|_| out.is_empty()).map(str::to_string)),
+            address,
             mac: Some(mac),
-            observed_at_unix: hit.map(|_| now),
-            observed_by: hit.map(|_| "neighbour".to_string()),
+            observed_at_unix: corroborated.then_some(now),
+            observed_by: corroborated.then(|| "neighbour".to_string()),
+            name: if also.is_empty() {
+                key.clone()
+            } else {
+                // Carried on the name because the contract has nowhere else for
+                // it, and losing it would hide exactly the finding this whole
+                // module exists to produce.
+                format!(
+                    "{key} (host has also seen {})",
+                    also.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            },
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -122,102 +161,108 @@ mod tests {
     use super::*;
 
     const TABLE: &str = "IP address       HW type     Flags       HW address            Mask     Device
-192.168.100.103  0x1         0x2         bc:24:11:3a:4b:5c     *        vmbr0
-10.200.99.5      0x1         0x2         BC:24:11:00:00:01     *        omnuvbr1
+192.168.100.103  0x1         0x2         bc:24:11:bb:6a:89     *        vmbr0
+192.168.100.101  0x1         0x2         BC:24:11:BB:6A:89     *        vmbr0
+10.200.99.5      0x1         0x2         bc:24:11:00:00:01     *        omnuvbr1
 10.200.99.9      0x1         0x0         00:00:00:00:00:00     *        omnuvbr1
 ";
 
-    fn cfg(v: serde_json::Value) -> serde_json::Value {
-        v
+    fn net(n: &str, mac: &str) -> serde_json::Value {
+        serde_json::json!({ n: format!("virtio={mac},bridge=vmbr0") })
     }
 
     #[test]
     fn an_unanswered_arp_is_not_an_observation() {
-        let n = Neighbours::parse(TABLE);
-        // .9 is in the table, flagged incomplete: the kernel asked and nothing
-        // replied. That is the opposite of evidence.
-        assert!(n.get("00:00:00:00:00:00").is_none());
-        assert!(n.get("bc:24:11:3a:4b:5c").is_some());
+        // .9 is in the table flagged incomplete: the kernel asked and nothing
+        // replied, which is the opposite of evidence.
+        assert!(Neighbours::parse(TABLE).get("00:00:00:00:00:00").is_empty());
     }
 
     #[test]
     fn the_case_of_a_mac_does_not_decide_whether_we_saw_it() {
-        // Proxmox writes them upper, the kernel writes them lower.
         let n = Neighbours::parse(TABLE);
-        assert_eq!(n.get("BC:24:11:3A:4B:5C").map(|(ip, _)| ip.as_str()), Some("192.168.100.103"));
-        assert_eq!(n.get("bc:24:11:00:00:01").map(|(ip, _)| ip.as_str()), Some("10.200.99.5"));
+        assert_eq!(n.get("BC:24:11:00:00:01"), ["10.200.99.5"]);
     }
 
+    /// One NIC, two entries. Pluto's worker had exactly this within a minute of
+    /// the first version shipping: a live lease and one the kernel had not aged
+    /// out, and keying this one-to-one picked whichever landed last.
     #[test]
-    fn an_address_the_host_has_answered_is_observed() {
+    fn one_mac_can_hold_more_than_one_address() {
         let n = Neighbours::parse(TABLE);
+        assert_eq!(n.get("bc:24:11:bb:6a:89").len(), 2);
+    }
+
+    /// The whole point. The host seeing the address we already believe is
+    /// corroboration — and the strongest thing this module can say.
+    #[test]
+    fn seeing_the_believed_address_corroborates_it() {
         let a = adapters(
-            &cfg(serde_json::json!({ "net1": "virtio=BC:24:11:00:00:01,bridge=omnuvbr1" })),
-            &n,
-            None,
+            &net("net0", "BC:24:11:BB:6A:89"),
+            &Neighbours::parse(TABLE),
+            Some("192.168.100.103"),
             42,
         );
-        assert_eq!(a.len(), 1);
-        assert_eq!(a[0].address.as_deref(), Some("10.200.99.5"));
+        assert_eq!(a[0].address.as_deref(), Some("192.168.100.103"));
         assert_eq!(a[0].observed_at_unix, Some(42));
-        assert_eq!(a[0].observed_by.as_deref(), Some("neighbour"));
     }
 
-    /// The distinction the whole module exists for: an address we were told
-    /// about is reported, but never stamped as seen.
+    /// **An observation never silently replaces a belief.** A stale entry for a
+    /// dead lease is indistinguishable from a live one in `/proc/net/arp`, so
+    /// substituting would have swapped a working address for a silent one and
+    /// stamped it observed. The extra is reported instead, for a person.
+    #[test]
+    fn an_extra_address_is_reported_never_substituted() {
+        let a = adapters(
+            &net("net0", "BC:24:11:BB:6A:89"),
+            &Neighbours::parse(TABLE),
+            Some("192.168.100.103"),
+            42,
+        );
+        assert_eq!(a[0].address.as_deref(), Some("192.168.100.103"), "the belief stands");
+        assert!(a[0].name.contains("192.168.100.101"), "and the divergence is visible: {}", a[0].name);
+    }
+
+    /// A belief the host has not corroborated stays a belief.
     #[test]
     fn an_address_only_the_guest_claimed_is_reported_but_not_observed() {
-        let a = adapters(
-            &cfg(serde_json::json!({ "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0" })),
-            &Neighbours::default(),
-            Some("192.168.1.50"),
-            42,
-        );
+        let a = adapters(&net("net0", "AA:BB:CC:DD:EE:FF"), &Neighbours::default(), Some("192.168.1.50"), 42);
         assert_eq!(a[0].address.as_deref(), Some("192.168.1.50"));
         assert_eq!(a[0].observed_at_unix, None, "believing is not seeing");
     }
 
+    /// With nothing believed, the host's reading is all there is — and it is
+    /// still not stamped as corroborating anything.
+    #[test]
+    fn with_no_belief_the_host_reading_is_reported_unobserved() {
+        let a = adapters(&net("net1", "BC:24:11:00:00:01"), &Neighbours::parse(TABLE), None, 42);
+        assert_eq!(a[0].address.as_deref(), Some("10.200.99.5"));
+        assert_eq!(a[0].observed_at_unix, None);
+    }
+
     #[test]
     fn a_second_adapter_does_not_inherit_the_first_ones_address() {
-        let a = adapters(
-            &cfg(serde_json::json!({
-                "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
-                "net1": "virtio=11:22:33:44:55:66,bridge=omnuvbr1",
-            })),
-            &Neighbours::default(),
-            Some("192.168.1.50"),
-            42,
-        );
+        let cfg = serde_json::json!({
+            "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+            "net1": "virtio=11:22:33:44:55:66,bridge=omnuvbr1",
+        });
+        let a = adapters(&cfg, &Neighbours::default(), Some("192.168.1.50"), 42);
         assert_eq!(a.len(), 2);
-        assert_eq!(a[0].name, "net0");
         assert_eq!(a[1].address, None, "net1 has no address of its own to report");
     }
 
     #[test]
     fn nothing_but_network_keys_is_read_as_a_network() {
-        let a = adapters(
-            &cfg(serde_json::json!({
-                "netcfg": "not-an-adapter",
-                "name": "vm",
-                "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
-            })),
-            &Neighbours::default(),
-            None,
-            1,
-        );
-        assert_eq!(a.len(), 1);
-        assert_eq!(a[0].name, "net0");
+        let cfg = serde_json::json!({
+            "netcfg": "not-an-adapter",
+            "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+        });
+        assert_eq!(adapters(&cfg, &Neighbours::default(), None, 1).len(), 1);
     }
 
     #[test]
     fn an_unreadable_host_observes_nothing_rather_than_everything() {
-        let n = Neighbours::parse("");
-        let a = adapters(
-            &cfg(serde_json::json!({ "net0": "virtio=BC:24:11:00:00:01,bridge=omnuvbr1" })),
-            &n,
-            None,
-            1,
-        );
+        let a = adapters(&net("net0", "BC:24:11:00:00:01"), &Neighbours::parse(""), None, 1);
         assert_eq!(a[0].observed_at_unix, None);
     }
 }
