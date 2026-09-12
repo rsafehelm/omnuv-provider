@@ -383,6 +383,68 @@ impl Client {
         Ok(res.json::<Envelope<T>>().await?.data)
     }
 
+    /// What this provider can actually do, asked of Proxmox each time.
+    ///
+    /// Each answer has a source, and anything that cannot be confirmed is
+    /// reported `false` — an unconfirmable capability is one the marketplace
+    /// should not place work against, and claiming it would be worse than
+    /// denying it.
+    async fn capabilities(&self, offered_gpus: usize, nodes: &[NodeInventory]) -> ComputeCapabilities {
+        // **A card is passable when a resource mapping exists for it.**
+        // Discovering a display controller is not the same as the host being
+        // configured for passthrough, and `hostpci` is refused to any user but
+        // root@pam — a mapping is precisely what lets the agent's restricted
+        // token attach a specific device, so its existence *is* the capability.
+        // Bootstrap validates IOMMU/VFIO and creates one per offered card.
+        let mapped: usize = match self
+            .get_json::<Vec<serde_json::Value>>("/cluster/mapping/pci")
+            .await
+        {
+            Ok(maps) => nodes
+                .iter()
+                .flat_map(|n| n.gpus.iter())
+                .filter(|g| {
+                    let want = crate::names::gpu_mapping(&g.local_id);
+                    maps.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some(&want))
+                })
+                .count(),
+            Err(_) => 0,
+        };
+        let gpu_passthrough = offered_gpus > 0 && mapped == offered_gpus;
+
+        // A project network is an SDN vnet in the marketplace's own zone, so
+        // the zone existing is what makes private networking possible here.
+        let private_network = self
+            .get_json::<Vec<serde_json::Value>>("/cluster/sdn/zones")
+            .await
+            .is_ok_and(|zones| {
+                zones.iter().any(|z| {
+                    z.get("zone").and_then(|v| v.as_str()) == Some(crate::names::SDN_ZONE)
+                })
+            });
+
+        ComputeCapabilities {
+            // The driver creates QEMU machines with a cloud-init drive on
+            // Proxmox storage. These are properties of the driver, not of the
+            // host, and a Proxmox that could not do them would not answer at
+            // all — which is why they are the only three stated outright.
+            vm: true,
+            cloud_init: true,
+            persistent_disk: true,
+            gpu_passthrough,
+            private_network,
+            // An inference worker is a marketplace-owned machine with a card
+            // passed through to it. Without a passable card the provider can
+            // host the VM and not the work, so this follows the cards rather
+            // than the driver's ability to write the spec.
+            inference_worker: gpu_passthrough,
+            // No storage driver yet: `portable-ssd` needs Ceph RBD, and
+            // claiming portability the runtime cannot deliver would strand a
+            // buyer's volume on a provider that cannot detach it.
+            portable_volume_attach: false,
+        }
+    }
+
     /// Every PCI address referenced by any VM config on the node, running or
     /// stopped. A stopped VM still owns its passthrough device: selling it would
     /// break the guest the moment its owner starts it again.
@@ -579,25 +641,24 @@ impl Client {
             None => Vec::new(),
         };
 
+        // **Capabilities are asked of the runtime, not asserted.** All four of
+        // the interesting ones were hardcoded `false` until 12 September and
+        // nothing ever set them true — so Pluto was on record saying it could
+        // not do GPU passthrough while contributing two RTX 3090s, and both
+        // providers denied private networking and inference workers while
+        // doing both. Nothing read the column, which is the only reason it
+        // never broke: stored, plausible and unchecked is the shape a lie
+        // takes before somebody trusts it.
+        let offered_gpus: usize = nodes.iter().map(|n| n.gpus.len()).sum();
+        let capabilities = self.capabilities(offered_gpus, &nodes).await;
+
         Ok(InventoryReport {
             held_images,
             protocol_version: omnuv_protocol::PROTOCOL_VERSION,
             runtime: RuntimeKind::Proxmox,
             // Filled in by the agent from its own image map before reporting.
             images: Vec::new(),
-            capabilities: ComputeCapabilities {
-                vm: true,
-                cloud_init: true,
-                persistent_disk: true,
-                // Discovering a display controller is not the same as the host
-                // being configured for passthrough. IOMMU/VFIO is validated
-                // during provider bootstrap; until then this stays false even
-                // when GPUs are offered.
-                gpu_passthrough: false,
-                private_network: false,
-                inference_worker: false,
-                portable_volume_attach: false,
-            },
+            capabilities,
             nodes,
             location: self.location,
             city: self.city.clone(),

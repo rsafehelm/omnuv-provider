@@ -200,6 +200,32 @@ pub async fn import(
     vmid: u32,
     sha256: &str,
 ) -> anyhow::Result<()> {
+    // **Everything that can be checked is checked before anything is
+    // destroyed.** The window below cannot be closed — the vmid *is* the
+    // image's identity here, so the replacement cannot be built beside the
+    // original and swapped — but it can be made very unlikely to be entered
+    // for a reason that was knowable in advance.
+    //
+    // On 12 September it was entered for exactly such a reason: the pool the
+    // create names did not exist, so Titan's template was destroyed and
+    // nothing replaced it. Proxmox reports that as "Permission check failed",
+    // which is not a sentence anyone connects to a missing pool.
+    anyhow::ensure!(
+        px.get_json::<serde_json::Value>(&format!("/pools/{}", crate::names::POOL))
+            .await
+            .is_ok(),
+        "pool '{}' does not exist on {node}; not destroying the existing template \
+         for an import that would fail",
+        crate::names::POOL
+    );
+    anyhow::ensure!(
+        px.get_json::<serde_json::Value>(&format!("/nodes/{node}/storage/{storage}/status"))
+            .await
+            .is_ok(),
+        "storage '{storage}' does not answer on {node}; not destroying the existing \
+         template for an import that would fail"
+    );
+
     // Retire whatever is there. Only ever a template: `held` refuses to look
     // at anything else, and this refuses to remove anything else.
     //
