@@ -289,7 +289,7 @@ impl Client {
                 waiting_on: None,
                 local_id: Some(vm.vmid.to_string()),
                 endpoint: serving.then(|| endpoint.clone()).flatten(),
-                adapters: self.observed_adapters(node, vm.vmid, None).await,
+                adapters: self.observed_adapters(node, vm.vmid, None, None).await,
                 diagnostics: Some(
                     self.diagnose(node, vm.vmid, serving, Some(endpoint.is_some())).await,
                 ),
@@ -476,12 +476,13 @@ impl Client {
         node: &str,
         vmid: u32,
         believed: Option<&str>,
+        believed_mac: Option<&str>,
     ) -> Vec<omnuv_protocol::AdapterStatus> {
         let Ok(cfg) = self.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config")).await
         else {
             return Vec::new();
         };
-        crate::neighbours::adapters(&cfg, &crate::neighbours::Neighbours::read(), believed, now_unix())
+        crate::neighbours::adapters(&cfg, &crate::neighbours::Neighbours::read(), believed, believed_mac, now_unix())
     }
 
     /// Everything the hypervisor will say about a marketplace machine.

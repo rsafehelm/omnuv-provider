@@ -711,7 +711,14 @@ impl Client {
                 // shows the marketplace address rather than whichever NIC the
                 // host happened to resolve first.
                 private_ip: private_ip.clone(),
-                adapters: self.observed_adapters(node, vm.vmid, private_ip.as_deref()).await,
+                adapters: self
+                    .observed_adapters(
+                        node,
+                        vm.vmid,
+                        private_ip.as_deref(),
+                        spec.network.as_ref().map(|n| n.mac.as_str()),
+                    )
+                    .await,
                 diagnostics: Some(
                     self.diagnose(node, vm.vmid, running && guest_ip.is_some(), Some(guest_ip.is_some()))
                         .await,

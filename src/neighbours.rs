@@ -78,14 +78,23 @@ fn normalise(mac: &str) -> String {
 
 /// Every `netN` on a machine, with the address the host has seen behind it.
 ///
-/// `believed` is what the guest agent said, if anything. It is kept as a
-/// fallback so an adapter still reports an address on a host whose neighbour
-/// table has aged the entry out — but only the neighbour table sets
-/// `observed_at_unix`, because only the neighbour table is evidence.
+/// `believed` is the marketplace address Core issued, if the machine has one,
+/// and `believed_mac` is the NIC that holds it. It is kept as a fallback so an
+/// adapter still reports an address on a host whose neighbour table has aged
+/// the entry out — but only the neighbour table sets `observed_at_unix`,
+/// because only the neighbour table is evidence.
+///
+/// **The MAC is what decides which adapter claims it.** It used to be "the
+/// first one", which put the machine's *marketplace* address on its *egress*
+/// NIC and left the segment NIC blank — precisely backwards, and it read as
+/// authoritative because the field is the same either way. Core derives both
+/// MACs from the machine id and sends the segment one in the attachment, so
+/// there is no guessing left to do.
 pub(crate) fn adapters(
     config: &serde_json::Value,
     seen: &Neighbours,
     believed: Option<&str>,
+    believed_mac: Option<&str>,
     now: u64,
 ) -> Vec<AdapterStatus> {
     let Some(map) = config.as_object() else { return Vec::new() };
@@ -98,10 +107,12 @@ pub(crate) fn adapters(
         let Some(mac) = mac_of(raw) else { continue };
         let resolved = seen.get(&mac);
 
-        // Only one adapter can claim the believed address: the guest agent
-        // reports the machine's primary, and attaching it to every NIC would
-        // invent addresses.
-        let mine = believed.filter(|_| out.is_empty());
+        // Only the adapter that actually holds it. Attaching it to every NIC
+        // would invent addresses; attaching it to the first would put the
+        // marketplace address on the egress NIC.
+        let mine = believed.filter(|_| {
+            believed_mac.map(normalise).map(|want| want == mac).unwrap_or(false)
+        });
 
         // **An observation corroborates a belief; it never silently replaces
         // it.** The host's table holds entries the kernel has not aged out, so
@@ -130,17 +141,12 @@ pub(crate) fn adapters(
             mac: Some(mac),
             observed_at_unix: corroborated.then_some(now),
             observed_by: corroborated.then(|| "neighbour".to_string()),
-            name: if also.is_empty() {
-                key.clone()
-            } else {
-                // Carried on the name because the contract has nowhere else for
-                // it, and losing it would hide exactly the finding this whole
-                // module exists to produce.
-                format!(
-                    "{key} (host has also seen {})",
-                    also.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ")
-                )
-            },
+            // **The name is a name.** This used to carry the note as a suffix,
+            // and Core keys one observation per `(provider, machine, adapter)`
+            // — so every distinct note minted a row nothing could ever sweep.
+            // `also_seen` is where it goes now (protocol 4, additive).
+            name: key.clone(),
+            also_seen: also.iter().map(|a| (*a).clone()).collect(),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -201,6 +207,7 @@ mod tests {
             &net("net0", "BC:24:11:BB:6A:89"),
             &Neighbours::parse(TABLE),
             Some("192.168.100.103"),
+            Some("BC:24:11:BB:6A:89"),
             42,
         );
         assert_eq!(a[0].address.as_deref(), Some("192.168.100.103"));
@@ -217,16 +224,31 @@ mod tests {
             &net("net0", "BC:24:11:BB:6A:89"),
             &Neighbours::parse(TABLE),
             Some("192.168.100.103"),
+            Some("BC:24:11:BB:6A:89"),
             42,
         );
         assert_eq!(a[0].address.as_deref(), Some("192.168.100.103"), "the belief stands");
-        assert!(a[0].name.contains("192.168.100.101"), "and the divergence is visible: {}", a[0].name);
+        // **In its own field, not appended to the name.** The name is the key
+        // Core stores an observation under, so a note in it mints a row per
+        // note that nothing can ever sweep.
+        assert_eq!(a[0].name, "net0", "the name is a name");
+        assert!(
+            a[0].also_seen.contains(&"192.168.100.101".to_string()),
+            "and the divergence is visible: {:?}",
+            a[0].also_seen
+        );
     }
 
     /// A belief the host has not corroborated stays a belief.
     #[test]
     fn an_address_only_the_guest_claimed_is_reported_but_not_observed() {
-        let a = adapters(&net("net0", "AA:BB:CC:DD:EE:FF"), &Neighbours::default(), Some("192.168.1.50"), 42);
+        let a = adapters(
+            &net("net0", "AA:BB:CC:DD:EE:FF"),
+            &Neighbours::default(),
+            Some("192.168.1.50"),
+            Some("AA:BB:CC:DD:EE:FF"),
+            42,
+        );
         assert_eq!(a[0].address.as_deref(), Some("192.168.1.50"));
         assert_eq!(a[0].observed_at_unix, None, "believing is not seeing");
     }
@@ -235,7 +257,7 @@ mod tests {
     /// still not stamped as corroborating anything.
     #[test]
     fn with_no_belief_the_host_reading_is_reported_unobserved() {
-        let a = adapters(&net("net1", "BC:24:11:00:00:01"), &Neighbours::parse(TABLE), None, 42);
+        let a = adapters(&net("net1", "BC:24:11:00:00:01"), &Neighbours::parse(TABLE), None, None, 42);
         assert_eq!(a[0].address.as_deref(), Some("10.200.99.5"));
         assert_eq!(a[0].observed_at_unix, None);
     }
@@ -246,9 +268,38 @@ mod tests {
             "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
             "net1": "virtio=11:22:33:44:55:66,bridge=omnuvbr1",
         });
-        let a = adapters(&cfg, &Neighbours::default(), Some("192.168.1.50"), 42);
+        let a = adapters(&cfg, &Neighbours::default(), Some("192.168.1.50"), Some("AA:BB:CC:DD:EE:FF"), 42);
         assert_eq!(a.len(), 2);
         assert_eq!(a[1].address, None, "net1 has no address of its own to report");
+    }
+
+    /// **The believed address goes on the adapter that holds it**, which is
+    /// decided by MAC and not by position. It used to go to the first NIC —
+    /// putting a machine's *marketplace* address on its *egress* interface and
+    /// leaving the segment blank, exactly backwards, and authoritative-looking
+    /// because the field is the same either way.
+    #[test]
+    fn the_believed_address_lands_on_the_nic_that_holds_it() {
+        let cfg = serde_json::json!({
+            "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=onat0",
+            "net1": "virtio=11:22:33:44:55:66,bridge=onvfc5ca",
+        });
+        // The marketplace address belongs to net1, and Core says so by sending
+        // that NIC's MAC in the attachment.
+        let a = adapters(&cfg, &Neighbours::default(), Some("10.200.0.10"), Some("11:22:33:44:55:66"), 42);
+        assert_eq!(a[0].name, "net0");
+        assert_eq!(a[0].address, None, "the egress NIC does not hold the marketplace address");
+        assert_eq!(a[1].name, "net1");
+        assert_eq!(a[1].address.as_deref(), Some("10.200.0.10"));
+    }
+
+    /// A MAC that matches nothing claims nothing, rather than falling back to
+    /// the first adapter — which is how the bug above would come back.
+    #[test]
+    fn an_unmatched_mac_claims_nothing() {
+        let cfg = serde_json::json!({ "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=onat0" });
+        let a = adapters(&cfg, &Neighbours::default(), Some("10.200.0.10"), Some("99:99:99:99:99:99"), 42);
+        assert_eq!(a[0].address, None);
     }
 
     #[test]
@@ -257,12 +308,12 @@ mod tests {
             "netcfg": "not-an-adapter",
             "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
         });
-        assert_eq!(adapters(&cfg, &Neighbours::default(), None, 1).len(), 1);
+        assert_eq!(adapters(&cfg, &Neighbours::default(), None, None, 1).len(), 1);
     }
 
     #[test]
     fn an_unreadable_host_observes_nothing_rather_than_everything() {
-        let a = adapters(&net("net0", "BC:24:11:00:00:01"), &Neighbours::parse(""), None, 1);
+        let a = adapters(&net("net0", "BC:24:11:00:00:01"), &Neighbours::parse(""), None, None, 1);
         assert_eq!(a[0].observed_at_unix, None);
     }
 }
