@@ -202,6 +202,19 @@ pub async fn import(
 ) -> anyhow::Result<()> {
     // Retire whatever is there. Only ever a template: `held` refuses to look
     // at anything else, and this refuses to remove anything else.
+    //
+    // **This destroys before it can prove the replacement will build**, and on
+    // 12 September that cost Titan its `ubuntu-26.04` template: the old one was
+    // destroyed, the create failed on a misnamed pool, and the provider was
+    // left holding nothing. There is no way around the window — the vmid is
+    // the image's identity here, so the replacement cannot be built beside the
+    // original and swapped.
+    //
+    // What makes it survivable is the reconciler, not cleverness: `held` reads
+    // the templates rather than remembering them, so the provider immediately
+    // and correctly reports that it no longer has the image, and the next pass
+    // two minutes later tries again. A provider mid-mirror is a provider with
+    // one fewer image, which is a state the marketplace already models.
     if let Ok(cfg) =
         px.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config")).await
     {
