@@ -11,7 +11,7 @@ use crate::proxmox::Client;
 
 /// Marks VMs this agent owns. Recovery and deletion key off this, so nothing
 /// the marketplace did not create is ever touched.
-pub const TAG: &str = "omnuv-worker";
+pub const TAG: &str = crate::names::TAG_WORKER;
 
 /// Typed empty form body for endpoints that take no parameters.
 const NO_FORM: &[(String, String)] = &[];
@@ -74,9 +74,9 @@ packages:
 # disk, and the model cache on it, survive. Rebuilding the VM to change a flag
 # costs a ~16 GB re-download.
 bootcmd:
-  - [ bash, -c, "mkdir -p /etc/omnuv" ]
-  - [ bash, -c, "echo {args_b64} | base64 -d > /etc/omnuv/vllm.args" ]
-  - [ bash, -c, "echo {image_b64} | base64 -d > /etc/omnuv/vllm.image" ]
+  - [ bash, -c, "mkdir -p /etc/onv" ]
+  - [ bash, -c, "echo {args_b64} | base64 -d > /etc/onv/vllm.args" ]
+  - [ bash, -c, "echo {image_b64} | base64 -d > /etc/onv/vllm.image" ]
 write_files:
   - path: /usr/local/bin/omnuv-serve
     permissions: '0755'
@@ -86,18 +86,18 @@ write_files:
       # rather than word-splitting a string keeps arguments with spaces or
       # punctuation intact.
       set -euo pipefail
-      mapfile -t ARGS < /etc/omnuv/vllm.args
-      IMAGE=$(cat /etc/omnuv/vllm.image)
-      exec /usr/bin/docker run --rm --name omnuv-vllm \
+      mapfile -t ARGS < /etc/onv/vllm.args
+      IMAGE=$(cat /etc/onv/vllm.image)
+      exec /usr/bin/docker run --rm --name onv-vllm \
         --gpus all --ipc=host -p {port}:8000 \
-        -v /opt/omnuv/hf:/root/.cache/huggingface \
+        -v /opt/onv/hf:/root/.cache/huggingface \
         "$IMAGE" "${{ARGS[@]}}"
-  - path: /etc/systemd/system/omnuv-workloadd.service
+  - path: /etc/systemd/system/onv-workloadd.service
     permissions: '0644'
     content: |
       [Unit]
       Description=Omnuv Workload Agent
-      # Deliberately not After=omnuv-vllm: the minutes before vLLM serves are
+      # Deliberately not After=onv-vllm: the minutes before vLLM serves are
       # exactly the window this exists to describe.
 
       [Service]
@@ -106,11 +106,11 @@ write_files:
       # reboot rather than only at first boot. cloud-init's runcmd runs once per
       # *instance*, so a machine built before this existed would never acquire
       # it — and "rebuild every worker" is not a convergence story.
-      ExecStartPre=/bin/sh -c 'test -x /usr/local/bin/omnuv-workloadd || (curl -fsSL -o /usr/local/bin/omnuv-workloadd.new {core_url}/downloads/omnuv-workloadd && chmod 0755 /usr/local/bin/omnuv-workloadd.new && mv /usr/local/bin/omnuv-workloadd.new /usr/local/bin/omnuv-workloadd)'
+      ExecStartPre=/bin/sh -c 'test -x /usr/local/bin/onv-workloadd || (curl -fsSL -o /usr/local/bin/onv-workloadd.new {core_url}/downloads/onv-workloadd && chmod 0755 /usr/local/bin/onv-workloadd.new && mv /usr/local/bin/onv-workloadd.new /usr/local/bin/onv-workloadd)'
       Environment=OMNUV_WORKLOAD_ID={worker_id}
       Environment=OMNUV_VLLM_URL=http://127.0.0.1:{port}
-      Environment=OMNUV_CACHE_DIR=/opt/omnuv/hf
-      ExecStart=/usr/local/bin/omnuv-workloadd
+      Environment=OMNUV_CACHE_DIR=/opt/onv/hf
+      ExecStart=/usr/local/bin/onv-workloadd
       Restart=always
       RestartSec=10s
       # It writes one file and opens no socket, so it is confined rather than
@@ -119,11 +119,11 @@ write_files:
       NoNewPrivileges=yes
       PrivateTmp=yes
       RuntimeDirectory=omnuv
-      ReadWritePaths=/run/omnuv
+      ReadWritePaths=/run/onv
 
       [Install]
       WantedBy=multi-user.target
-  - path: /etc/systemd/system/omnuv-vllm.service
+  - path: /etc/systemd/system/onv-vllm.service
     permissions: '0644'
     content: |
       [Unit]
@@ -138,23 +138,23 @@ write_files:
       # reliable. Restarting until the GPU appears is the whole design.
       Restart=always
       RestartSec=15s
-      ExecStartPre=-/usr/bin/docker rm -f omnuv-vllm
+      ExecStartPre=-/usr/bin/docker rm -f onv-vllm
       # Reads image and arguments from disk at start, so changing them is a
       # reboot rather than a rebuild that re-downloads the model.
       ExecStart=/usr/local/bin/omnuv-serve
-      ExecStop=/usr/bin/docker stop omnuv-vllm
+      ExecStop=/usr/bin/docker stop onv-vllm
 
       [Install]
       WantedBy=multi-user.target
 runcmd:
   - [ systemctl, enable, --now, qemu-guest-agent ]
-  - [ bash, -c, "mkdir -p /opt/omnuv/hf /etc/omnuv /run/omnuv" ]
+  - [ bash, -c, "mkdir -p /opt/onv/hf /etc/onv /run/onv" ]
   # The Workload Agent. Statically linked, so it does not care that this guest's
   # glibc is older than the one it was built against. Failure to fetch it is not
   # fatal: it reports, it does not serve, and a worker that cannot describe
   # itself is still a worker that answers requests.
-  - [ bash, -c, "curl -fsSL -o /usr/local/bin/omnuv-workloadd {core_url}/downloads/omnuv-workloadd && chmod 0755 /usr/local/bin/omnuv-workloadd || echo 'omnuv-workloadd unavailable; continuing without telemetry'" ]
-  - [ bash, -c, "command -v /usr/local/bin/omnuv-workloadd && systemctl enable --now omnuv-workloadd.service || true" ]
+  - [ bash, -c, "curl -fsSL -o /usr/local/bin/onv-workloadd {core_url}/downloads/onv-workloadd && chmod 0755 /usr/local/bin/onv-workloadd || echo 'onv-workloadd unavailable; continuing without telemetry'" ]
+  - [ bash, -c, "command -v /usr/local/bin/onv-workloadd && systemctl enable --now onv-workloadd.service || true" ]
   - [ bash, -c, "curl -fsSL https://get.docker.com | sh" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list" ]
@@ -167,7 +167,7 @@ runcmd:
   # metapackage for the newest available branch instead.
   - [ bash, -c, "apt-get update && DRV=$(apt-cache search --names-only '^nvidia-driver-[0-9]+-server$' | awk '{{print $1}}' | sort -V | tail -1) && echo \"installing $DRV\" && DEBIAN_FRONTEND=noninteractive apt-get install -y \"$DRV\"" ]
   - [ bash, -c, "command -v nvidia-smi || DEBIAN_FRONTEND=noninteractive apt-get install -y $(apt-cache search --names-only '^nvidia-utils-[0-9]+-server$' | awk '{{print $1}}' | sort -V | tail -1)" ]
-  - [ systemctl, enable, omnuv-vllm.service ]
+  - [ systemctl, enable, onv-vllm.service ]
   # The driver is not loadable until the machine restarts; the service comes up
   # by itself afterwards.
   - [ bash, -c, "systemctl reboot" ]
@@ -348,7 +348,7 @@ impl Client {
             ("machine".into(), "q35".into()),
             ("agent".into(), "enabled=1".into()),
             ("ipconfig0".into(), "ip=dhcp".into()),
-            ("cicustom".into(), format!("user=omnuv-snippets:snippets/{file}")),
+            ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
             ("description".into(), format!("Omnuv inference worker {}\nManaged by omnuv-provider. Do not edit.", spec.id)),
         ];
@@ -577,12 +577,12 @@ mod tests {
         // the whole point: changing a flag must be a reboot, not a rebuild that
         // re-downloads the model.
         assert!(ci.contains("bootcmd:"), "args must be written from bootcmd");
-        assert!(ci.contains("/etc/omnuv/vllm.args"));
-        assert!(ci.contains("/etc/omnuv/vllm.image"));
+        assert!(ci.contains("/etc/onv/vllm.args"));
+        assert!(ci.contains("/etc/onv/vllm.image"));
         // Read into an argv array, not word-split from a string: `$(cat file)`
         // performs no quote removal and bash would brace-expand a value like
         // {"image":0,"video":0} before docker saw it.
-        assert!(ci.contains("mapfile -t ARGS < /etc/omnuv/vllm.args"));
+        assert!(ci.contains("mapfile -t ARGS < /etc/onv/vllm.args"));
         assert!(ci.contains("\"${ARGS[@]}\""));
         assert!(ci.contains("ExecStart=/usr/local/bin/omnuv-serve"));
         // The arguments must be base64, never shell-quoted text in the unit.
@@ -650,10 +650,10 @@ mod workload_agent_tests {
     #[test]
     fn the_worker_is_built_with_a_workload_agent() {
         let ci = super::cloud_init(&spec(), "https://api.omnuv.com/");
-        assert!(ci.contains("omnuv-workloadd.service"));
+        assert!(ci.contains("onv-workloadd.service"));
         // Fetched from Core, which already serves /downloads over TLS. The
         // trailing slash must not survive into a doubled one.
-        assert!(ci.contains("https://api.omnuv.com/downloads/omnuv-workloadd"));
+        assert!(ci.contains("https://api.omnuv.com/downloads/onv-workloadd"));
         assert!(!ci.contains("omnuv.com//downloads"));
         // It is told which workload it is. Inventing an id would attribute
         // telemetry to a machine that does not exist.
@@ -666,7 +666,7 @@ mod workload_agent_tests {
     #[test]
     fn a_missing_workload_agent_does_not_stop_the_worker() {
         let ci = super::cloud_init(&spec(), "https://api.omnuv.com");
-        let fetch = ci.lines().find(|l| l.contains("omnuv-workloadd &&")).expect("fetch line");
+        let fetch = ci.lines().find(|l| l.contains("onv-workloadd &&")).expect("fetch line");
         assert!(fetch.contains("||"), "the download must not be able to fail the boot");
     }
 
@@ -676,14 +676,14 @@ mod workload_agent_tests {
     fn the_reporter_does_not_wait_for_the_thing_it_reports_on() {
         let ci = super::cloud_init(&spec(), "https://api.omnuv.com");
         let unit = ci
-            .split("omnuv-workloadd.service")
+            .split("onv-workloadd.service")
             .nth(1)
-            .and_then(|s| s.split("omnuv-vllm.service").next())
+            .and_then(|s| s.split("onv-vllm.service").next())
             .unwrap_or("");
         // A directive, not a substring: the unit's own comment says
-        // "Deliberately not After=omnuv-vllm", and a naive contains() finds it.
+        // "Deliberately not After=onv-vllm", and a naive contains() finds it.
         assert!(
-            !unit.lines().any(|l| l.trim_start().starts_with("After=omnuv-vllm")),
+            !unit.lines().any(|l| l.trim_start().starts_with("After=onv-vllm")),
             "the reporter must start before the thing it reports on"
         );
     }
@@ -765,8 +765,8 @@ mod workload_unit_tests {
             .lines()
             .find(|l| l.contains("ExecStartPre="))
             .expect("ExecStartPre");
-        assert!(pre.contains("test -x /usr/local/bin/omnuv-workloadd"), "{pre}");
-        assert!(pre.contains("/downloads/omnuv-workloadd"), "{pre}");
+        assert!(pre.contains("test -x /usr/local/bin/onv-workloadd"), "{pre}");
+        assert!(pre.contains("/downloads/onv-workloadd"), "{pre}");
         // Written aside and renamed: overwriting a running binary in place is
         // ETXTBSY, which turns a restart into a permanent failure loop.
         assert!(pre.contains(".new"), "must not overwrite in place: {pre}");
@@ -778,7 +778,7 @@ mod workload_unit_tests {
     fn the_reporter_is_confined() {
         let ci = ci();
         assert!(ci.contains("NoNewPrivileges=yes"));
-        assert!(ci.contains("ReadWritePaths=/run/omnuv"));
+        assert!(ci.contains("ReadWritePaths=/run/onv"));
         assert!(!ci.contains("DynamicUser=yes"), "cannot install its own binary");
     }
 }

@@ -1,10 +1,18 @@
 [package]
 name = "omnuv-provider"
-version = "0.3.10"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/rsafehelm/omnuv-provider"
 description = "Omnuv Provider Agent. Executes normalized marketplace intent on a provider runtime."
+
+# The crate keeps the repository's name; the binary takes the `onv` prefix every
+# resource on a provider carries. Identity and installed artefact are different
+# things: nothing is created on a provider called `omnuv-provider`, and
+# everything that is created has to be recognisable as ours at a glance.
+[[bin]]
+name = "onv-provider"
+path = "src/main.rs"
 
 [dependencies]
 omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.6.0" }

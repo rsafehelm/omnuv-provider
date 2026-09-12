@@ -1,3 +1,4 @@
+mod names;
 mod agent;
 mod audit;
 mod config;
@@ -22,7 +23,7 @@ omnuv-provider - Omnuv Provider Agent
 USAGE:
     omnuv-provider join  --core <url> --token <token> [options]
     omnuv-provider leave [--dry-run]
-    omnuv-provider agent [--config /etc/omnuv/agent.yaml]
+    omnuv-provider agent [--config /etc/onv/agent.yaml]
     omnuv-provider discover --provider <id> [--config <path>]
 
 JOIN OPTIONS:
@@ -98,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if command == "agent" {
-        let path = arg("--config").unwrap_or_else(|| "/etc/omnuv/agent.yaml".into());
+        let path = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
         let cfg = config::load_agent(&path)?;
         // Audit before anything else, so even a failed start is on the record.
         audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());

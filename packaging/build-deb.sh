@@ -25,7 +25,7 @@ OUT="$ROOT/dist"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 STAGE="$OUT/.deb"
 
-echo "omnuv-provider $VERSION ($ARCH)"
+echo "onv-provider $VERSION ($ARCH)"
 
 # A release build, statically enough linked for any current Debian or Ubuntu:
 # the agent speaks TLS through rustls rather than the system OpenSSL, so the
@@ -34,16 +34,16 @@ docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry 
     -w /w rust:1.98 cargo build --release --quiet
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/omnuv-provider"
+mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
 cp -r "$ROOT/packaging/deb/DEBIAN" "$STAGE/"
 cp -r "$ROOT/packaging/deb/lib" "$STAGE/"
-install -m 0755 "$ROOT/target/release/omnuv-provider" "$STAGE/usr/bin/omnuv-provider"
-install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/omnuv-provider/README.md"
-install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/omnuv-provider/copyright"
+install -m 0755 "$ROOT/target/release/onv-provider" "$STAGE/usr/bin/onv-provider"
+install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/onv-provider/README.md"
+install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/onv-provider/copyright"
 
 size=$(du -sk "$STAGE" | cut -f1)
 cat > "$STAGE/DEBIAN/control" <<CTL
-Package: omnuv-provider
+Package: onv-provider
 Version: $VERSION
 Section: admin
 Priority: optional
@@ -61,14 +61,14 @@ Description: Omnuv Provider Agent
  created locally at enrolment and never leave the machine. While Core is
  unreachable it maintains what is running and decides nothing.
  .
- Enrol a machine with: omnuv-provider join --token <token>
+ Enrol a machine with: onv-provider join --token <token>
 CTL
 
 docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -c "
     apt-get -qq update >/dev/null 2>&1
     DEBIAN_FRONTEND=noninteractive apt-get -qq install -y fakeroot >/dev/null 2>&1
-    fakeroot dpkg-deb --build .deb omnuv-provider_${VERSION}_${ARCH}.deb
+    fakeroot dpkg-deb --build .deb onv-provider_${VERSION}_${ARCH}.deb
     rm -rf /out/.deb
 " >/dev/null
 
-echo "  $(basename "$OUT")/omnuv-provider_${VERSION}_${ARCH}.deb"
+echo "  $(basename "$OUT")/onv-provider_${VERSION}_${ARCH}.deb"

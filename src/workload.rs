@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 /// Where the Workload Agent writes, and the Provider Agent reads. On `tmpfs`,
 /// so a reboot cannot leave yesterday's report behind looking current.
-pub const WORKLOAD_STATUS: &str = "/run/omnuv/workload.json";
+pub const WORKLOAD_STATUS: &str = "/run/onv/workload.json";
 
 /// Reads with no advance in `uptime_s` before the reporter is presumed dead.
 ///

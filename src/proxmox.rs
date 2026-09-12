@@ -701,9 +701,29 @@ mod host_commitment_tests {
 
     #[test]
     fn a_marketplace_guest_is_recognised_by_any_of_its_three_tags() {
-        assert!(is_marketplace(Some("omnuv-worker;w-abcd1234")));
-        assert!(is_marketplace(Some("omnuv-gateway;g-1")));
-        assert!(is_marketplace(Some("omnuv-instance;i-1")));
+        assert!(is_marketplace(Some("onv-worker;w-abcd1234")));
+        assert!(is_marketplace(Some("onv-gateway;g-1")));
+        assert!(is_marketplace(Some("onv-instance;i-1")));
+    }
+
+    /// **A rename is a migration.** A machine built before one still carries the
+    /// old tag, and an agent that stopped recognising it would walk past a
+    /// machine it owns — leaving a guest nothing reconciles and nothing reaps.
+    /// Two generations, because there have been two renames.
+    #[test]
+    fn a_guest_built_under_an_older_name_is_still_ours() {
+        for t in ["omnuv-worker;w-1", "omnuv-gateway;g-1", "omnuv-instance;i-1",
+                  "omnu-worker;w-1", "omnu-gateway;g-1", "omnu-instance;i-1"] {
+            assert!(is_marketplace(Some(t)), "{t} should still be recognised");
+        }
+    }
+
+    /// And a name that merely *starts* with one of ours is not ours. The reading
+    /// of "we do not know whose this is" stays "not ours".
+    #[test]
+    fn a_tag_that_only_looks_like_ours_is_not() {
+        assert!(!is_marketplace(Some("onv-ish;x")));
+        assert!(!is_marketplace(Some("omnuv-something-else")));
     }
 
     #[test]

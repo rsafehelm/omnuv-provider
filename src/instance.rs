@@ -12,12 +12,12 @@ use crate::proxmox::Client;
 
 /// Marks VMs this agent owns on behalf of buyers. Distinct from the inference
 /// worker tag so the two lifecycles can never be confused.
-pub const TAG: &str = "omnuv-instance";
+pub const TAG: &str = crate::names::TAG_INSTANCE;
 
 /// The Proxmox pool buyer machines are cloned into. Bootstrap grants
 /// `VM.Console` on this pool and nowhere else, so the agent can open the
 /// console of a machine the marketplace built — never a provider's own.
-pub(crate) const BUYER_POOL: &str = "omnuv-buyers";
+pub(crate) const BUYER_POOL: &str = crate::names::POOL_BUYERS;
 
 const NO_FORM: &[(String, String)] = &[];
 
@@ -79,11 +79,11 @@ pub(crate) fn short_tag(id: &str) -> String {
 }
 
 /// Where a recipe's compose file lives in the machine.
-const RECIPE_DIR: &str = "/opt/omnuv/recipe";
+const RECIPE_DIR: &str = "/opt/onv/recipe";
 
 /// Where a recipe records how its own install went. One file, one known path,
 /// read with `VM.GuestAgent.FileRead` and nothing wider — see `recipe_progress`.
-const RECIPE_STATUS: &str = "/etc/omnuv/recipe-status";
+const RECIPE_STATUS: &str = "/etc/onv/recipe-status";
 
 /// The recipe's compose file, written before any package runs. Base64: a
 /// compose file is YAML inside YAML, and escaping it would be a bug farm.
@@ -209,7 +209,7 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     // buyer's machine, which the marketplace must never be able to do.
     let script = format!(
         "set -e\n\
-         mkdir -p /etc/omnuv\n\
+         mkdir -p /etc/onv\n\
          STEP=starting\n\
          trap 'rc=$?; printf \"step=%s\\nrc=%s\\n\" \"$STEP\" \"$rc\" > {RECIPE_STATUS}' EXIT\n\
          {body}\
@@ -365,7 +365,7 @@ fn private_network(net: &NetworkAttachment) -> String {
     # applies it on first boot; on every later boot networkd binds the file
     # itself, and its name sorts before the image's catch-all and any netplan
     # file so it always wins the match.
-    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/32\nDNS={gateway}\nDomains=~internal\n\n[Route]\nDestination={gateway}/32\nScope=link\n\n[Route]\nDestination={cidr}\nGateway={gateway}\nGatewayOnLink=yes\n' > /etc/systemd/network/05-omnuv.network
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/32\nDNS={gateway}\nDomains=~internal\n\n[Route]\nDestination={gateway}/32\nScope=link\n\n[Route]\nDestination={cidr}\nGateway={gateway}\nGatewayOnLink=yes\n' > /etc/systemd/network/05-onv.network
 "#,
         address = net.address,
         gateway = net.gateway,
@@ -590,7 +590,7 @@ impl Client {
             // opens to watch it boot or rescue it, and what a Windows machine
             // uses for everything.
             ("vga".into(), "std".into()),
-            ("cicustom".into(), format!("user=omnuv-snippets:snippets/{file}")),
+            ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
             (
                 "description".into(),
@@ -787,14 +787,22 @@ impl Client {
 /// expensive.
 pub const LEGACY_TAG_PREFIX: &str = "omnu-";
 
-/// Whether a tag list belongs to a machine this agent built under the old name.
-/// `omnu-instance` yes; `omnuv-instance` no, because the new prefix starts with
-/// the old one.
+/// Whether a tag list belongs to a machine this agent built under an older
+/// name. **Two generations now**, `omnu-` and `omnuv-`, because there have been
+/// two renames — and the second is the reason this function is a list rather
+/// than a prefix test: `omnuv-` starts with `omnu-`, so a prefix check alone
+/// would have called every `omnuv-instance` legacy.
+///
+/// Exact names, not prefixes. A machine tagged `omnuv-something-else` is not
+/// one of ours under an old name; it is somebody else's machine that happens to
+/// start with a string we used to use, and *the safe reading of "we do not know
+/// whose this is" is "not ours"*.
 pub(crate) fn is_legacy_marketplace_tag(tags: &str) -> bool {
-    tags.split(&[';', ','][..]).map(str::trim).any(|t| {
-        t.starts_with(LEGACY_TAG_PREFIX)
-            && matches!(t, "omnu-instance" | "omnu-gateway" | "omnu-worker")
-    })
+    const LEGACY: &[&str] = &[
+        "omnuv-instance", "omnuv-gateway", "omnuv-worker",
+        "omnu-instance", "omnu-gateway", "omnu-worker",
+    ];
+    tags.split(&[';', ','][..]).map(str::trim).any(|t| LEGACY.contains(&t))
 }
 
 /// The whole of what maintenance is allowed to do, as one rule.
@@ -810,19 +818,46 @@ pub(crate) fn maintenance_may_touch(lifecycle: Lifecycle, exists: bool, running:
 
 #[cfg(test)]
 mod tests {
-    /// The rename guard has to tell the two prefixes apart, because one is a
-    /// prefix of the other and getting it wrong either blocks a healthy host
-    /// forever or lets the duplicate-machine accident through.
+    /// The rename guard has to recognise **every** generation, and getting it
+    /// wrong either blocks a healthy host forever or lets the duplicate-machine
+    /// accident through. Two now: `omnu-` and `omnuv-`.
+    ///
+    /// The prefixes nest — `omnuv-` starts with `omnu-`, and `onv-` starts with
+    /// neither — which is why this matches exact names rather than testing a
+    /// prefix. A prefix test called every current machine legacy the first time
+    /// and would do it again.
     #[test]
-    fn the_old_tags_are_recognised_and_the_new_ones_are_not() {
+    fn a_tag_from_any_older_generation_is_recognised() {
         use super::is_legacy_marketplace_tag;
+        // First generation.
         assert!(is_legacy_marketplace_tag("omnu-42472e172c55;omnu-instance"));
         assert!(is_legacy_marketplace_tag("gw-bfd571c2;omnu-gateway"));
         assert!(is_legacy_marketplace_tag("omnu-worker"));
-        assert!(!is_legacy_marketplace_tag("omnuv-42472e172c55;omnuv-instance"));
-        assert!(!is_legacy_marketplace_tag("omnuv-gateway"));
+        // Second, legacy as of the rename to `onv`.
+        assert!(is_legacy_marketplace_tag("omnuv-42472e172c55;omnuv-instance"));
+        assert!(is_legacy_marketplace_tag("omnuv-gateway"));
+        assert!(is_legacy_marketplace_tag("omnuv-worker"));
+    }
+
+    /// The current name is not legacy, or the agent would refuse to reconcile
+    /// a host it had just built correctly.
+    #[test]
+    fn the_current_tags_are_not_legacy() {
+        use super::is_legacy_marketplace_tag;
+        assert!(!is_legacy_marketplace_tag("onv-instance"));
+        assert!(!is_legacy_marketplace_tag("onv-gateway;g-1"));
+        assert!(!is_legacy_marketplace_tag("onv-worker"));
+    }
+
+    /// And nothing that merely resembles one of ours counts. *The safe reading
+    /// of "we do not know whose this is" is "not ours".*
+    #[test]
+    fn a_name_that_only_resembles_ours_is_not_legacy() {
+        use super::is_legacy_marketplace_tag;
         assert!(!is_legacy_marketplace_tag(""));
         assert!(!is_legacy_marketplace_tag("someone-elses-vm"));
+        assert!(!is_legacy_marketplace_tag("omnuv-something-else"));
+        assert!(!is_legacy_marketplace_tag("omnu-backup"));
     }
 
     /// Maintenance restarts what crashed and does nothing else. Every other
@@ -907,7 +942,7 @@ mod tests {
         let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid cloud-config");
         // The compose file rides as base64 so its YAML can never break ours.
         let files = parsed["write_files"].as_sequence().expect("write_files");
-        assert_eq!(files[0]["path"].as_str(), Some("/opt/omnuv/recipe/compose.yaml"));
+        assert_eq!(files[0]["path"].as_str(), Some("/opt/onv/recipe/compose.yaml"));
         assert_eq!(files[0]["encoding"].as_str(), Some("b64"));
         // Docker, the container toolkit (GPU), compose up, then the recipe's
         // own steps — each as a base64 script, after the network is bound.
@@ -1077,7 +1112,7 @@ echo 'single' "double" `backtick` \$escaped
         // Our file must sort first, and the first-boot rebind (reload, then
         // reconfigure — D-Bus calls) must be in runcmd, never in bootcmd
         // where D-Bus is not up yet and they fail silently.
-        assert!(ci.contains("05-omnuv.network"));
+        assert!(ci.contains("05-onv.network"));
         let reload = ci.find("networkctl reload").expect("reloads");
         let reconf = ci.find("networkctl reconfigure $DEV").expect("reconfigures");
         assert!(run < reload && reload < reconf, "rebind lives in runcmd, reload before reconfigure");

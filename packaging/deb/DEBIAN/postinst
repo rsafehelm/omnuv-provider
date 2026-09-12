@@ -9,23 +9,23 @@ set -e
 
 case "$1" in
   configure)
-    if ! getent group omnuv >/dev/null; then
-        addgroup --system omnuv
+    if ! getent group onv >/dev/null; then
+        addgroup --system onv
     fi
-    if ! getent passwd omnuv >/dev/null; then
-        adduser --system --ingroup omnuv --no-create-home \
-                --home /var/lib/omnuv --shell /usr/sbin/nologin omnuv
+    if ! getent passwd onv >/dev/null; then
+        adduser --system --ingroup onv --no-create-home \
+                --home /var/lib/onv --shell /usr/sbin/nologin onv
     fi
 
     # Readable by the agent, writable only by root: it holds this provider's
     # own hypervisor credentials, which never leave this machine.
-    mkdir -p /etc/omnuv
-    chown root:omnuv /etc/omnuv
-    chmod 0750 /etc/omnuv
+    mkdir -p /etc/onv
+    chown root:onv /etc/onv
+    chmod 0750 /etc/onv
 
-    for d in /var/lib/omnuv /var/log/omnuv; do
+    for d in /var/lib/onv /var/log/onv; do
         mkdir -p "$d"
-        chown omnuv:omnuv "$d"
+        chown onv:onv "$d"
     done
 
     # Enabled, but not started: there is nothing to start until `join` has
@@ -33,13 +33,13 @@ case "$1" in
     # install teaches an operator to ignore it.
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
-        systemctl enable omnuv-provider.service >/dev/null 2>&1 || true
-        if [ -f /etc/omnuv/agent.yaml ]; then
-            systemctl restart omnuv-provider.service || true
+        systemctl enable onv-provider.service >/dev/null 2>&1 || true
+        if [ -f /etc/onv/agent.yaml ]; then
+            systemctl restart onv-provider.service || true
         else
-            echo "omnuv-provider installed. Enrol this machine with:"
+            echo "onv-provider installed. Enrol this machine with:"
             echo
-            echo "    sudo omnuv-provider join --token <your enrolment token>"
+            echo "    sudo onv-provider join --token <your enrolment token>"
             echo
         fi
     fi

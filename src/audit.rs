@@ -18,7 +18,7 @@ use serde::Serialize;
 
 /// Where the record is written. Also emitted to the journal via `tracing`, so
 /// `journalctl -u omnuv-provider` shows the same events.
-const DEFAULT_PATH: &str = "/var/log/omnuv/audit.log";
+const DEFAULT_PATH: &str = "/var/log/onv/audit.log";
 
 static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 

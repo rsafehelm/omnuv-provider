@@ -20,7 +20,7 @@
 use crate::proxmox::Client;
 
 /// The marketplace zone every segment lives in. Created at provider bootstrap.
-pub(crate) const ZONE: &str = "omnuv";
+pub(crate) const ZONE: &str = crate::names::SDN_ZONE;
 
 const NO_FORM: &[(String, String)] = &[];
 
@@ -29,13 +29,7 @@ const NO_FORM: &[(String, String)] = &[];
 /// hex digits of the network id. Stable, and the same for the gateway and
 /// every machine of the network here.
 pub(crate) fn vnet_for(network_id: &str) -> String {
-    let hex: String = network_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(7)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    format!("o{hex}")
+    crate::names::vnet(network_id)
 }
 
 impl Client {
@@ -102,7 +96,7 @@ mod tests {
     #[test]
     fn vnet_ids_fit_proxmox_and_are_stable() {
         let a = vnet_for("c4d90fd2-be3d-4225-a4a6-265138a76e49");
-        assert_eq!(a, "oc4d90fd");
+        assert_eq!(a, "onvc4d90");
         assert_eq!(a, vnet_for("c4d90fd2-be3d-4225-a4a6-265138a76e49"));
         assert_ne!(a, vnet_for("db885ae5-f466-4526-96bd-cfbe447d0fec"));
         for id in ["c4d90fd2-be3d-4225-a4a6-265138a76e49", "ABCDEF01-2", "x"] {

@@ -36,7 +36,7 @@ use crate::proxmox;
 /// An empty form body, for POSTs that carry no parameters.
 const NO_FORM: &[(String, String)] = &[];
 
-pub const TAG: &str = "omnuv-gateway";
+pub const TAG: &str = crate::names::TAG_GATEWAY;
 
 /// The gateway's root disk.
 ///
@@ -191,9 +191,9 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # Without forwarding the VM is not a gateway at all: buyer traffic arrives
     # from the overlay and would be dropped instead of forwarded onto the bridge.
     sysctl -w net.ipv4.ip_forward=1
-    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-omnuv.conf
+    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-onv.conf
     # Declarative copy so systemd-networkd owns the interface across reboots.
-    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={addr}\nIPForward=yes\n' > /etc/systemd/network/10-omnuv.network
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={addr}\nIPForward=yes\n' > /etc/systemd/network/10-onv.network
     systemctl enable systemd-networkd 2>/dev/null || true
     # Install the fence and put it on a timer. Here, in bootcmd, rather than in
     # write_files: that module runs on a machine's first boot only, so a
@@ -206,10 +206,10 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # reply path, because a buyer machine has no route back to an overlay
     # address. Applying them once is not enough; they have to be true
     # continuously. Every line is check-then-insert, so re-running is free.
-    echo {fence} | base64 -d > /usr/local/sbin/omnuv-gateway-fence
-    chmod 0755 /usr/local/sbin/omnuv-gateway-fence
-    printf '[Unit]\nDescription=Re-assert the Omnuv gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-fence\n' > /etc/systemd/system/omnuv-gateway-fence.service
-    printf '[Unit]\nDescription=Keep the Omnuv gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-fence.timer
+    echo {fence} | base64 -d > /usr/local/sbin/onv-gateway-fence
+    chmod 0755 /usr/local/sbin/onv-gateway-fence
+    printf '[Unit]\nDescription=Re-assert the Onv gateway forwarding rules\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/onv-gateway-fence\n' > /etc/systemd/system/onv-gateway-fence.service
+    printf '[Unit]\nDescription=Keep the Onv gateway forwarding rules true\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/onv-gateway-fence.timer
     # The gateway says, out loud and continuously, whether it can actually reach
     # anything — and *how*. `--detail` is what carries `Connection type: P2P`
     # or `Relayed` per peer, which is the difference between cross-provider
@@ -226,14 +226,14 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # report needs, and far short of the unrestricted exec that running a
     # command in here would require. /run is tmpfs, so a stale file cannot
     # outlive a reboot and pretend to be current.
-    printf '#!/bin/sh\nmkdir -p /run/omnuv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route; echo ---; netbird status --json ) > /run/omnuv/gateway-status.txt.new 2>&1\nmv /run/omnuv/gateway-status.txt.new /run/omnuv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
+    printf '#!/bin/sh\nmkdir -p /run/onv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route; echo ---; netbird status --json ) > /run/onv/gateway-status.txt.new 2>&1\nmv /run/onv/gateway-status.txt.new /run/onv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
     chmod 0755 /usr/local/sbin/omnuv-gateway-selfcheck
     printf '[Unit]\nDescription=Report what the Omnuv gateway can actually reach\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-selfcheck\n' > /etc/systemd/system/omnuv-gateway-selfcheck.service
-    printf '[Unit]\nDescription=Keep the Omnuv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-selfcheck.timer
+    printf '[Unit]\nDescription=Keep the Onv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-selfcheck.timer
     systemctl daemon-reload
-    systemctl enable --now --no-block omnuv-gateway-fence.timer 2>/dev/null || true
+    systemctl enable --now --no-block onv-gateway-fence.timer 2>/dev/null || true
     systemctl enable --now --no-block omnuv-gateway-selfcheck.timer 2>/dev/null || true
-    /usr/local/sbin/omnuv-gateway-fence || true
+    /usr/local/sbin/onv-gateway-fence || true
     /usr/local/sbin/omnuv-gateway-selfcheck || true
 "#,
             addr = addr,
@@ -268,7 +268,7 @@ fn cloud_init(spec: &GatewaySpec) -> String {
       listen-address={ip}
       no-resolv
       local=/internal/
-      hostsdir=/etc/omnuv/hosts.d
+      hostsdir=/etc/onv/hosts.d
   - path: {DNS_HOSTS_PATH}
     content: |
 {seed}"
@@ -279,12 +279,12 @@ fn cloud_init(spec: &GatewaySpec) -> String {
 
     format!(
         "#cloud-config
-# Omnuv marketplace overlay gateway. Managed by omnuv-provider; do not edit.
+# Onv marketplace overlay gateway. Managed by omnuv-provider; do not edit.
 #
 # This VM is one buyer network's overlay peer on this provider. The hypervisor
 # never runs the overlay client, because a WireGuard interface writing routes
 # there could take the host and every guest on it off the network.
-hostname: omnuv-gw-{short}
+hostname: onv-gw-{short}
 manage_etc_hosts: true
 users:
   - default
@@ -298,7 +298,7 @@ users:
   - qemu-guest-agent
   - dnsmasq
 write_files:
-  - path: /etc/omnuv/gateway.env
+  - path: /etc/onv/gateway.env
     permissions: '0600'
     content: |
       OMNUV_GATEWAY_ID={id}
@@ -312,7 +312,7 @@ bootcmd:
   # it is a deadlock that looks like a boot stuck at cloud-init-network.
   - [ sh, -c, \"systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true\" ]
 {routes}runcmd:
-  - [ mkdir, -p, /etc/omnuv ]
+  - [ mkdir, -p, /etc/onv ]
   # runcmd is the final stage, after packages: both are installed by then.
   - [ sh, -c, \"systemctl enable --now qemu-guest-agent || true\" ]
   - [ sh, -c, \"systemctl enable --now dnsmasq || true\" ]
@@ -322,7 +322,7 @@ bootcmd:
   # is time-bounded so it can never hang the boot.
   - [ sh, -c, \"command -v netbird >/dev/null || timeout 60 bash -c 'curl -fsSL https://pkgs.netbird.io/install.sh | sh' || true\" ]
   - [ sh, -c, \"systemctl enable --now netbird || true\" ]
-  - [ sh, -c, \"netbird up --management-url {mgmt} --setup-key {key} --hostname omnuv-gw-{short}\" ]",
+  - [ sh, -c, \"netbird up --management-url {mgmt} --setup-key {key} --hostname onv-gw-{short}\" ]",
         keys = if keys.is_empty() { "      []\n".to_string() } else { keys },
         id = spec.id,
         mgmt = spec.management_url,
@@ -411,7 +411,7 @@ impl proxmox::Client {
             let mut refreshed = false;
             if running && spec.lifecycle == Lifecycle::Running {
                 match self
-                    .sync_cloud_init(node, vm.vmid, snippet_dir, &format!("omnuv-gw-{tag}.yaml"), &cloud_init(spec))
+                    .sync_cloud_init(node, vm.vmid, snippet_dir, &format!("onv-gw-{tag}.yaml"), &cloud_init(spec))
                     .await
                 {
                     Ok(true) => {
@@ -494,7 +494,7 @@ impl proxmox::Client {
         let bridge = crate::sdn::vnet_for(&spec.network_id);
         self.ensure_vnet(node, &bridge).await?;
 
-        let file = format!("omnuv-gw-{tag}.yaml");
+        let file = format!("onv-gw-{tag}.yaml");
         std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec))
             .map_err(|e| anyhow::anyhow!("writing the gateway's cloud-init: {e}"))?;
 
@@ -504,7 +504,7 @@ impl proxmox::Client {
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
                 &[
                     ("newid".to_string(), vmid.to_string()),
-                    ("name".to_string(), format!("omnuv-gw-{tag}")),
+                    ("name".to_string(), format!("onv-gw-{tag}")),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // Into the pool that carries the file-write grant; a
@@ -540,7 +540,7 @@ impl proxmox::Client {
                     "net1".to_string(),
                     format!("virtio={},bridge={bridge}", crate::instance::marketplace_mac(&spec.id)),
                 ),
-                ("cicustom".to_string(), format!("user=omnuv-snippets:snippets/{file}")),
+                ("cicustom".to_string(), format!("user=onv-snippets:snippets/{file}")),
                 ("tags".to_string(), format!("{TAG};{tag}")),
                 // The gateway must come back with the host, or a reboot leaves
                 // the provider silently off the overlay.
@@ -633,11 +633,11 @@ impl proxmox::Client {
 /// `VM.GuestAgent.FileWrite` on this pool and nowhere else, so the agent can
 /// write the resolver's map into its own gateway and into nothing else on the
 /// host — not a buyer VM, not the provider's own machines.
-pub(crate) const GATEWAY_POOL: &str = "omnuv";
+pub(crate) const GATEWAY_POOL: &str = crate::names::POOL;
 
 /// Where the gateway's resolver reads the project's names. dnsmasq watches
 /// the directory (`hostsdir`), so replacing this file is the whole update.
-const DNS_HOSTS_PATH: &str = "/etc/omnuv/hosts.d/project";
+const DNS_HOSTS_PATH: &str = "/etc/onv/hosts.d/project";
 
 /// The resolver's hosts file: one `address name` line per record, sorted so
 /// the same map always produces the same bytes.
@@ -732,15 +732,15 @@ mod tests {
         // The resolver listens on the slice address only, is authoritative for
         // `internal`, reads a watched directory, and is seeded with the map.
         assert!(ci.contains("listen-address=10.200.7.1\n"));
-        assert!(ci.contains("hostsdir=/etc/omnuv/hosts.d"));
+        assert!(ci.contains("hostsdir=/etc/onv/hosts.d"));
         assert!(ci.contains("10.200.7.11 gpu-2.internal"));
         // The rules ride as a script the gateway re-runs, so they are asserted
         // where they actually live rather than in the document that carries
         // them. The timer is what makes them true continuously: the overlay
         // client rebuilds the firewall when its routing changes, and applying
         // these once at boot loses them without a word.
-        assert!(ci.contains("/usr/local/sbin/omnuv-gateway-fence"));
-        assert!(ci.contains("omnuv-gateway-fence.timer"));
+        assert!(ci.contains("/usr/local/sbin/onv-gateway-fence"));
+        assert!(ci.contains("onv-gateway-fence.timer"));
         assert!(ci.contains("OnUnitActiveSec=60s"));
         let fence = fence_script("02:09:a4:76:f8:ee");
         // The gateway must never be a path from the bridge to the provider's
@@ -855,7 +855,7 @@ impl crate::proxmox::Client {
         }
         let r: FileRead = self
             .get_json(&format!(
-                "/nodes/{node}/qemu/{vmid}/agent/file-read?file=/run/omnuv/gateway-status.txt"
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file=/run/onv/gateway-status.txt"
             ))
             .await
             .ok()?;
@@ -899,7 +899,7 @@ impl crate::proxmox::Client {
 
         let read: Option<FileRead> = self
             .get_json(&format!(
-                "/nodes/{node}/qemu/{vmid}/agent/file-read?file=/run/omnuv/gateway-status.txt"
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file=/run/onv/gateway-status.txt"
             ))
             .await
             .ok();

@@ -23,13 +23,13 @@ VM.GuestAgent.Audit,Mapping.Audit,Mapping.Use,SDN.Audit,SDN.Use";
 
 /// The pool a gateway lands in, and the pool a buyer's machine lands in. The
 /// agent's extra privileges are granted on these and nowhere else.
-pub(crate) const GATEWAY_POOL: &str = "omnuv";
-const BUYER_POOL: &str = "omnuv-buyers";
+pub(crate) const GATEWAY_POOL: &str = crate::names::POOL;
+const BUYER_POOL: &str = crate::names::POOL_BUYERS;
 /// The marketplace's own SDN zone, and the buyer egress bridge beside it.
 /// Eight characters is the Proxmox limit for a vnet name, which is why the
 /// bridge is `onat0` rather than something readable.
-const SDN_ZONE: &str = "omnuv";
-const EGRESS_ZONE: &str = "omnuvnat";
+const SDN_ZONE: &str = crate::names::SDN_ZONE;
+const EGRESS_ZONE: &str = crate::names::SDN_ZONE_NAT;
 const EGRESS_VNET: &str = "onat0";
 const EGRESS_SUBNET: &str = "10.201.0.0/24";
 const EGRESS_GATEWAY: &str = "10.201.0.1";
@@ -137,27 +137,27 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     println!("\nCreating a restricted Proxmox token. It stays on this machine:");
     step(
         "role",
-        &format!("pveum role list --output-format json | grep -q '\"OmnuvAgent\"' || pveum role add OmnuvAgent -privs \"{ROLE_PRIVS}\"; pveum role modify OmnuvAgent -privs \"{ROLE_PRIVS}\""),
+        &format!("pveum role list --output-format json | grep -q '\"OnvAgent\"' || pveum role add OnvAgent -privs \"{ROLE_PRIVS}\"; pveum role modify OnvAgent -privs \"{ROLE_PRIVS}\""),
         a.dry_run,
     )?;
     step(
         "user",
-        "pveum user list --output-format json | grep -q '\"omnuv@pve\"' || pveum user add omnuv@pve --comment 'Omnuv marketplace agent'",
+        "pveum user list --output-format json | grep -q '\"onv@pve\"' || pveum user add onv@pve --comment 'Onv marketplace agent'",
         a.dry_run,
     )?;
-    step("acl", "pveum acl modify / -user omnuv@pve -role OmnuvAgent", a.dry_run)?;
+    step("acl", "pveum acl modify / -user onv@pve -role OnvAgent", a.dry_run)?;
 
     let secret = if a.dry_run {
         "<created at run time>".to_string()
     } else {
-        sh("pveum user token remove omnuv@pve agent >/dev/null 2>&1; \
-            pveum user token add omnuv@pve agent --privsep 1 --output-format json")
+        sh("pveum user token remove onv@pve agent >/dev/null 2>&1; \
+            pveum user token add onv@pve agent --privsep 1 --output-format json")
             .and_then(|out| {
                 let v: serde_json::Value = serde_json::from_str(&out)?;
                 Ok(v["value"].as_str().unwrap_or_default().to_string())
             })?
     };
-    step("token acl", "pveum acl modify / -token 'omnuv@pve!agent' -role OmnuvAgent", a.dry_run)?;
+    step("token acl", "pveum acl modify / -token 'onv@pve!agent' -role OnvAgent", a.dry_run)?;
 
     // Pools, and roles granted only on those pools. The agent can write files
     // into a gateway it built and open a console on a machine it built, and can
@@ -185,14 +185,14 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         // Still `FileRead` and never `Unrestricted`: the latter is arbitrary
         // command execution inside the guest, and the marketplace has no
         // business holding that on any machine.
-        ("OmnuvGatewayFiles", "VM.GuestAgent.FileWrite,VM.GuestAgent.FileRead", GATEWAY_POOL),
-        ("OmnuvConsole", "VM.Console", BUYER_POOL),
+        ("OnvGatewayFiles", "VM.GuestAgent.FileWrite,VM.GuestAgent.FileRead", GATEWAY_POOL),
+        ("OnvConsole", "VM.Console", BUYER_POOL),
         // Reads one file: the outcome a recipe writes about its own install.
         // Deliberately `FileRead` and not `Unrestricted` — the latter is
         // arbitrary command execution inside a buyer's machine, which is
         // exactly what the marketplace must never be able to do. Scoped to the
         // pool of machines the marketplace built, never the host.
-        ("OmnuvRecipeStatus", "VM.GuestAgent.FileRead", BUYER_POOL),
+        ("OnvRecipeStatus", "VM.GuestAgent.FileRead", BUYER_POOL),
     ] {
         step(
             &format!("role {role}"),
@@ -206,8 +206,8 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         step(
             &format!("grant {role} on {pool}"),
             &format!(
-                "pveum acl modify /pool/{pool} -user omnuv@pve -role {role}; \
-                 pveum acl modify /pool/{pool} -token 'omnuv@pve!agent' -role {role}"
+                "pveum acl modify /pool/{pool} -user onv@pve -role {role}; \
+                 pveum acl modify /pool/{pool} -token 'onv@pve!agent' -role {role}"
             ),
             a.dry_run,
         )?;
@@ -220,10 +220,10 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     // rather than adding to them.
     println!("\nCreating the marketplace's network segments:");
     step(
-        "role OmnuvSdn",
-        "pveum role list --output-format json | grep -q '\"OmnuvSdn\"' \
-         && pveum role modify OmnuvSdn -privs SDN.Allocate,SDN.Audit,SDN.Use \
-         || pveum role add OmnuvSdn -privs SDN.Allocate,SDN.Audit,SDN.Use",
+        "role OnvSdn",
+        "pveum role list --output-format json | grep -q '\"OnvSdn\"' \
+         && pveum role modify OnvSdn -privs SDN.Allocate,SDN.Audit,SDN.Use \
+         || pveum role add OnvSdn -privs SDN.Allocate,SDN.Audit,SDN.Use",
         a.dry_run,
     )?;
     step(
@@ -235,11 +235,11 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         a.dry_run,
     )?;
     step(
-        "grant OmnuvSdn",
+        "grant OnvSdn",
         &format!(
-            "pveum acl modify /sdn/zones/{SDN_ZONE} -user omnuv@pve -role OmnuvSdn; \
-             pveum acl modify /sdn/zones/{SDN_ZONE} -token 'omnuv@pve!agent' -role OmnuvSdn; \
-             pveum acl modify /sdn -token 'omnuv@pve!agent' -role OmnuvSdn --propagate 0"
+            "pveum acl modify /sdn/zones/{SDN_ZONE} -user onv@pve -role OnvSdn; \
+             pveum acl modify /sdn/zones/{SDN_ZONE} -token 'onv@pve!agent' -role OnvSdn; \
+             pveum acl modify /sdn -token 'onv@pve!agent' -role OnvSdn --propagate 0"
         ),
         a.dry_run,
     )?;
@@ -276,10 +276,10 @@ proxmox:
   apiUrl: "https://127.0.0.1:8006"
   node: "{node}"
   tlsFingerprintSha256: "{fingerprint}"
-  tokenId: "omnuv@pve!agent"
+  tokenId: "onv@pve!agent"
   tokenSecret: "{secret}"
   templateVmid: 9000
-  snippetDir: /var/lib/omnuv/snippets
+  snippetDir: /var/lib/onv/snippets
   contribute:
     cpuCores: {cpu}
     memoryMib: {mem}
@@ -296,14 +296,14 @@ proxmox:
         gpus = if gpus.is_empty() { "      []".to_string() } else { gpus },
     );
 
-    println!("\nWriting /etc/omnuv/agent.yaml (0640 root:omnuv)");
+    println!("\nWriting /etc/onv/agent.yaml (0640 root:omnuv)");
     if !a.dry_run {
-        std::fs::create_dir_all("/etc/omnuv")?;
-        sh("id -u omnuv >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/omnuv --create-home omnuv")?;
-        std::fs::write("/etc/omnuv/agent.yaml", &config)?;
-        sh("chgrp omnuv /etc/omnuv/agent.yaml && chmod 0640 /etc/omnuv/agent.yaml")?;
-        sh("install -d -o omnuv -g omnuv /var/lib/omnuv/snippets /var/log/omnuv")?;
-        sh("pvesm status --storage omnuv-snippets >/dev/null 2>&1 || pvesm add dir omnuv-snippets --path /var/lib/omnuv --content snippets")?;
+        std::fs::create_dir_all("/etc/onv")?;
+        sh("id -u omnuv >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/onv --create-home onv")?;
+        std::fs::write("/etc/onv/agent.yaml", &config)?;
+        sh("chgrp onv /etc/onv/agent.yaml && chmod 0640 /etc/onv/agent.yaml")?;
+        sh("install -d -o onv -g onv /var/lib/onv/snippets /var/log/onv")?;
+        sh("pvesm status --storage omnuv-snippets >/dev/null 2>&1 || pvesm add dir omnuv-snippets --path /var/lib/onv --content snippets")?;
     }
 
     // The package ships the unit and creates the service account. Writing our
@@ -327,7 +327,7 @@ proxmox:
 
     println!("\nDone. The agent now dials {} outward.", a.core);
     println!("Nothing listens on this machine, and Omnuv never connects to it.");
-    println!("Audit log:  /var/log/omnuv/audit.log");
+    println!("Audit log:  /var/log/onv/audit.log");
     println!("Logs:       journalctl -u omnuv-provider -f");
     println!("To leave:   omnuv-provider leave");
     Ok(())
@@ -340,7 +340,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/omnuv-provider agent --config /etc/omnuv/agent.yaml
+ExecStart=/usr/local/bin/omnuv-provider agent --config /etc/onv/agent.yaml
 User=omnuv
 Group=omnuv
 Restart=always
@@ -351,7 +351,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ReadWritePaths=/var/lib/omnuv /var/log/omnuv
+ReadWritePaths=/var/lib/onv /var/log/onv
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
@@ -416,11 +416,11 @@ pub fn leave(dry_run: bool) -> anyhow::Result<()> {
     for (label, cmd) in [
         ("stop service", "systemctl disable --now omnuv-provider 2>/dev/null || true"),
         ("remove unit", "rm -f /etc/systemd/system/omnuv-provider.service; systemctl daemon-reload"),
-        ("remove token", "pveum user token remove omnuv@pve agent 2>/dev/null || true"),
-        ("remove acl", "pveum acl delete / -token 'omnuv@pve!agent' -role OmnuvAgent 2>/dev/null || true; pveum acl delete / -user omnuv@pve -role OmnuvAgent 2>/dev/null || true"),
-        ("remove user", "pveum user delete omnuv@pve 2>/dev/null || true"),
-        ("remove role", "pveum role delete OmnuvAgent 2>/dev/null || true"),
-        ("remove config", "rm -f /etc/omnuv/agent.yaml"),
+        ("remove token", "pveum user token remove onv@pve agent 2>/dev/null || true"),
+        ("remove acl", "pveum acl delete / -token 'onv@pve!agent' -role OnvAgent 2>/dev/null || true; pveum acl delete / -user onv@pve -role OnvAgent 2>/dev/null || true"),
+        ("remove user", "pveum user delete onv@pve 2>/dev/null || true"),
+        ("remove role", "pveum role delete OnvAgent 2>/dev/null || true"),
+        ("remove config", "rm -f /etc/onv/agent.yaml"),
     ] {
         println!("  {label}\n    $ {cmd}");
         if !dry_run {
@@ -428,6 +428,6 @@ pub fn leave(dry_run: bool) -> anyhow::Result<()> {
         }
     }
     // The audit log is deliberately left in place: it is the provider's record.
-    println!("\nRemoved. /var/log/omnuv/audit.log is kept — it is your record, not ours.");
+    println!("\nRemoved. /var/log/onv/audit.log is kept — it is your record, not ours.");
     Ok(())
 }

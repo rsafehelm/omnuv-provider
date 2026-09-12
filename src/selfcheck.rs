@@ -175,12 +175,12 @@ pub fn peer_paths(detail: &str) -> SelfCheck {
 
     let gateways_relayed: Vec<&str> = peers
         .iter()
-        .filter(|p| p.relayed && p.name.starts_with("omnuv-gw-"))
+        .filter(|p| p.relayed && p.name.starts_with("onv-gw-"))
         .map(|p| p.name.as_str())
         .collect();
     let clients_relayed = peers
         .iter()
-        .filter(|p| p.relayed && !p.name.starts_with("omnuv-gw-"))
+        .filter(|p| p.relayed && !p.name.starts_with("onv-gw-"))
         .count();
     let direct = peers.iter().filter(|p| !p.relayed).count();
 
@@ -293,7 +293,7 @@ Peers detail:
  omnuv-relay-c4d90fd2.netbird.selfhosted:
   Status: Connected
   Connection type: Relayed
- omnuv-gw-55a24373.netbird.selfhosted:
+ onv-gw-55a24373.netbird.selfhosted:
   Status: Connected
   Connection type: P2P
   ICE candidate endpoints (Local/Remote): 10.200.99.1:51820/192.168.100.109:51820
@@ -318,19 +318,19 @@ Peers detail:
     #[test]
     fn a_relayed_gateway_is_a_fault_and_says_which() {
         let relayed_gw = REAL.replace(
-            " omnuv-gw-55a24373.netbird.selfhosted:\n  Status: Connected\n  Connection type: P2P",
-            " omnuv-gw-55a24373.netbird.selfhosted:\n  Status: Connected\n  Connection type: Relayed",
+            " onv-gw-55a24373.netbird.selfhosted:\n  Status: Connected\n  Connection type: P2P",
+            " onv-gw-55a24373.netbird.selfhosted:\n  Status: Connected\n  Connection type: Relayed",
         );
         let c = peer_paths(&relayed_gw);
         assert_eq!(c.result, CheckResult::Fail);
-        assert!(c.detail.unwrap().contains("omnuv-gw-55a24373"));
+        assert!(c.detail.unwrap().contains("onv-gw-55a24373"));
     }
 
     #[test]
     fn peers_and_their_paths_are_read_correctly() {
         let p = peers_in(REAL);
         assert_eq!(p.len(), 3);
-        assert_eq!(p[1].name, "omnuv-gw-55a24373");
+        assert_eq!(p[1].name, "onv-gw-55a24373");
         assert!(!p[1].relayed);
         assert!(p[0].relayed && p[2].relayed);
     }
@@ -449,7 +449,7 @@ mod link_tests {
 
     const STATUS: &str = r#"{
       "peers": {"total":2,"connected":2,"details":[
-        {"fqdn":"omnuv-gw-abcd1234.netbird.selfhosted","netbirdIp":"100.93.1.5/16",
+        {"fqdn":"onv-gw-abcd1234.netbird.selfhosted","netbirdIp":"100.93.1.5/16",
          "connectionType":"P2P","latency":4200000,
          "lastWireguardHandshake":"2026-09-11T10:00:00Z"},
         {"fqdn":"rmartins-laptop.netbird.selfhosted","netbirdIp":"100.93.9.9/16",
@@ -463,7 +463,7 @@ mod link_tests {
     fn a_direct_gateway_and_a_relayed_client_are_told_apart() {
         let l = links_in(STATUS, "g1", 99);
         assert_eq!(l.len(), 2);
-        assert_eq!(l[0].peer, "omnuv-gw-abcd1234");
+        assert_eq!(l[0].peer, "onv-gw-abcd1234");
         assert!(!l[0].relayed);
         assert!(l[1].relayed);
         // Directional: both are what g1 sees.
