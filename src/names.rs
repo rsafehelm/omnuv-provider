@@ -76,7 +76,19 @@ pub const STORAGE_SNIPPETS: &str = "onv-snippets";
 pub const SDN_ZONE: &str = "onv";
 pub const SDN_ZONE_NAT: &str = "onvnat";
 /// The egress bridge every buyer machine's first interface sits on.
-pub const NAT_VNET: &str = "onat0";
+///
+/// **`onvnat0`, not `onat0`.** It was shortened on the belief that a Proxmox
+/// SDN id is at most eight characters and `onvnat0` was nine. It is seven. The
+/// dropped `v` bought nothing and cost the one thing the prefix rule exists
+/// for: a name an operator recognises at a glance as ours.
+///
+/// The older name is still swept by `remove-provider.yml` and still re-pointed
+/// by the agent, because a rename is a migration — see `ensure_egress`.
+pub const NAT_VNET: &str = "onvnat0";
+
+/// The egress bridge's name before 12 September 2026. Machines built under it
+/// are re-pointed rather than left on a bridge that is about to be removed.
+pub const NAT_VNET_LEGACY: &str = "onat0";
 
 // ---------------------------------------------------------------------------
 // Tags, which are how a machine says whose it is
@@ -213,6 +225,24 @@ mod tests {
         // The id arrives hyphenated; filtering non-alphanumerics before taking
         // five is what stops `onvc4d9` losing a digit to a separator.
         assert_eq!(vnet("c4d9-0fd2"), "onvc4d90");
+    }
+
+    /// Proxmox caps an SDN id at eight characters, and every id we mint has to
+    /// fit — including the one that was shortened to `onat0` on the belief that
+    /// it did not.
+    #[test]
+    fn every_sdn_id_fits_proxmoxs_eight_characters() {
+        for id in [SDN_ZONE, SDN_ZONE_NAT, NAT_VNET, NAT_VNET_LEGACY, &vnet("c4d90fd2-be3d-4225-a4a6-265138a76e49")] {
+            assert!(id.len() <= 8, "{id} is {} characters", id.len());
+            assert!(
+                id.chars().next().is_some_and(|c| c.is_ascii_alphabetic()),
+                "{id} must start with a letter"
+            );
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id} is not alphanumeric");
+        }
+        // And the current name says `onv`, which the shortened one did not.
+        assert!(NAT_VNET.starts_with(PREFIX), "{NAT_VNET} does not say {PREFIX}");
+        assert_ne!(NAT_VNET, NAT_VNET_LEGACY, "a rename needs both names to exist");
     }
 
     #[test]

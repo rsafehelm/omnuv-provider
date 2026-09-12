@@ -35,11 +35,14 @@ pub(crate) fn marketplace_bridge(net: &NetworkAttachment) -> String {
 /// LAN and cannot reach the host, other providers' machines or, with port
 /// isolation, another tenant's VM on the same bridge. Gateways and inference
 /// workers are marketplace-owned and stay on the provider's bridge.
-// Proxmox caps a vnet name at 8 characters, which is also why a marketplace
-// segment is `o` plus seven hex digits rather than something readable. The
-// rename produced `omnuvnat0`, which is nine and cannot exist; this is the same
-// idea inside the limit.
-pub(crate) const EGRESS_BRIDGE: &str = "onat0";
+// One definition, in `names`. This held a second copy of the string, which is
+// how a rename leaves half a codebase behind.
+//
+// Proxmox caps a vnet name at 8 characters, which is why a marketplace segment
+// is a prefix plus five hex digits rather than something readable. The rename
+// produced `omnuvnat0`, which is nine and cannot exist — and the correction
+// overshot to `onat0` when `onvnat0` is seven and fits.
+pub(crate) use crate::names::NAT_VNET as EGRESS_BRIDGE;
 
 /// A stable, locally-administered MAC for a machine's marketplace interface.
 ///
@@ -547,6 +550,35 @@ impl Client {
     /// Moves the machine's marketplace interface onto its network's segment
     /// if it is anywhere else. Its address never changes; the segment is
     /// where the network's gateway is.
+    /// Keeps an existing machine's `net0` on the current egress bridge.
+    ///
+    /// **This is what makes renaming that bridge a migration rather than an
+    /// edit.** `net0` is written once, at create time, so a machine built under
+    /// `onat0` would have kept naming it after the agent started creating
+    /// `onvnat0` — and would have lost its internet the moment the old bridge
+    /// was swept, with nothing saying why.
+    async fn ensure_egress(&self, node: &str, vmid: u32) -> anyhow::Result<()> {
+        let cfg: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await?;
+        let Some(current) = cfg.get("net0").and_then(|v| v.as_str()) else { return Ok(()) };
+        if current.split(',').any(|kv| kv == format!("bridge={EGRESS_BRIDGE}")) {
+            return Ok(());
+        }
+        // Keep the MAC it already has: the host's DHCP lease is keyed on it,
+        // and changing it would hand the machine a different address for no
+        // reason.
+        let Some(mac) = current.split(',').next().and_then(|m| m.split_once('=')).map(|(_, m)| m)
+        else {
+            return Ok(());
+        };
+        self.post_form::<serde_json::Value>(
+            &format!("/nodes/{node}/qemu/{vmid}/config"),
+            &[("net0".to_string(), format!("virtio={mac},bridge={EGRESS_BRIDGE}"))],
+        )
+        .await?;
+        audit::record("instance.egress", "core", &vmid.to_string(), "ok", Some(EGRESS_BRIDGE));
+        Ok(())
+    }
+
     /// Attaches an existing machine's `net1` to its network's segment.
     ///
     /// The segment itself is ensured by `ensure_instance`, before this — see
@@ -611,6 +643,16 @@ impl Client {
                 && spec.lifecycle != Lifecycle::Deleted
             {
                 self.ensure_segment(node, vm.vmid, net).await?;
+            }
+
+            // And its way out. A machine built before the egress bridge was
+            // renamed still names the old one, which the teardown sweep is
+            // about to remove — so it is re-pointed here rather than left to
+            // lose its internet quietly. Proxmox re-plugs a running machine's
+            // interface live and the guest's own configuration does not change,
+            // exactly as for the segment above.
+            if spec.lifecycle != Lifecycle::Deleted {
+                self.ensure_egress(node, vm.vmid).await?;
             }
 
             // Converge toward the requested lifecycle rather than merely
