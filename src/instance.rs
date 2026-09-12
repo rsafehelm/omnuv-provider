@@ -432,6 +432,20 @@ fn private_network(net: &NetworkAttachment) -> String {
     # has no uplink, and the overlay carries everything that is not on this
     # wire.
     ip addr replace {address}/{prefix} dev $DEV
+    # `RequiredForOnline=degraded`, and it is not cosmetic. This link has an
+    # address and no route beyond its own segment — by design, under topology
+    # v2 — so networkd settles it at `degraded`, never `routable`.
+    # `systemd-networkd-wait-online` requires `routable` from every managed
+    # link by default, so it waited for this one until it timed out:
+    #
+    #     Failed to wait for network: ... systemd-networkd-wait-online.service
+    #     failed because the control process exited with error code
+    #
+    # on every boot of every machine, pushing `modules:config` two minutes late
+    # and making cloud-init's own recoverable-error list something nobody could
+    # read for the noise. `degraded` says what is true: the link is up and
+    # addressed, and a route is not what it is for.
+    #
     # The declarative copy. No DNS= line: private names are answered by the
     # overlay client's own resolver, from the zone its network map carries, so
     # pointing this link at a resolver would be pointing it at nothing.
@@ -441,7 +455,7 @@ fn private_network(net: &NetworkAttachment) -> String {
     # applies it on first boot; on every later boot networkd binds the file
     # itself, and its name sorts before the image's catch-all and any netplan
     # file so it always wins the match.
-    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/{prefix}\n' > /etc/systemd/network/05-onv.network
+    printf '[Match]\nMACAddress={mac}\n\n[Link]\nRequiredForOnline=degraded\n\n[Network]\nAddress={address}/{prefix}\n' > /etc/systemd/network/05-onv.network
 "#,
         address = net.address,
         prefix = prefix_of(&net.cidr),
@@ -1296,6 +1310,13 @@ echo 'single' "double" `backtick` \$escaped
         // reconfigure — D-Bus calls) must be in runcmd, never in bootcmd
         // where D-Bus is not up yet and they fail silently.
         assert!(ci.contains("05-onv.network"));
+        // The link is addressed and has no route, which networkd settles at
+        // `degraded`. Without this, `systemd-networkd-wait-online` waits for
+        // `routable` and times out on every boot.
+        assert!(
+            ci.contains("[Link]\\nRequiredForOnline=degraded"),
+            "the segment link never becomes routable, and must not be waited for as if it would"
+        );
         let reload = ci.find("networkctl reload").expect("reloads");
         let reconf = ci.find("networkctl reconfigure $DEV").expect("reconfigures");
         assert!(run < reload && reload < reconf, "rebind lives in runcmd, reload before reconfigure");
