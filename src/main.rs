@@ -2,7 +2,6 @@ mod names;
 mod agent;
 mod audit;
 mod config;
-mod gateway;
 mod images;
 mod instance;
 mod join;
@@ -15,7 +14,6 @@ mod tunnel;
 mod console;
 mod worker;
 mod neighbours;
-mod selfcheck;
 mod workload;
 
 const USAGE: &str = "\

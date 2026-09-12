@@ -608,83 +608,21 @@ async fn reconcile_workers(
         Err(e) => eprintln!("segment reap: {e}"),
     }
 
-    if desired.inference_workers.is_empty()
-        && desired.instances.is_empty()
-        && desired.gateways.is_empty()
-    {
+    if desired.inference_workers.is_empty() && desired.instances.is_empty() {
         return Ok(());
     }
 
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
 
-    // Gateways first: each carries one buyer network's traffic and creates
-    // that network's segment here, and a buyer VM that comes up before them
-    // simply has nowhere to talk to yet. A failure here is reported and does
-    // not stop workers or instances converging — the control plane does not
-    // run on the overlay, so a broken gateway is a degraded buyer network,
-    // not a degraded provider.
-    let mut checks: Vec<omnuv_protocol::SelfCheck> = Vec::new();
-    let mut links: Vec<omnuv_protocol::LinkReport> = Vec::new();
-    let mut gateways = Vec::new();
-    for spec in &desired.gateways {
-        let status = if spec.lifecycle == Lifecycle::Deleted {
-            match driver.delete_gateway(node, &spec.id, &spec.network_id).await {
-                Ok(()) => omnuv_protocol::GatewayStatus {
-                    id: spec.id.clone(),
-                    state: omnuv_protocol::GatewayState::Offline,
-                    retryable: None,
-                    waiting_on: None,
-                    local_id: None,
-                    overlay_address: None,
-                    adapters: Vec::new(),
-                    diagnostics: None,
-                    message: Some("deleted".into()),
-                },
-                Err(e) => {
-                    eprintln!("gateway {}: {e}", spec.id);
-                    continue;
-                }
-            }
-        } else {
-            driver
-                .ensure_gateway(node, cfg.proxmox.template_vmid, storage, &cfg.proxmox.snippet_dir, spec)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("gateway {}: {e}", spec.id);
-                    omnuv_protocol::GatewayStatus {
-                        id: spec.id.clone(),
-                        state: omnuv_protocol::GatewayState::Error,
-                        retryable: None,
-                        waiting_on: None,
-                        local_id: None,
-                        overlay_address: None,
-                        adapters: Vec::new(),
-                        diagnostics: None,
-                        message: Some(e.to_string().chars().take(400).collect()),
-                    }
-                })
-        };
-        // Presence is not health. The status above says the VM exists and is
-        // running; these say whether it can reach anything, which is a
-        // different question that fails on its own.
-        if spec.lifecycle != Lifecycle::Deleted
-            && let Some(vmid) = status.local_id.as_deref().and_then(|v| v.parse::<u32>().ok())
-        {
-            checks.extend(driver.gateway_checks(node, vmid, &spec.id).await);
-            // The same status file, read for its numbers rather than its
-            // yes/no answers: which peers this gateway has, whether each is
-            // direct, and how far away it feels.
-            links.extend(driver.gateway_links(node, vmid, &spec.id).await);
-        }
-        gateways.push(status);
-    }
-    // Anything tagged as a gateway that Core did not just ask for, running or
-    // deleted, is left over from before and goes.
-    match driver.reap_stale_gateways(node, &desired.gateways).await {
-        Ok(0) => {}
-        Ok(n) => println!("reaped {n} stale gateway(s)"),
-        Err(e) => eprintln!("stale gateways: {e}"),
-    }
+    // **No gateways.** Topology v2 makes every buyer machine an overlay peer,
+    // so there is nothing per-provider to bring up, tear down, or reap — and
+    // the contract no longer has a place to ask for one (protocol 3).
+    //
+    // What the gateway also did, as a side effect, was create and destroy the
+    // project's SDN segment. Both halves moved: `ensure_segment` creates it
+    // with the machine that needs it, and `reap_unused_segments` above removes
+    // one no machine is attached to.
+    let checks: Vec<omnuv_protocol::SelfCheck> = Vec::new();
 
     let mut statuses = Vec::new();
     for spec in &desired.inference_workers {
@@ -822,15 +760,10 @@ async fn reconcile_workers(
         audit: audit::drain(100),
         workers: statuses,
         instances,
-        gateways,
         // Reported every pass, not only when something is wrong: a check that
         // is only sent on failure is indistinguishable from one that stopped
         // running.
         checks,
-        // How each gateway actually reaches its peers, with the latency it
-        // measured. Same rule: sent every pass, so an empty list means "no
-        // links seen" rather than "nothing changed".
-        links,
     };
     let res = core.post("/provider/v1/status", Some(serde_json::to_value(&report)?)).await?;
     if !res.status().is_success() {

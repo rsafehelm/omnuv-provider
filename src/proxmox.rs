@@ -279,28 +279,6 @@ impl Client {
         Ok(true)
     }
 
-    /// Writes a file inside a guest through the QEMU guest agent.
-    ///
-    /// Needs `VM.GuestAgent.FileWrite` on the VM. That is a root-level write
-    /// into a guest, so bootstrap grants it on the gateway pool only: the agent
-    /// can feed its own gateway's resolver and cannot touch a buyer VM or the
-    /// provider's own machines. Proxmox base64-encodes `content` itself; the
-    /// limit is 60 KiB.
-    pub(crate) async fn guest_file_write(
-        &self,
-        node: &str,
-        vmid: u32,
-        file: &str,
-        content: &str,
-    ) -> anyhow::Result<()> {
-        self.post_form::<Option<serde_json::Value>>(
-            &format!("/nodes/{node}/qemu/{vmid}/agent/file-write"),
-            &[("file".to_string(), file.to_string()), ("content".to_string(), content.to_string())],
-        )
-        .await
-        .map(|_| ())
-    }
-
     async fn send_form<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
@@ -732,7 +710,11 @@ fn is_marketplace(tags: Option<&str>) -> bool {
     let Some(tags) = tags else { return false };
     tags.split(&[';', ','][..]).map(str::trim).any(|t| {
         t == crate::worker::TAG
-            || t == crate::gateway::TAG
+            // Still recognised, deliberately. Topology v2 creates no
+            // gateways, but a provider that joined under v1 may still carry a
+            // gateway VM — and a marketplace machine we stop recognising is
+            // one the agent would count as somebody else's.
+            || t == crate::names::TAG_GATEWAY
             || t == crate::instance::TAG
             || crate::instance::is_legacy_marketplace_tag(t)
     })

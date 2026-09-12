@@ -24,6 +24,8 @@
 //! report that stops advancing is dropped rather than read as bad news, because
 //! otherwise a dead reporter would be indistinguishable from a dead worker.
 
+#![allow(dead_code)]
+
 use omnuv_protocol::WorkloadReport;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,16 @@ pub const WORKLOAD_STATUS: &str = "/run/onv/workload.json";
 /// timestamp in the file: a stopped reporter leaves a perfectly well-formed
 /// file behind, and the only thing that distinguishes it from a live one is
 /// that the number stops moving. Nothing here trusts the guest's wall clock.
+// **Written, tested, and not yet wired**, which is why the compiler calls it
+// dead. It is the staleness half of the workload-agent contract: a stopped
+// reporter leaves a perfectly well-formed file behind, and the only thing
+// separating it from a live one is that the uptime stops moving.
+//
+// `worker.rs` reads and parses reports today but does not yet hold this across
+// passes, so nothing decides that a reporter has stopped being believable. Kept
+// rather than deleted because the tests below are the decision — deleting it
+// would throw away the reasoning and leave the gap unmarked.
+
 const STUCK_AFTER_READS: u32 = 3;
 
 #[derive(Clone, Default)]

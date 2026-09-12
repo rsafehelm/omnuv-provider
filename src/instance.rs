@@ -361,12 +361,32 @@ runcmd:
 
 /// Configures the machine's place on the buyer's private network.
 ///
-/// The address is a **/32**, not the project prefix. Each provider has its own
-/// isolated segment per network, so two machines on the same project network
-/// but different providers are not on the same wire: giving them a /24 would
-/// have them ARP for each other and fail. With a /32 plus an on-link route to the gateway,
-/// anything in the project that is not local is routed — which is what makes a
-/// private network span providers at all.
+/// **On-link across the project prefix, and nothing else** — no route, no
+/// next hop, no resolver. That is the whole of the v2 change here, and it
+/// inverts what this used to do.
+///
+/// Under v1 the address was a `/32` and the project prefix was routed through
+/// the provider's gateway at `.1`, because machines on other providers were
+/// only reachable through it. The gateway is gone: every machine is an overlay
+/// peer, the tunnel installs its own routes for every peer in the project, and
+/// a `/24` route through `.1` would name a VM that was deleted.
+///
+/// What the segment is still for is the machine *next to this one*. Two of a
+/// buyer's machines on the same provider share it, and without a local address
+/// on it WireGuard has no local candidate to offer: `@private` drops their
+/// public-side addresses and Linux does not hairpin its own masquerade, so two
+/// machines 30 cm apart would meet on a relay. On-link across the prefix is
+/// exactly what gives them that candidate.
+///
+/// Two machines of the same project on *different* providers are not on the
+/// same wire, and now nothing pretends they are: they never ARP for each
+/// other, because the overlay's route for the far peer is more specific and
+/// wins.
+///
+/// Private names are resolved by the overlay client from the zone its own
+/// network map carries — not by a `DNS=` line pointing at the gateway's `.1`,
+/// which after v2 would have sent every `.internal` lookup to a dead address
+/// and timed out while every status said `RUNNING`.
 fn private_network(net: &NetworkAttachment) -> String {
     // One YAML block scalar (`- |`), not `[ sh, -c, "..." ]` flow entries: the
     // MAC-resolution shell needs both single quotes (awk) and double quotes
@@ -379,34 +399,35 @@ fn private_network(net: &NetworkAttachment) -> String {
   - |
     {resolve}
     ip link set dev $DEV up
-    ip addr replace {address}/32 dev $DEV
-    # On-link to the gateway first, then everything else in the project through
-    # it. Without the first route the second has no reachable next hop.
-    ip route replace {gateway} dev $DEV scope link
-    ip route replace {cidr} via {gateway} dev $DEV
-    # The declarative copy, which is also how the project's private names get
-    # resolved: DNS= points this link at the gateway and Domains=~internal is a
-    # routing-only domain, so only `.internal` goes there and every other
-    # lookup stays on the image's own resolver. Placement is invisible without
-    # touching the machine's internet resolution.
-    #
-    # GatewayOnLink is required: the gateway is outside the /32, and without
-    # it networkd rejects the route, leaves the link "configuring" forever and
-    # never hands the DNS server to resolved — names silently stop resolving.
+    # On-link across the project prefix. No route and no next hop: the segment
+    # has no uplink, and the overlay carries everything that is not on this
+    # wire.
+    ip addr replace {address}/{prefix} dev $DEV
+    # The declarative copy. No DNS= line: private names are answered by the
+    # overlay client's own resolver, from the zone its network map carries, so
+    # pointing this link at a resolver would be pointing it at nothing.
     #
     # Only written here, not applied: bootcmd runs before D-Bus is up, so
     # networkctl and resolvectl cannot act yet (they fail silently). runcmd
     # applies it on first boot; on every later boot networkd binds the file
     # itself, and its name sorts before the image's catch-all and any netplan
     # file so it always wins the match.
-    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/32\nDNS={gateway}\nDomains=~internal\n\n[Route]\nDestination={gateway}/32\nScope=link\n\n[Route]\nDestination={cidr}\nGateway={gateway}\nGatewayOnLink=yes\n' > /etc/systemd/network/05-onv.network
+    printf '[Match]\nMACAddress={mac}\n\n[Network]\nAddress={address}/{prefix}\n' > /etc/systemd/network/05-onv.network
 "#,
         address = net.address,
-        gateway = net.gateway,
-        cidr = net.cidr,
+        prefix = prefix_of(&net.cidr),
         mac = net.mac,
         resolve = resolve_dev(&net.mac),
     )
+}
+
+/// The prefix length out of a CIDR, defaulting to a /24.
+///
+/// A default rather than a failure, and the default is what every project
+/// network has been: a machine that comes up on the wrong prefix length can
+/// still be reached and corrected, and one that does not come up at all cannot.
+fn prefix_of(cidr: &str) -> u8 {
+    cidr.split_once('/').and_then(|(_, p)| p.parse().ok()).filter(|p| *p <= 32).unwrap_or(24)
 }
 
 impl Client {
@@ -825,18 +846,6 @@ impl Client {
     }
 }
 
-/// The tag prefix this agent used before the project was renamed.
-///
-/// A machine carries the marketplace's name in its tags, and that is how the
-/// agent recognises what it built. After the rename an agent looking for
-/// `omnuv-instance` finds nothing on a host whose machines say `omnu-instance`
-/// — and "nothing" is indistinguishable from "not created yet", so it would
-/// build a second copy of every machine and orphan the first, GPU and all.
-///
-/// So the agent refuses to reconcile while it can see the old name. Refusing is
-/// the only safe reading: the alternative is to guess, and the guess is
-/// expensive.
-pub const LEGACY_TAG_PREFIX: &str = "omnu-";
 
 /// Whether a tag list belongs to a machine this agent built under an older
 /// name. **Two generations now**, `omnu-` and `omnuv-`, because there have been
@@ -1070,7 +1079,6 @@ mod tests {
                 network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
                 address: "10.200.99.10".into(),
                 cidr: "10.200.99.0/24".into(),
-                gateway: "10.200.99.1".into(),
                 dns_name: Some("gpu-1.internal".into()),
                 mac: "02:09:a4:76:f8:ee".into(),
             }),
@@ -1145,7 +1153,7 @@ echo 'single' "double" `backtick` \$escaped
         let ci = cloud_init(&spec_with_network(), None);
         let boot = ci.find("bootcmd:").expect("has bootcmd");
         let run = ci.find("runcmd:").expect("has runcmd");
-        let addr = ci.find("10.200.99.10/32").expect("configures the /32");
+        let addr = ci.find("10.200.99.10/24").expect("configures the address on-link");
         assert!(boot < addr, "address must be under bootcmd");
         assert!(addr < run, "address must come before runcmd, not inside it");
         // The agent is still installed and started so Core can read the IP back.
@@ -1157,11 +1165,19 @@ echo 'single' "double" `backtick` \$escaped
         assert!(ci.contains("password: \"$6$rounds=10000$"));
         assert!(ci.contains("type: hash"));
         assert!(ci.contains("ssh_pwauth: false"));
-        // Private names resolve at the gateway, scoped to `.internal` only, so
-        // the machine's ordinary resolution is untouched.
-        assert!(ci.contains("DNS=10.200.99.1\\nDomains=~internal"));
-        // Without this networkd never finishes the link and DNS never lands.
-        assert!(ci.contains("Gateway=10.200.99.1\\nGatewayOnLink=yes"));
+        // **Nothing points at a `.1` any more.** Protocol 4 removed the
+        // gateway, and this is the assertion that it cannot come back by
+        // accident: a route through a deleted machine, or a resolver at one,
+        // fails silently while the machine reports RUNNING.
+        assert!(!ci.contains("10.200.99.1\\n"), "no next hop and no resolver at the old gateway");
+        assert!(!ci.contains("GatewayOnLink"));
+        // The `\\n` matters: the generator's own comment says "No DNS= line",
+        // and an assertion that cannot tell a comment from a directive is one
+        // that fails on its own prose.
+        assert!(
+            !ci.contains("\\nDNS="),
+            "private names come from the overlay client's own resolver, not a DNS= directive"
+        );
         // Our file must sort first, and the first-boot rebind (reload, then
         // reconfigure — D-Bus calls) must be in runcmd, never in bootcmd
         // where D-Bus is not up yet and they fail silently.
@@ -1175,12 +1191,6 @@ echo 'single' "double" `backtick` \$escaped
         assert!(!ci.contains("resolvectl dns"), "DNS comes from the networkd file, not resolvectl");
     }
 
-    /// The bug that shipped once and cost a full validation cycle: the
-    /// MAC-resolution shell contains `[ -n "$DEV" ]`, and a double quote inside
-    /// a `[ sh, -c, "..." ]` flow scalar closes the YAML string, so cloud-init
-    /// silently rejected the *entire* config — no networking, no agent. A
-    /// `contains()` check cannot see that; parsing as YAML can.
-    #[test]
     /// The enrolment has to survive being embedded in YAML, and the failure
     /// mode if it does not is a machine that boots with a broken cloud-config
     /// and joins nothing — reported as RUNNING, because it is.
@@ -1227,6 +1237,11 @@ echo 'single' "double" `backtick` \$escaped
         let _: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
     }
 
+    /// The bug that shipped once and cost a full validation cycle: the
+    /// MAC-resolution shell contains `[ -n "$DEV" ]`, and a double quote inside
+    /// a `[ sh, -c, "..." ]` flow scalar closes the YAML string, so cloud-init
+    /// silently rejected the *entire* config — no networking, no agent. A
+    /// `contains()` check cannot see that; parsing as YAML can.
     #[test]
     fn cloud_init_is_valid_yaml() {
         let ci = cloud_init(&spec_with_network(), None);
@@ -1237,7 +1252,7 @@ echo 'single' "double" `backtick` \$escaped
         // The network setup is one block-scalar string entry that mentions the
         // address and the "$DEV" test that broke the flow form.
         let joined = serde_yaml_ng::to_string(boot).unwrap();
-        assert!(joined.contains("10.200.99.10/32"));
+        assert!(joined.contains("10.200.99.10/24"));
         assert!(joined.contains("$DEV"));
     }
 

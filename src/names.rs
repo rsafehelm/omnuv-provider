@@ -25,6 +25,15 @@
 //! this repository. Those are identity, not resources — nothing is created on a
 //! provider called any of them, so nothing has to be recognised or removed.
 
+// **Several constants below are read by no Rust at all**, and that is
+// deliberate: they name things the *playbooks* create — the service account,
+// the egress unit and table, the paths, the Proxmox user. They are this
+// repository's statement of the naming contract, and the test at the bottom of
+// this file asserts the prefix rule over every one of them. A name that lives
+// in Ansible and nowhere else is a name nothing can check.
+#![allow(dead_code)]
+
+
 /// The prefix itself. Nothing below should hard-code it; a name is built from
 /// this so that a grep for `onv` finds the definition rather than forty uses.
 pub const PREFIX: &str = "onv";
