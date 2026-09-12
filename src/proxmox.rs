@@ -551,6 +551,11 @@ impl Client {
         }
 
         Ok(InventoryReport {
+            // Not yet reported. The catalogue's other half — the agent mirroring
+            // published images and saying which digests it actually holds — is
+            // still to be built, and an empty list is read by Core as "this
+            // agent does not report digests" rather than "it holds nothing".
+            held_images: Vec::new(),
             protocol_version: omnuv_protocol::PROTOCOL_VERSION,
             runtime: RuntimeKind::Proxmox,
             // Filled in by the agent from its own image map before reporting.

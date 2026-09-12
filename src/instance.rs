@@ -127,6 +127,39 @@ done
 echo "omnuv: no internet after five minutes; the recipe cannot install" >&2
 exit 1"#;
 
+/// Joins the machine to its buyer's overlay, at first boot.
+///
+/// **Topology v2.** The client runs here, in the machine, so WireGuard
+/// terminates where the traffic actually ends. Under v1 it ran only on a
+/// per-provider gateway and the last hop — gateway to machine, across a bridge
+/// on the provider's hardware — was clear text.
+///
+/// The key is single-use and Core revokes it when the machine goes. It is
+/// written into this file, which lives on a disk the provider can read, so its
+/// one use is the whole of its value: by the time anyone else could read it,
+/// it has been spent by the boot it was made for.
+///
+/// The client is in the image, not fetched here. An image is cloned; a machine
+/// that apt-installs its own networking at first boot is one that fails when a
+/// mirror is mid-sync, which is not a hypothetical — it cost a gaming rig on
+/// 11 September and a smoke run the day after.
+///
+/// Failure is not fatal. `|| true` on the enrolment: a machine that cannot
+/// reach the overlay still boots, still holds its provider-local address, and
+/// still answers its console. Refusing to start would turn a network problem
+/// into a dead machine, and the buyer can already see that it is unreachable.
+fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment) -> String {
+    let hostname = o.hostname.clone().unwrap_or_default();
+    let host_arg =
+        if hostname.is_empty() { String::new() } else { format!(" --hostname {hostname}") };
+    format!(
+        "\n  - [ sh, -c, \"netbird up --management-url {url} --setup-key {key}{host_arg} \
+         >/var/log/onv-overlay.log 2>&1 || true\" ]",
+        url = o.management_url,
+        key = o.setup_key,
+    )
+}
+
 /// Brings the recipe up in runcmd: Docker from its own installer, the NVIDIA
 /// container toolkit when the containers reserve a GPU (the image already
 /// carries the driver), then `compose up` and the recipe's finishing steps.
@@ -282,9 +315,10 @@ bootcmd:
 # Networking already ran in bootcmd, so a slow apt here delays nothing.
 runcmd:
   - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
-{network_final}{recipe_final}"#,
+{overlay}{network_final}{recipe_final}"#,
         apt = apt,
         name = spec.name,
+        overlay = spec.overlay.as_ref().map(overlay_runcmd).unwrap_or_default(),
         recipe_files = spec.recipe.as_ref().map(recipe_files).unwrap_or_default(),
         recipe_final = spec.recipe.as_ref().map(recipe_runcmd).unwrap_or_default(),
         user = spec.image.default_user,
@@ -1024,6 +1058,8 @@ mod tests {
                 mac: "02:09:a4:76:f8:ee".into(),
             }),
             recipe: None,
+            // No overlay: this fixture is about the marketplace NIC.
+            overlay: None,
         }
     }
 
@@ -1127,6 +1163,53 @@ echo 'single' "double" `backtick` \$escaped
     /// a `[ sh, -c, "..." ]` flow scalar closes the YAML string, so cloud-init
     /// silently rejected the *entire* config — no networking, no agent. A
     /// `contains()` check cannot see that; parsing as YAML can.
+    #[test]
+    /// The enrolment has to survive being embedded in YAML, and the failure
+    /// mode if it does not is a machine that boots with a broken cloud-config
+    /// and joins nothing — reported as RUNNING, because it is.
+    #[test]
+    fn an_enrolled_machine_still_produces_valid_cloud_init() {
+        let spec = InstanceSpec {
+            id: "i-1".into(),
+            name: "gpu-1".into(),
+            lifecycle: omnuv_protocol::Lifecycle::Running,
+            vcpus: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            overlay: Some(omnuv_protocol::OverlayEnrolment {
+                setup_key: "0E38B183-B8B6-45CE-B93B-2EF63F3D14E4".into(),
+                management_url: "https://api.omnuv.com:8443".into(),
+                hostname: Some("onv-gpu-1".into()),
+            }),
+            ..Default::default()
+        };
+        let ci = cloud_init(&spec, None);
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
+        assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
+        assert!(ci.contains("netbird up"), "the machine must enrol itself");
+        assert!(ci.contains("--setup-key 0E38B183"), "with its own key");
+        assert!(ci.contains("|| true"), "and a failure must not stop the boot");
+    }
+
+    /// A machine with no private network gets no enrolment, and the cloud-init
+    /// is unchanged from what it always was. `None` means *not a peer*, never
+    /// *the field went missing*.
+    #[test]
+    fn a_machine_with_no_overlay_is_untouched() {
+        let spec = InstanceSpec {
+            id: "i-2".into(),
+            name: "gpu-2".into(),
+            lifecycle: omnuv_protocol::Lifecycle::Running,
+            vcpus: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            ..Default::default()
+        };
+        let ci = cloud_init(&spec, None);
+        assert!(!ci.contains("netbird"));
+        let _: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
+    }
+
     #[test]
     fn cloud_init_is_valid_yaml() {
         let ci = cloud_init(&spec_with_network(), None);
