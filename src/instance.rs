@@ -148,13 +148,28 @@ exit 1"#;
 /// reach the overlay still boots, still holds its provider-local address, and
 /// still answers its console. Refusing to start would turn a network problem
 /// into a dead machine, and the buyer can already see that it is unreachable.
+/// **Every runcmd fragment ends with a newline and none begins with one.**
+///
+/// This one led with `\n` and ended without, which is the same shape as the
+/// other convention and composes with nothing. On its own it looked right —
+/// the guest-agent entry above it already ends a line — and the moment a
+/// second fragment followed it, that fragment landed on this one's line:
+///
+///     - [ sh, -c, "netbird up … || true" ]  - |
+///
+/// and cloud-init rejected **the whole document**: *"sequence entries are not
+/// allowed here"*, then *"Unexpected failure parsing userdata"*, then
+/// `modules:final` finishing in 0.06 s having run nothing. The machine booted,
+/// answered its console, reported RUNNING, and had no networking and no
+/// enrolment — which is the first entry in `fixed.md`, met again from the
+/// other direction.
 fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment) -> String {
     let hostname = o.hostname.clone().unwrap_or_default();
     let host_arg =
         if hostname.is_empty() { String::new() } else { format!(" --hostname {hostname}") };
     format!(
-        "\n  - [ sh, -c, \"netbird up --management-url {url} --setup-key {key}{host_arg} \
-         >/var/log/onv-overlay.log 2>&1 || true\" ]",
+        "  - [ sh, -c, \"netbird up --management-url {url} --setup-key {key}{host_arg} \
+         >/var/log/onv-overlay.log 2>&1 || true\" ]\n",
         url = o.management_url,
         key = o.setup_key,
     )
@@ -1071,6 +1086,69 @@ mod tests {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode("nvidia")[..6].to_string()
         }) || true);
+    }
+
+    /// **A machine with a network *and* an enrolment**, which is every real
+    /// buyer machine and was the one combination no fixture had.
+    ///
+    /// `spec_with_network` has no overlay and
+    /// `an_enrolled_machine_still_produces_valid_cloud_init` has no network, so
+    /// each fragment was only ever generated as the last one in the document.
+    /// The `runcmd` newline bug lived in exactly the gap between them: it
+    /// needed a fragment *after* the enrolment to show itself, and cloud-init
+    /// then rejected the whole config on a real machine.
+    fn spec_enrolled_on_a_network() -> InstanceSpec {
+        InstanceSpec {
+            overlay: Some(omnuv_protocol::OverlayEnrolment {
+                setup_key: "0E38B183-B8B6-45CE-B93B-2EF63F3D14E4".into(),
+                management_url: "https://api.omnuv.com:8443".into(),
+                hostname: Some("onv-gpu-1-01509af7".into()),
+            }),
+            ..spec_with_network()
+        }
+    }
+
+    /// The test that would have caught it: parse as YAML, and require that
+    /// `runcmd` is a list whose entries are separate entries.
+    #[test]
+    fn an_enrolled_machine_on_a_network_is_still_valid_yaml() {
+        let ci = cloud_init(&spec_enrolled_on_a_network(), None);
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&ci).expect("cloud-init must be valid YAML");
+        let run = doc.get("runcmd").expect("has runcmd");
+        let seq = run.as_sequence().expect("runcmd is a list");
+        // Guest agent, enrolment, network — three separate entries. Two would
+        // mean one had been folded into another's line, which is exactly what
+        // cloud-init refused with "sequence entries are not allowed here".
+        assert!(seq.len() >= 3, "runcmd has {} entries, expected at least 3", seq.len());
+        let joined = serde_yaml_ng::to_string(run).unwrap();
+        assert!(joined.contains("netbird up"), "the machine must enrol itself");
+        assert!(joined.contains("networkctl reconfigure"), "and rebind its marketplace NIC");
+        // No entry carries the start of another.
+        for e in seq {
+            let text = e.as_str().map(str::to_string).unwrap_or_else(|| {
+                e.as_sequence()
+                    .map(|v| v.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default()
+            });
+            assert!(!text.contains("\" ]  "), "an entry swallowed the next one: {text}");
+        }
+    }
+
+    /// And the shape rule the bug broke, asserted directly on the fragments
+    /// rather than on the document they compose into — because a fragment is
+    /// only ever wrong in the presence of the next one.
+    #[test]
+    fn every_runcmd_fragment_ends_a_line_and_starts_none() {
+        let o = omnuv_protocol::OverlayEnrolment {
+            setup_key: "k".into(),
+            management_url: "https://example.invalid".into(),
+            hostname: None,
+        };
+        for (what, frag) in [("overlay", overlay_runcmd(&o))] {
+            assert!(frag.ends_with('\n'), "{what} fragment does not end a line");
+            assert!(!frag.starts_with('\n'), "{what} fragment starts a line it did not open");
+        }
     }
 
     fn spec_with_network() -> InstanceSpec {
