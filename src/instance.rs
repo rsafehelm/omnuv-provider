@@ -309,7 +309,7 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: {lock}
-    ssh_authorized_keys:
+{hashed}    ssh_authorized_keys:
 {nested}
 # Applies to the default user.
 ssh_authorized_keys:
@@ -340,18 +340,32 @@ runcmd:
         // A password is only usable when the account is not locked; without
         // one, the account stays key-only as before.
         lock = if spec.console_password_hash.is_some() { "false" } else { "true" },
-        // The console password, as its crypt(3) hash: the plaintext was shown
-        // to the buyer once and is not in this file. SSH stays key-only.
-        password = spec
+        // **The hash goes on the user entry, not in a `chpasswd` block.**
+        //
+        // It was in `chpasswd`, and cloud-init said so on every machine:
+        //
+        //     Not unlocking password for user omnuv. 'lock_passwd: false'
+        //     present in user-data but no 'passwd'/'plain_text_passwd'/
+        //     'hashed_passwd' provided in user-data
+        //
+        // `cc_users_groups` creates the account in the *init* stage and will
+        // not unlock it without a hash it can see there; `chpasswd` runs later,
+        // in `modules:config`. So the account was created locked, and whether
+        // the console password worked afterwards depended on a second module
+        // undoing the first — which is not a thing to leave a buyer's only
+        // out-of-band access resting on.
+        //
+        // `hashed_passwd` on the user entry is what the warning asks for, and
+        // it does not expire the password the way `chpasswd` defaults to.
+        hashed = spec
             .console_password_hash
             .as_deref()
-            .map(|hash| {
-                format!(
-                    "chpasswd:\n  expire: false\n  users:\n    - name: {}\n      password: \"{hash}\"\n      type: hash\nssh_pwauth: false\n",
-                    spec.image.default_user
-                )
-            })
+            .map(|hash| format!("    hashed_passwd: \"{hash}\"\n"))
             .unwrap_or_default(),
+        // SSH stays key-only regardless. The console password is for the
+        // console, and a machine that accepted it over SSH would be a machine
+        // whose one-time password is an internet-facing credential.
+        password = if spec.console_password_hash.is_some() { "ssh_pwauth: false\n" } else { "" },
         nested = render("      "),
         top = render("  "),
         network = spec.network.as_ref().map(private_network).unwrap_or_default(),
@@ -1252,9 +1266,19 @@ echo 'single' "double" `backtick` \$escaped
         // unlocked for it, and SSH stays key-only.
         assert!(ci.contains("- name: omnuv\n    sudo:"));
         assert!(ci.contains("lock_passwd: false"));
-        assert!(ci.contains("password: \"$6$rounds=10000$"));
-        assert!(ci.contains("type: hash"));
         assert!(ci.contains("ssh_pwauth: false"));
+        // **On the user entry, where `cc_users_groups` can see it.** In a
+        // `chpasswd` block cloud-init created the account locked and warned
+        // "no 'hashed_passwd' provided in user-data", leaving the buyer's only
+        // out-of-band access resting on a later module undoing the first.
+        let users = ci.find("- name: omnuv").expect("the image user");
+        let after = ci.find("ssh_authorized_keys:").expect("its keys");
+        let entry = &ci[users..after];
+        assert!(
+            entry.contains("hashed_passwd: \"$6$rounds=10000$"),
+            "the hash must be on the user entry, not in a later module: {entry}"
+        );
+        assert!(!ci.contains("chpasswd"), "chpasswd creates the account locked first");
         // **Nothing points at a `.1` any more.** Protocol 4 removed the
         // gateway, and this is the assertion that it cannot come back by
         // accident: a route through a deleted machine, or a resolver at one,
