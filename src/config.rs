@@ -250,10 +250,25 @@ impl ProxmoxRuntime {
     /// Image ids reported with the inventory, so the scheduler never places
     /// an image on a provider that cannot build it.
     pub fn offered_images(&self) -> Vec<String> {
+        self.image_map().into_keys().collect()
+    }
+
+    /// The same thing `template_for` and `offered_images` answer, as a map —
+    /// which is what mirroring needs, because it has to know *where* to put
+    /// each image as well as which ones are wanted.
+    ///
+    /// The empty-map fallback lives here once rather than in each caller: a
+    /// provider that has written no `images` offers the shipped Linux image
+    /// from `template_vmid`, and that default is a property of the config, not
+    /// of whoever is reading it.
+    pub fn image_map(&self) -> std::collections::BTreeMap<String, u32> {
         if self.images.is_empty() {
-            return vec![DEFAULT_IMAGE.to_string()];
+            return std::collections::BTreeMap::from([(
+                DEFAULT_IMAGE.to_string(),
+                self.template_vmid,
+            )]);
         }
-        self.images.keys().cloned().collect()
+        self.images.clone()
     }
 }
 

@@ -3,6 +3,7 @@ mod agent;
 mod audit;
 mod config;
 mod gateway;
+mod images;
 mod instance;
 mod join;
 mod diagnostics;

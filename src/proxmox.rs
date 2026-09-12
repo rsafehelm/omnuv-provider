@@ -136,6 +136,12 @@ pub struct Client {
     /// Whether this provider has opted in to disclosing what its host has
     /// already given its own guests. See `config::ProxmoxRuntime::showall`.
     showall: bool,
+    /// Marketplace image id -> the template vmid holding it on this host.
+    ///
+    /// Set separately rather than through `new`, which already takes ten
+    /// arguments; and empty is a working default, meaning a provider that
+    /// offers no images and reports holding none.
+    images: std::collections::BTreeMap<String, u32>,
 }
 
 impl ComputeDriver for Client {
@@ -186,7 +192,14 @@ impl Client {
             city,
             apt_mirror,
             showall,
+            images: Default::default(),
         })
+    }
+
+    /// The images this provider offers, and where each one lives locally.
+    pub fn with_images(mut self, images: std::collections::BTreeMap<String, u32>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Development-inventory constructor, used by the `discover` debug command.
@@ -550,12 +563,24 @@ impl Client {
             anyhow::bail!("no usable nodes found");
         }
 
+        // Read out of the templates themselves, never remembered from having
+        // mirrored them: a template destroyed since the last fetch must stop
+        // being advertised, and only observation can notice that.
+        //
+        // One node's worth. Every provider we run is single-node, and
+        // `HeldImage` carries no node of its own, so a genuine cluster needs
+        // the protocol to say *where* before this can honestly answer for more
+        // than the node the agent was pointed at.
+        let held_images = match nodes.first() {
+            Some(n) => {
+                let node = self.node.clone().unwrap_or_else(|| n.local_id.clone());
+                crate::images::held(self, &node, &self.images).await
+            }
+            None => Vec::new(),
+        };
+
         Ok(InventoryReport {
-            // Not yet reported. The catalogue's other half — the agent mirroring
-            // published images and saying which digests it actually holds — is
-            // still to be built, and an empty list is read by Core as "this
-            // agent does not report digests" rather than "it holds nothing".
-            held_images: Vec::new(),
+            held_images,
             protocol_version: omnuv_protocol::PROTOCOL_VERSION,
             runtime: RuntimeKind::Proxmox,
             // Filled in by the agent from its own image map before reporting.

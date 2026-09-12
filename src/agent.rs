@@ -70,6 +70,72 @@ impl Core {
         Ok(res.json().await?)
     }
 
+    /// Streams a published image artefact to `dest`, hashing as the bytes
+    /// arrive, and refusing to keep anything that does not match.
+    ///
+    /// **Never into memory.** These are several gigabytes and a `Vec<u8>` of
+    /// one is how an agent dies on a provider's smallest node — the same
+    /// reason Core streams it out rather than reading it in.
+    ///
+    /// The partial file is called `<id>.part` on purpose. Proxmox only treats
+    /// `import/<name>.(ova|ovf|qcow2|raw|vmdk)` as a volume, so a download
+    /// that is interrupted, or one whose digest is wrong, is not something the
+    /// hypervisor can be asked to import even by mistake.
+    async fn download_artefact(
+        &self,
+        a: &omnuv_protocol::ImageArtefact,
+        dest: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt as _;
+        use sha2::Digest as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let part = dest.with_extension("part");
+        let res = self
+            .http
+            .get(&a.url)
+            .bearer_auth(&self.token)
+            // Deliberately long, and not the 30 seconds every other call uses:
+            // a 6 GB transfer over a provider's uplink is not a hung request,
+            // and killing it at 30 seconds would mean no image ever arrives.
+            .timeout(std::time::Duration::from_secs(6 * 3600))
+            .send()
+            .await?;
+        anyhow::ensure!(res.status().is_success(), "GET {}: {}", a.url, res.status());
+
+        if let Some(parent) = part.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut f = tokio::fs::File::create(&part).await?;
+        let mut hasher = sha2::Sha256::new();
+        let mut written: u64 = 0;
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            written += chunk.len() as u64;
+            f.write_all(&chunk).await?;
+        }
+        f.flush().await?;
+        drop(f);
+
+        let got = crate::images::hex(&hasher.finalize());
+        if got != a.sha256 || written != a.bytes {
+            // Removed, not kept for inspection: a file that is nearly right is
+            // the most dangerous thing in this directory.
+            let _ = tokio::fs::remove_file(&part).await;
+            anyhow::bail!(
+                "{}: the marketplace published {} bytes sha256 {}; {written} bytes sha256 {got} \
+                 arrived. Not imported.",
+                a.id,
+                a.bytes,
+                a.sha256
+            );
+        }
+        tokio::fs::rename(&part, dest).await?;
+        Ok(())
+    }
+
     async fn post(&self, path: &str, body: Option<serde_json::Value>) -> anyhow::Result<reqwest::Response> {
         let mut req = self
             .http
@@ -145,7 +211,8 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         cfg.proxmox.city.clone(),
         cfg.proxmox.apt_mirror.clone(),
         cfg.proxmox.showall,
-    )?);
+    )?
+    .with_images(cfg.proxmox.image_map()));
     let core = Core::new(&cfg.core.url, &cfg.core.token)?;
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
@@ -305,6 +372,95 @@ async fn report_inventory(core: &Core, driver: &impl ComputeDriver, offered_imag
     Ok(())
 }
 
+/// Fetches every published image this provider offers and does not hold.
+///
+/// The order matters and is the whole contract: **download, verify, then
+/// import**. A digest checked after the import would be a digest checked after
+/// a buyer could already have been given a machine built from the wrong bytes.
+///
+/// Nothing here is compulsory. The catalogue is what the marketplace
+/// publishes, not an instruction: an image this provider does not offer is
+/// skipped, and disk and bandwidth are the provider's own operational cost —
+/// fewer images simply means fewer opportunities to earn.
+async fn mirror_images(
+    core: &Core,
+    driver: &proxmox::Client,
+    cfg: &AgentConfig,
+    node: &str,
+    catalogue: &[omnuv_protocol::ImageArtefact],
+) -> anyhow::Result<()> {
+    let offered = cfg.proxmox.image_map();
+    let held = crate::images::held(driver, node, &offered).await;
+    let wanted = crate::images::outstanding(catalogue, &offered, &held);
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    // The storage the artefact is *staged* in, which is not the storage the
+    // disk ends up on. It has to be one Proxmox knows, with `import` content,
+    // because the agent's token deliberately lacks `Sys.Modify` and PVE refuses
+    // an arbitrary path to anyone but root@pam.
+    let import_storage = crate::names::STORAGE_SNIPPETS;
+    let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
+    let dir = std::path::Path::new(&cfg.proxmox.snippet_dir)
+        .parent()
+        .unwrap_or(std::path::Path::new(crate::names::VAR))
+        .join("import");
+
+    for (artefact, vmid) in wanted {
+        let dest = dir.join(crate::images::artefact_file(&artefact.id));
+        crate::audit::record("image.mirror", "core", &artefact.id, "fetching", None);
+
+        if let Err(e) = core.download_artefact(artefact, &dest).await {
+            crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
+            eprintln!("image {}: {e}", artefact.id);
+            continue;
+        }
+
+        // Hashed again, from the file, because the check above proves the
+        // transfer was clean and this proves the thing about to be imported is
+        // still that file.
+        match crate::images::digest_of_file(&dest) {
+            Ok(d) if d == artefact.sha256 => {}
+            Ok(d) => {
+                let _ = std::fs::remove_file(&dest);
+                eprintln!("image {}: on-disk digest {d} is not {}", artefact.id, artefact.sha256);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("image {}: cannot read back what was written: {e}", artefact.id);
+                continue;
+            }
+        }
+
+        match crate::images::import(
+            driver,
+            node,
+            storage,
+            import_storage,
+            &artefact.id,
+            vmid,
+            &artefact.sha256,
+        )
+        .await
+        {
+            Ok(()) => {
+                crate::audit::record("image.mirror", "core", &artefact.id, "held", Some(&vmid.to_string()));
+                eprintln!("image {} imported as template {vmid}", artefact.id);
+                // The staged copy is several gigabytes and Proxmox has now
+                // converted it onto the storage. Keeping it would cost a
+                // provider its disk twice for the same image.
+                let _ = std::fs::remove_file(&dest);
+            }
+            Err(e) => {
+                crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
+                eprintln!("image {}: import failed: {e}", artefact.id);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Converges the provider toward Core's desired state, then reports what is
 /// actually true. This runs on every tick rather than on an event, so a missed
 /// message or an agent restart cannot leave the two sides diverged.
@@ -388,6 +544,22 @@ async fn reconcile_workers(
         }
         fetched
     };
+
+    // **Before the early return below, deliberately.** A provider with nothing
+    // running is precisely the provider that should be fetching images: it has
+    // no work to do and everything to prepare. Put this after the "nothing to
+    // reconcile" shortcut and a fresh provider would mirror nothing until its
+    // first machine was placed on it — which is the one moment the download
+    // needs to have already happened.
+    //
+    // Failures are logged, not propagated. An image that will not download is
+    // a provider with fewer things it can earn from; it is not a reason to
+    // stop converging the machines it already has.
+    if !desired.images.is_empty()
+        && let Err(e) = mirror_images(core, driver, cfg, node, &desired.images).await
+    {
+        eprintln!("image mirror: {e}");
+    }
 
     if desired.inference_workers.is_empty()
         && desired.instances.is_empty()

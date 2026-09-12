@@ -23,7 +23,11 @@ case "$1" in
     chown root:onv /etc/onv
     chmod 0750 /etc/onv
 
-    for d in /var/lib/onv /var/log/onv; do
+    # `import` is where a mirrored image artefact lands before Proxmox takes
+    # it: several gigabytes, written by the agent, referenced as a volume in a
+    # storage of content type `import` because the agent's hypervisor token
+    # deliberately lacks the privilege to name an arbitrary path.
+    for d in /var/lib/onv /var/log/onv /var/lib/onv/snippets /var/lib/onv/import; do
         mkdir -p "$d"
         chown onv:onv "$d"
     done
