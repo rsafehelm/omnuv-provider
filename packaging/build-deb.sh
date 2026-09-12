@@ -16,9 +16,22 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # passed on the command line would produce a package whose number disagreed with
 # what the running agent says it is — which is precisely the number the runtime
 # compatibility profiles are written against.
-VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
-if [ -n "${1:-}" ] && [ "$1" != "$VERSION" ]; then
-    echo "Cargo.toml says $VERSION, not $1. Bump the crate version instead." >&2
+CRATE="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+# **The version has to move when the bytes move.** The crate version does not
+# change between iterations, so two different binaries called themselves the
+# same thing and `apt` — which decides by version — installed neither. On 12
+# September that meant a fix was built, committed, deployed to both providers,
+# and the failure reproduced exactly, because what reached the hosts was the
+# package from an hour before.
+#
+# `+g<sha>` is a Debian-legal suffix that sorts above the bare version, and
+# `git describe --dirty` appends `-dirty` when the tree is not clean — so a
+# package built from uncommitted work is distinguishable too, rather than
+# silently identical to the commit it came from.
+BUILD="$(cd "$ROOT" && git describe --always --dirty --abbrev=7 2>/dev/null || echo unknown)"
+VERSION="${CRATE}+g${BUILD}"
+if [ -n "${1:-}" ] && [ "$1" != "$CRATE" ] && [ "$1" != "$VERSION" ]; then
+    echo "Cargo.toml says $CRATE (package $VERSION), not $1." >&2
     exit 2
 fi
 OUT="$ROOT/dist"
@@ -31,7 +44,7 @@ echo "onv-provider $VERSION ($ARCH)"
 # the agent speaks TLS through rustls rather than the system OpenSSL, so the
 # only real link is glibc.
 docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
-    -w /w rust:1.98 cargo build --release --quiet
+    -e OMNUV_BUILD="$VERSION" -w /w rust:1.98 cargo build --release --quiet
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
@@ -70,5 +83,10 @@ docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -c "
     fakeroot dpkg-deb --build .deb onv-provider_${VERSION}_${ARCH}.deb
     rm -rf /out/.deb
 " >/dev/null
+
+# A stable name for the deploy to install, beside the versioned one it keeps.
+# The play cannot guess `+g<sha>`, and hard-coding a version there would be the
+# same one-definition-in-two-places mistake that produced this bug.
+cp "$OUT/onv-provider_${VERSION}_${ARCH}.deb" "$OUT/onv-provider_current_${ARCH}.deb"
 
 echo "  $(basename "$OUT")/onv-provider_${VERSION}_${ARCH}.deb"

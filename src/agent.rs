@@ -16,7 +16,23 @@ use crate::config::AgentConfig;
 use crate::driver::ComputeDriver;
 use crate::proxmox;
 
-const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// What this agent tells Core it is.
+///
+/// **The crate version plus the commit it was built from**, because the crate
+/// version alone does not move between iterations and two different binaries
+/// then call themselves the same thing. On 12 September that stopped a fix
+/// reaching either provider: the package carried the same `0.5.0` as the one
+/// already installed, apt saw nothing to do, and the play reported success
+/// while both hosts went on running the previous binary.
+///
+/// `OMNUV_BUILD` is set by `packaging/build-deb.sh` from `git describe`, so it
+/// carries the commit and a `-dirty` marker when the tree was not clean. An
+/// ordinary `cargo build` sets nothing and this reads as the bare crate
+/// version, which is the honest answer for a binary nobody packaged.
+const AGENT_VERSION: &str = match option_env!("OMNUV_BUILD") {
+    Some(b) => b,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 struct Core {
     http: reqwest::Client,
