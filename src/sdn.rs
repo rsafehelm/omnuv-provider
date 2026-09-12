@@ -62,6 +62,74 @@ impl Client {
         anyhow::bail!("segment {vnet} not up on {node} after applying")
     }
 
+    /// Removes any segment of ours on this node that no machine is attached to.
+    ///
+    /// **Nothing else deletes them any more.** A project segment used to be
+    /// created and destroyed as a side effect of the per-provider gateway;
+    /// topology v2 stopped Core asking for gateways, so both halves fell away.
+    /// The creating half now lives with the machine that needs it, and this is
+    /// the other half: a buyer who deletes their last machine on a provider
+    /// should not leave a bridge behind there, and deleting the network in the
+    /// marketplace should not leave one either.
+    ///
+    /// **Attachment is read from every VM's configuration, not from what is
+    /// running.** A stopped machine still owns its segment, and reaping one
+    /// out from under it would leave a VM that cannot start.
+    ///
+    /// Only vnets in the marketplace's own zone, and never the NAT bridge:
+    /// `onat0` is host configuration that every buyer machine's first
+    /// interface sits on, and it belongs to no project.
+    pub(crate) async fn reap_unused_segments(&self, node: &str) -> anyhow::Result<usize> {
+        let vnets: Vec<serde_json::Value> = self.get_json("/cluster/sdn/vnets?pending=1").await?;
+        let ours: Vec<String> = vnets
+            .iter()
+            .filter(|v| v["zone"] == ZONE)
+            .filter_map(|v| v["vnet"].as_str().map(str::to_string))
+            .filter(|v| v != crate::names::NAT_VNET)
+            .collect();
+        if ours.is_empty() {
+            return Ok(0);
+        }
+
+        // Every bridge any VM on this node references, running or stopped.
+        let vms: Vec<serde_json::Value> = self.get_json(&format!("/nodes/{node}/qemu")).await?;
+        let mut used: std::collections::BTreeSet<String> = Default::default();
+        for vm in &vms {
+            let Some(vmid) = vm["vmid"].as_u64() else { continue };
+            let Ok(cfg) = self
+                .get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"))
+                .await
+            else {
+                // Unreadable is not unused. Skipping the whole reap is the
+                // safe direction: a bridge left behind costs nothing, and one
+                // removed from under a machine costs that machine.
+                return Ok(0);
+            };
+            if let Some(obj) = cfg.as_object() {
+                for (k, v) in obj {
+                    if k.starts_with("net")
+                        && let Some(s) = v.as_str()
+                        && let Some(b) = s.split(',').find_map(|kv| kv.strip_prefix("bridge="))
+                    {
+                        used.insert(b.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut removed = 0;
+        for v in ours.iter().filter(|v| !used.contains(*v)) {
+            match self.delete_vnet(node, v).await {
+                Ok(()) => {
+                    crate::audit::record("segment.reap", "agent", v, "removed", None);
+                    removed += 1;
+                }
+                Err(e) => eprintln!("segment {v}: not removed: {e}"),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Removes the segment and applies. Nothing to do when it is already gone.
     pub(crate) async fn delete_vnet(&self, node: &str, vnet: &str) -> anyhow::Result<()> {
         let vnets: Vec<serde_json::Value> = self.get_json("/cluster/sdn/vnets?pending=1").await?;

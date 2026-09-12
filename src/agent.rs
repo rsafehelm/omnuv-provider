@@ -597,6 +597,17 @@ async fn reconcile_workers(
         eprintln!("image mirror: {e}");
     }
 
+    // Segments whose last machine has gone. Before the early return below,
+    // for the same reason the image mirror is: a provider with nothing running
+    // is exactly the provider that has bridges left over, and putting this
+    // after the shortcut would mean they are only ever cleaned while something
+    // else is happening.
+    match driver.reap_unused_segments(node).await {
+        Ok(0) => {}
+        Ok(n) => eprintln!("removed {n} unused segment(s)"),
+        Err(e) => eprintln!("segment reap: {e}"),
+    }
+
     if desired.inference_workers.is_empty()
         && desired.instances.is_empty()
         && desired.gateways.is_empty()
