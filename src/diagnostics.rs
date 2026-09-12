@@ -150,7 +150,7 @@ mod tests {
         let cfg = serde_json::json!({
             "hostpci0": "0000:21:00,pcie=1,rombar=0",
             "scsi0": "local-lvm:vm-105-disk-0,size=120G",
-            "name": "omnuv-worker-x",
+            "name": "onv-worker-x",
         });
         let d = build("pve", None, Some(&cfg), None, None);
         assert_eq!(d.pci, vec!["0000:21:00".to_string()]);

@@ -34,7 +34,7 @@ pub(crate) struct VmRef {
 /// Verified on hardware against an RTX 3090 that was its host's boot display:
 /// with the ROM bar hidden the guest's driver loads and `nvidia-smi` lists it.
 pub(crate) fn mapping_name(pci: &str) -> String {
-    format!("omnuv-gpu-{}", pci.replace([':', '.'], "-"))
+    crate::names::gpu_mapping(pci)
 }
 
 /// cloud-init that brings up the NVIDIA stack and serves the model.
@@ -78,7 +78,7 @@ bootcmd:
   - [ bash, -c, "echo {args_b64} | base64 -d > /etc/onv/vllm.args" ]
   - [ bash, -c, "echo {image_b64} | base64 -d > /etc/onv/vllm.image" ]
 write_files:
-  - path: /usr/local/bin/omnuv-serve
+  - path: /usr/local/bin/onv-serve
     permissions: '0755'
     content: |
       #!/bin/bash
@@ -141,7 +141,7 @@ write_files:
       ExecStartPre=-/usr/bin/docker rm -f onv-vllm
       # Reads image and arguments from disk at start, so changing them is a
       # reboot rather than a rebuild that re-downloads the model.
-      ExecStart=/usr/local/bin/omnuv-serve
+      ExecStart=/usr/local/bin/onv-serve
       ExecStop=/usr/bin/docker stop onv-vllm
 
       [Install]
@@ -314,7 +314,7 @@ impl Client {
         }
 
         // Snippet must exist before the VM references it.
-        let file = format!("omnuv-{}.yaml", spec.id);
+        let file = crate::names::snippet_worker(&spec.id);
         std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec, core_url))
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
@@ -325,7 +325,7 @@ impl Client {
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
                 &[
                     ("newid".to_string(), vmid.to_string()),
-                    ("name".to_string(), format!("omnuv-worker-{}", &spec.id[..8])),
+                    ("name".to_string(), crate::names::worker(&spec.id)),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // Into the marketplace's own pool, where the file-read
@@ -350,7 +350,7 @@ impl Client {
             ("ipconfig0".into(), "ip=dhcp".into()),
             ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
-            ("description".into(), format!("Omnuv inference worker {}\nManaged by omnuv-provider. Do not edit.", spec.id)),
+            ("description".into(), format!("Omnuv inference worker {}\nManaged by onv-provider. Do not edit.", spec.id)),
         ];
         // Mappings rather than raw addresses: a non-root token may only attach
         // a device the host has explicitly published.
@@ -548,7 +548,7 @@ fn worker_state(running: bool, has_address: bool, serving: bool) -> WorkerState 
 /// association. Collisions are implausible at POC scale and would only ever
 /// affect this agent's own VMs.
 fn short_tag(worker_id: &str) -> String {
-    format!("omnuv-{}", worker_id.replace('-', "").chars().take(12).collect::<String>())
+    crate::names::short_tag(worker_id)
 }
 
 #[cfg(test)]
@@ -584,7 +584,7 @@ mod tests {
         // {"image":0,"video":0} before docker saw it.
         assert!(ci.contains("mapfile -t ARGS < /etc/onv/vllm.args"));
         assert!(ci.contains("\"${ARGS[@]}\""));
-        assert!(ci.contains("ExecStart=/usr/local/bin/omnuv-serve"));
+        assert!(ci.contains("ExecStart=/usr/local/bin/onv-serve"));
         // The arguments must be base64, never shell-quoted text in the unit.
         assert!(!ci.contains("--max-model-len"), "args leaked into the unit in plain text");
 
@@ -614,15 +614,15 @@ mod tests {
 
     #[test]
     fn maps_pci_addresses_to_published_mapping_names() {
-        assert_eq!(mapping_name("0000:21:00.0"), "omnuv-gpu-0000-21-00-0");
-        assert_eq!(mapping_name("0000:5d:00.0"), "omnuv-gpu-0000-5d-00-0");
+        assert_eq!(mapping_name("0000:21:00.0"), "onv-gpu-0000-21-00-0");
+        assert_eq!(mapping_name("0000:5d:00.0"), "onv-gpu-0000-5d-00-0");
     }
 
     #[test]
     fn short_tag_is_stable_and_tag_safe() {
         let t = short_tag("b48aedfb-205d-42fd-a6d3-3deafaeae938");
-        assert_eq!(t, "omnuv-b48aedfb205d");
-        assert!(!t.contains('-') || t.starts_with("omnuv-"));
+        assert_eq!(t, "onv-b48aedfb205d");
+        assert!(!t.contains('-') || t.starts_with("onv-"));
         assert!(t.len() <= 20);
     }
 }

@@ -75,7 +75,7 @@ pub(crate) fn resolve_dev(mac: &str) -> String {
 
 
 pub(crate) fn short_tag(id: &str) -> String {
-    format!("omnuv-{}", id.replace('-', "").chars().take(12).collect::<String>())
+    crate::names::short_tag(id)
 }
 
 /// Where a recipe's compose file lives in the machine.
@@ -484,7 +484,7 @@ impl Client {
                         node,
                         vm.vmid,
                         snippet_dir,
-                        &format!("omnuv-instance-{}.yaml", spec.id),
+                        &crate::names::snippet_instance(&spec.id),
                         &cloud_init(spec, self.apt_mirror.as_deref()),
                     )
                     .await
@@ -590,7 +590,7 @@ impl Client {
                 spec.image.id
             ),
         };
-        let file = format!("omnuv-instance-{}.yaml", spec.id);
+        let file = crate::names::snippet_instance(&spec.id);
         std::fs::write(format!("{snippet_dir}/{file}"), user_data)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
@@ -602,7 +602,7 @@ impl Client {
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
                 &[
                     ("newid".to_string(), vmid.to_string()),
-                    ("name".to_string(), format!("omnuv-{}", spec.name)),
+                    ("name".to_string(), crate::names::instance(&spec.name)),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // The pool that carries the console grant; only machines
@@ -628,7 +628,7 @@ impl Client {
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
             (
                 "description".into(),
-                format!("Omnuv instance {}\nManaged by omnuv-provider. Do not edit.", spec.id),
+                format!("Omnuv instance {}\nManaged by onv-provider. Do not edit.", spec.id),
             ),
         ];
         let mut config = config;
@@ -785,7 +785,7 @@ impl Client {
         // Removed first, and best-effort: a snippet left behind must never stop
         // a machine being deleted, because a VM that outlives its delete is far
         // worse than a file that does.
-        let snippet = format!("{snippet_dir}/omnuv-instance-{id}.yaml");
+        let snippet = format!("{snippet_dir}/{}", crate::names::snippet_instance(id));
         if let Err(e) = std::fs::remove_file(&snippet)
             && e.kind() != std::io::ErrorKind::NotFound
         {

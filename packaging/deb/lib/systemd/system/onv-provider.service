@@ -28,10 +28,14 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ReadWritePaths=/var/lib/onv /var/log/onv
-# The audit log is the provider's own record of what Core asked this machine to
-# do. It survives restarts and is readable without Omnuv's help.
-LogsDirectory=onv
-LogsDirectoryMode=0755
+# **The audit log directory is not declared here**, and that is deliberate.
+# `LogsDirectory=` makes systemd create and then *re-chown* the path at every
+# start, to the service's own User and Group — so it fought the bootstrap,
+# which sets `onv:adm` 0750 so an operator can read the provider's own record
+# without being root. Each reset the other on every run, forever, and neither
+# was wrong on its own.
+#
+# The bootstrap owns the path; this only needs to be allowed to write to it.
 StateDirectory=onv
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

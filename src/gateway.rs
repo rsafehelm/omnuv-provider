@@ -153,7 +153,7 @@ iptables -t mangle -C INPUT -i wt0 ! -d 10.200.0.0/13 -j DROP 2>/dev/null || ipt
 fn fence_script(mac: &str) -> String {
     format!(
         "#!/bin/sh\n\
-         # Managed by omnuv-provider; re-run on a timer. Do not edit.\n\
+         # Managed by onv-provider; re-run on a timer. Do not edit.\n\
          {resolve}\n\
          [ -n \"$DEV\" ] || exit 0\n\
          sysctl -qw net.ipv4.ip_forward=1\n\
@@ -226,15 +226,15 @@ fn cloud_init(spec: &GatewaySpec) -> String {
     # report needs, and far short of the unrestricted exec that running a
     # command in here would require. /run is tmpfs, so a stale file cannot
     # outlive a reboot and pretend to be current.
-    printf '#!/bin/sh\nmkdir -p /run/onv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route; echo ---; netbird status --json ) > /run/onv/gateway-status.txt.new 2>&1\nmv /run/onv/gateway-status.txt.new /run/onv/gateway-status.txt\n' > /usr/local/sbin/omnuv-gateway-selfcheck
-    chmod 0755 /usr/local/sbin/omnuv-gateway-selfcheck
-    printf '[Unit]\nDescription=Report what the Omnuv gateway can actually reach\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/omnuv-gateway-selfcheck\n' > /etc/systemd/system/omnuv-gateway-selfcheck.service
-    printf '[Unit]\nDescription=Keep the Onv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/omnuv-gateway-selfcheck.timer
+    printf '#!/bin/sh\nmkdir -p /run/onv\n( netbird status --detail; echo ---; ip -br addr; echo ---; ip -br route; echo ---; netbird status --json ) > /run/onv/gateway-status.txt.new 2>&1\nmv /run/onv/gateway-status.txt.new /run/onv/gateway-status.txt\n' > /usr/local/sbin/onv-gateway-selfcheck
+    chmod 0755 /usr/local/sbin/onv-gateway-selfcheck
+    printf '[Unit]\nDescription=Report what the Omnuv gateway can actually reach\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/onv-gateway-selfcheck\n' > /etc/systemd/system/onv-gateway-selfcheck.service
+    printf '[Unit]\nDescription=Keep the Onv gateway self-check current\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/onv-gateway-selfcheck.timer
     systemctl daemon-reload
     systemctl enable --now --no-block onv-gateway-fence.timer 2>/dev/null || true
-    systemctl enable --now --no-block omnuv-gateway-selfcheck.timer 2>/dev/null || true
+    systemctl enable --now --no-block onv-gateway-selfcheck.timer 2>/dev/null || true
     /usr/local/sbin/onv-gateway-fence || true
-    /usr/local/sbin/omnuv-gateway-selfcheck || true
+    /usr/local/sbin/onv-gateway-selfcheck || true
 "#,
             addr = addr,
             mac = crate::instance::marketplace_mac(&spec.id),
@@ -279,7 +279,7 @@ fn cloud_init(spec: &GatewaySpec) -> String {
 
     format!(
         "#cloud-config
-# Onv marketplace overlay gateway. Managed by omnuv-provider; do not edit.
+# Onv marketplace overlay gateway. Managed by onv-provider; do not edit.
 #
 # This VM is one buyer network's overlay peer on this provider. The hypervisor
 # never runs the overlay client, because a WireGuard interface writing routes
@@ -555,7 +555,7 @@ impl proxmox::Client {
                     "description".into(),
                     format!(
                         "Omnuv overlay gateway {}\nOne buyer network's overlay peer on this \
-                         provider; the host never runs it.\nManaged by omnuv-provider. Do not edit.",
+                         provider; the host never runs it.\nManaged by onv-provider. Do not edit.",
                         spec.id
                     ),
                 ),
@@ -645,7 +645,7 @@ fn hosts_file(records: &[omnuv_protocol::DnsRecord]) -> String {
     let mut lines: Vec<String> =
         records.iter().map(|r| format!("{} {}", r.address, r.name)).collect();
     lines.sort();
-    let mut out = String::from("# Managed by omnuv-provider; the marketplace owns these names.\n");
+    let mut out = String::from("# Managed by onv-provider; the marketplace owns these names.\n");
     for l in lines {
         out.push_str(&l);
         out.push('\n');

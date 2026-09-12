@@ -19,13 +19,13 @@ mod selfcheck;
 mod workload;
 
 const USAGE: &str = "\
-omnuv-provider - Omnuv Provider Agent
+onv-provider - Omnuv Provider Agent
 
 USAGE:
-    omnuv-provider join  --core <url> --token <token> [options]
-    omnuv-provider leave [--dry-run]
-    omnuv-provider agent [--config /etc/onv/agent.yaml]
-    omnuv-provider discover --provider <id> [--config <path>]
+    onv-provider join  --core <url> --token <token> [options]
+    onv-provider leave [--dry-run]
+    onv-provider agent [--config /etc/onv/agent.yaml]
+    onv-provider discover --provider <id> [--config <path>]
 
 JOIN OPTIONS:
     --region <name>       marketplace region                 (default eu-west)
@@ -46,7 +46,7 @@ a one-shot debugging command that prints a report instead of sending it.
 
 Prints a normalized InventoryReport as JSON on stdout. Pipe it into core:
 
-    omnuv-provider discover --provider my-proxmox | \\
+    onv-provider discover --provider my-proxmox | \\
         omnuv-core ingest --name my-proxmox --region eu-west
 
 Credentials come from the environment, named by the provider's tokenEnv entry.
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         let cfg = config::load_agent(&path)?;
         // Audit before anything else, so even a failed start is on the record.
         audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
-        eprintln!("omnuv-provider agent starting (config {path})");
+        eprintln!("onv-provider agent starting (config {path})");
         eprintln!("audit log policy: {}", audit::REDACTION_POLICY);
         return agent::run(cfg).await;
     }

@@ -1,4 +1,4 @@
-//! `omnuv-provider join` — onboarding, run by the provider on their own machine.
+//! `onv-provider join` — onboarding, run by the provider on their own machine.
 //!
 //! Phone-home: this dials Core outward and nothing ever dials back. Omnuv needs
 //! no SSH access, no inbound rule and no credentials for the hypervisor — the
@@ -101,7 +101,7 @@ fn step(label: &str, cmd: &str, dry: bool) -> anyhow::Result<String> {
 }
 
 pub fn run(a: JoinArgs) -> anyhow::Result<()> {
-    println!("omnuv-provider join");
+    println!("onv-provider join");
     println!("  core:   {}", a.core);
     println!("  region: {}", a.region);
     if a.dry_run {
@@ -264,7 +264,7 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         .join("\n");
 
     let config = format!(
-        r#"# Written by `omnuv-provider join`. Contains this machine's own Proxmox
+        r#"# Written by `onv-provider join`. Contains this machine's own Proxmox
 # credentials; they are never sent to Omnuv.
 core:
   url: "{core}"
@@ -296,30 +296,48 @@ proxmox:
         gpus = if gpus.is_empty() { "      []".to_string() } else { gpus },
     );
 
-    println!("\nWriting /etc/onv/agent.yaml (0640 root:omnuv)");
+    println!("\nWriting /etc/onv/agent.yaml (0640 root:onv)");
     if !a.dry_run {
         std::fs::create_dir_all("/etc/onv")?;
-        sh("id -u omnuv >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/onv --create-home onv")?;
+        // Checked and created under the *same* name. This asked for `omnuv`
+        // and created `onv`, so on a host that already had `omnuv` from an
+        // older install the check passed, nothing was created, and every
+        // `chgrp onv` after it failed on a user that did not exist.
+        sh(&format!(
+            "id -u {u} >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin \
+             --home-dir {var} --create-home {u}",
+            u = crate::names::PREFIX,
+            var = crate::names::VAR
+        ))?;
         std::fs::write("/etc/onv/agent.yaml", &config)?;
         sh("chgrp onv /etc/onv/agent.yaml && chmod 0640 /etc/onv/agent.yaml")?;
         sh("install -d -o onv -g onv /var/lib/onv/snippets /var/log/onv")?;
-        sh("pvesm status --storage omnuv-snippets >/dev/null 2>&1 || pvesm add dir omnuv-snippets --path /var/lib/onv --content snippets")?;
+        // `snippets,import`: the first is how generated cloud-init reaches a
+        // machine, the second is where a mirrored image artefact lands before
+        // Proxmox imports it. The agent's token may not name an arbitrary path,
+        // so an image can only arrive through a storage of that content type.
+        sh(&format!(
+            "pvesm status --storage {st} >/dev/null 2>&1 \
+             || pvesm add dir {st} --path {var} --content snippets,import",
+            st = crate::names::STORAGE_SNIPPETS,
+            var = crate::names::VAR
+        ))?;
     }
 
     // The package ships the unit and creates the service account. Writing our
     // own on top would mean two units for one service and an upgrade that
     // silently changes which one wins. Only a build installed by hand needs
     // this to write anything.
-    let packaged = std::path::Path::new("/lib/systemd/system/omnuv-provider.service").exists();
+    let packaged = std::path::Path::new("/lib/systemd/system/onv-provider.service").exists();
     println!(
         "\n{} the service",
         if packaged { "Starting" } else { "Installing and starting" }
     );
     if !a.dry_run {
         if !packaged {
-            std::fs::write("/etc/systemd/system/omnuv-provider.service", UNIT)?;
+            std::fs::write("/etc/systemd/system/onv-provider.service", UNIT)?;
         }
-        sh("systemctl daemon-reload && systemctl enable --now omnuv-provider")?;
+        sh("systemctl daemon-reload && systemctl enable --now onv-provider")?;
         audit::record("join.complete", "agent", &node, "ok", Some(&a.region));
     } else if packaged {
         println!("  (the installed package already provides the unit)");
@@ -328,8 +346,8 @@ proxmox:
     println!("\nDone. The agent now dials {} outward.", a.core);
     println!("Nothing listens on this machine, and Omnuv never connects to it.");
     println!("Audit log:  /var/log/onv/audit.log");
-    println!("Logs:       journalctl -u omnuv-provider -f");
-    println!("To leave:   omnuv-provider leave");
+    println!("Logs:       journalctl -u onv-provider -f");
+    println!("To leave:   onv-provider leave");
     Ok(())
 }
 
@@ -340,9 +358,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/omnuv-provider agent --config /etc/onv/agent.yaml
-User=omnuv
-Group=omnuv
+ExecStart=/usr/local/bin/onv-provider agent --config /etc/onv/agent.yaml
+User=onv
+Group=onv
 Restart=always
 RestartSec=10s
 
@@ -412,15 +430,33 @@ mod tests {
 /// Removes everything `join` created. A provider must be able to leave as
 /// easily as they joined, without asking us.
 pub fn leave(dry_run: bool) -> anyhow::Result<()> {
-    println!("omnuv-provider leave{}", if dry_run { " (dry run)" } else { "" });
+    println!("onv-provider leave{}", if dry_run { " (dry run)" } else { "" });
     for (label, cmd) in [
-        ("stop service", "systemctl disable --now omnuv-provider 2>/dev/null || true"),
-        ("remove unit", "rm -f /etc/systemd/system/omnuv-provider.service; systemctl daemon-reload"),
+        ("stop service", "systemctl disable --now onv-provider 2>/dev/null || true"),
+        ("remove unit", "rm -f /etc/systemd/system/onv-provider.service; systemctl daemon-reload"),
         ("remove token", "pveum user token remove onv@pve agent 2>/dev/null || true"),
         ("remove acl", "pveum acl delete / -token 'onv@pve!agent' -role OnvAgent 2>/dev/null || true; pveum acl delete / -user onv@pve -role OnvAgent 2>/dev/null || true"),
         ("remove user", "pveum user delete onv@pve 2>/dev/null || true"),
         ("remove role", "pveum role delete OnvAgent 2>/dev/null || true"),
         ("remove config", "rm -f /etc/onv/agent.yaml"),
+        ("remove storage", "pvesm remove onv-snippets 2>/dev/null || true"),
+        ("remove pools", "pveum pool delete onv-buyers 2>/dev/null || true; pveum pool delete onv 2>/dev/null || true"),
+        // **Two older generations, and they are not optional.** `join` created
+        // `omnuv-` names before 11 September and `omnu-` before that, and a
+        // rename that leaves the old object running is not a rename — it is a
+        // second copy nobody is looking at. A provider who joined last month
+        // and leaves today must end up with nothing of ours, not with nothing
+        // of this month's.
+        //
+        // The Proxmox `dir` storage is first on purpose: on 11 September
+        // `omnuv-snippets` recreated the directory it pointed at, a minute
+        // after that directory was deleted.
+        ("remove legacy storage", "pvesm remove omnuv-snippets 2>/dev/null || true; pvesm remove omnu-snippets 2>/dev/null || true"),
+        ("remove legacy units", "for u in omnuv-provider omnu-provider omnuv-egress omnu-egress; do systemctl disable --now $u 2>/dev/null || true; rm -f /etc/systemd/system/$u.service; done; systemctl daemon-reload"),
+        ("remove legacy identity", "for u in omnuv omnu; do pveum user token remove $u@pve agent 2>/dev/null || true; pveum user delete $u@pve 2>/dev/null || true; done; for r in OmnuvAgent OmnuAgent; do pveum role delete $r 2>/dev/null || true; done"),
+        ("remove legacy pools", "for p in omnuv-buyers omnuv omnu-buyers omnu; do pveum pool delete $p 2>/dev/null || true; done"),
+        ("remove legacy nftables", "for t in onv_egress omnuv_egress omnu_egress; do nft delete table inet $t 2>/dev/null || true; done"),
+        ("remove legacy config", "rm -rf /etc/omnuv /etc/omnu"),
     ] {
         println!("  {label}\n    $ {cmd}");
         if !dry_run {

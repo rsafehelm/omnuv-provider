@@ -91,6 +91,38 @@ pub fn instance(name: &str) -> String {
     format!("{PREFIX}-{name}")
 }
 
+/// A marketplace-owned worker's name on the hypervisor.
+pub fn worker(worker_id: &str) -> String {
+    format!("{PREFIX}-worker-{}", &worker_id[..worker_id.len().min(8)])
+}
+
+/// A Proxmox PCI resource mapping for one offered card.
+///
+/// **`deploy-agent.yml` writes these and this reads them**, so the two move
+/// together or neither does — which is exactly what went wrong when the pool
+/// was renamed on one side only.
+pub fn gpu_mapping(pci: &str) -> String {
+    format!("{PREFIX}-gpu-{}", pci.replace([':', '.'], "-"))
+}
+
+/// The short tag that keys a machine to its marketplace id.
+///
+/// Proxmox tags cannot hold a hyphenated UUID cleanly, so a truncated form
+/// keys the association. Collisions are implausible at this scale and would
+/// only ever affect this agent's own machines.
+pub fn short_tag(id: &str) -> String {
+    format!("{PREFIX}-{}", id.replace('-', "").chars().take(12).collect::<String>())
+}
+
+/// The cloud-init snippet a machine of each kind reads at first boot.
+pub fn snippet_instance(id: &str) -> String {
+    format!("{PREFIX}-instance-{id}.yaml")
+}
+
+pub fn snippet_worker(id: &str) -> String {
+    format!("{PREFIX}-{id}.yaml")
+}
+
 /// The per-network segment on this provider.
 ///
 /// A Proxmox SDN id is at most eight alphanumerics starting with a letter, so
@@ -114,6 +146,36 @@ pub fn vnet(network_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn everything_we_create_says_onv() {
+        // The rule in CLAUDE.md, as a test. It has been half-true three times:
+        // tags renamed but not machine names, the pool renamed in the agent but
+        // not in the play, the nft table renamed in the unit but not in the
+        // template it loads. A prefix that holds only where somebody remembered
+        // is not a prefix you can check a host against at two in the morning.
+        assert!(instance("gpu-1").starts_with("onv-"));
+        assert!(worker("2f8a1c0d-dead-beef-0000-000000000000").starts_with("onv-"));
+        assert!(gpu_mapping("0000:21:00.0").starts_with("onv-"));
+        assert!(short_tag("2f8a1c0d-dead-beef").starts_with("onv-"));
+        assert!(snippet_instance("x").starts_with("onv-"));
+        assert!(snippet_worker("x").starts_with("onv-"));
+        assert!(vnet("c4d90fd2-be3d").starts_with("onv"));
+        for n in [POOL, POOL_BUYERS, STORAGE_SNIPPETS, SDN_ZONE, SDN_ZONE_NAT,
+                  TAG_INSTANCE, TAG_GATEWAY, TAG_WORKER, AGENT, EGRESS_TABLE] {
+            assert!(n.starts_with(PREFIX), "{n} does not start with {PREFIX}");
+        }
+        for p in [ETC, VAR, LOG, RUN] {
+            assert!(p.ends_with("/onv"), "{p} is not an onv path");
+        }
+    }
+
+    #[test]
+    fn the_gpu_mapping_is_what_proxmox_accepts_as_an_id() {
+        // Colons and dots are not allowed in a mapping id; the play builds the
+        // same string with `tr ':.' '--'`.
+        assert_eq!(gpu_mapping("0000:21:00.0"), "onv-gpu-0000-21-00-0");
+    }
 
     #[test]
     fn a_vnet_id_fits_what_proxmox_accepts() {
