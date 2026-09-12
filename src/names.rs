@@ -128,6 +128,17 @@ pub fn snippet_instance(id: &str) -> String {
     format!("{PREFIX}-instance-{id}.yaml")
 }
 
+/// The cloud-init **network** config a machine reads, before networkd starts.
+///
+/// Separate from the user-data snippet because cloud-init reads them at
+/// different times, and that difference is the whole reason this file exists:
+/// network config is rendered in `init-local`, *before* `systemd-networkd`,
+/// while `bootcmd` in the user data runs later, in `init`, after cloud-init has
+/// already tried and failed to wait for the network.
+pub fn snippet_network(id: &str) -> String {
+    format!("{PREFIX}-net-{id}.yaml")
+}
+
 pub fn snippet_worker(id: &str) -> String {
     format!("{PREFIX}-{id}.yaml")
 }
@@ -168,6 +179,7 @@ mod tests {
         assert!(gpu_mapping("0000:21:00.0").starts_with("onv-"));
         assert!(short_tag("2f8a1c0d-dead-beef").starts_with("onv-"));
         assert!(snippet_instance("x").starts_with("onv-"));
+        assert!(snippet_network("x").starts_with("onv-"));
         assert!(snippet_worker("x").starts_with("onv-"));
         assert!(vnet("c4d90fd2-be3d").starts_with("onv"));
         for n in [POOL, POOL_BUYERS, STORAGE_SNIPPETS, SDN_ZONE, SDN_ZONE_NAT,

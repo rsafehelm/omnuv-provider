@@ -60,6 +60,27 @@ pub(crate) fn marketplace_mac(id: &str) -> String {
     )
 }
 
+/// The egress interface's MAC, derived the same way and from the same id.
+///
+/// **Derived rather than left to Proxmox**, because the network config names
+/// both NICs and is written before the VM exists. Matching the egress NIC by
+/// name instead (`en*`) would match the segment NIC too, and reading a MAC back
+/// after the clone would mean writing the snippet twice.
+///
+/// One more round over a fixed salt, so the two NICs of one machine can never
+/// collide — which they would if the same hash were reused for both.
+pub(crate) fn egress_mac(id: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.as_bytes().iter().chain(b"onv-egress") {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!(
+        "02:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        (h >> 32) as u8, (h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, h as u8
+    )
+}
+
 /// Shell that resolves the marketplace interface by MAC and exports `$DEV`.
 ///
 /// One line, and the caller must place it inside a YAML **block** scalar (`- |`),
@@ -270,6 +291,55 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
 
 /// cloud-init for a buyer VM. Only public keys go in; Omnuv never has a private
 /// key to inject even if it wanted to.
+/// The machine's network, rendered before `systemd-networkd` starts.
+///
+/// **This exists because of *when* cloud-init reads things.** Network config is
+/// rendered in `init-local`; `bootcmd` in the user data runs later, in `init`,
+/// and cloud-init runs its own `systemd-networkd-wait-online` between the two.
+/// So a machine whose segment was configured only from `bootcmd` had an
+/// unconfigured link at wait time, and every first boot carried
+///
+///     Failed to wait for network: ... systemd-networkd-wait-online.service
+///     failed because the control process exited with error code
+///
+/// twice — once in `init`, once in `modules-config` — which delayed the config
+/// stage by about two minutes and therefore delayed enrolment by the same.
+/// `RequiredForOnline=degraded` in the `.network` file cannot help: networkd
+/// has not read that file yet when the wait happens.
+///
+/// Both NICs are named, matched by MAC rather than by kernel name, because the
+/// distro chooses the name and it differs by image and by slot. The egress NIC
+/// takes DHCP from the host; the segment NIC is on-link across the project
+/// prefix with no gateway and no resolver, for the reasons in
+/// `private_network` — which still writes the same address in `bootcmd`, so it
+/// converges on every later boot even if the drive is refreshed.
+fn network_config(spec: &InstanceSpec) -> String {
+    let egress = egress_mac(&spec.id);
+    let Some(net) = &spec.network else {
+        // No private network: the egress NIC alone, and nothing said about a
+        // link the machine does not have.
+        return format!(
+            "version: 2\nethernets:\n  onv0:\n    match:\n      macaddress: \"{egress}\"\n    dhcp4: true\n"
+        );
+    };
+    format!(
+        "version: 2\n\
+         ethernets:\n  \
+         onv0:\n    \
+         match:\n      \
+         macaddress: \"{egress}\"\n    \
+         dhcp4: true\n  \
+         onv1:\n    \
+         match:\n      \
+         macaddress: \"{mac}\"\n    \
+         dhcp4: false\n    \
+         addresses: [{address}/{prefix}]\n",
+        mac = net.mac,
+        address = net.address,
+        prefix = prefix_of(&net.cidr),
+    )
+}
+
 fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>) -> String {
     // Written before `packages:` so cloud-init rewrites sources.list first.
     // Empty when the provider has not named one, which leaves the image's own
@@ -686,6 +756,12 @@ impl Client {
         let file = crate::names::snippet_instance(&spec.id);
         std::fs::write(format!("{snippet_dir}/{file}"), user_data)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
+        // The network, in its own file because cloud-init reads it in
+        // `init-local` — before networkd, and before the user data's `bootcmd`.
+        // See `network_config`.
+        let netfile = crate::names::snippet_network(&spec.id);
+        std::fs::write(format!("{snippet_dir}/{netfile}"), network_config(spec))
+            .map_err(|e| anyhow::anyhow!("writing cloud-init network config: {e}"))?;
 
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
         audit::record("instance.create", "core", &spec.id, "starting", Some(&vmid.to_string()));
@@ -711,13 +787,19 @@ impl Client {
             ("memory".into(), spec.memory_mib.to_string()),
             ("cpu".into(), "host".into()),
             ("agent".into(), "enabled=1".into()),
-            ("ipconfig0".into(), "ip=dhcp".into()),
+            // **No `ipconfig0`.** Proxmox generates a network config from the
+            // `ipconfigN` keys *only* when `cicustom` does not carry a
+            // `network=` of its own; ours does, and leaving this here would be
+            // a second description of the same interfaces that nothing reads.
             // A display as well as the serial port: the serial console is
             // where a Linux machine logs in, the screen is what the buyer
             // opens to watch it boot or rescue it, and what a Windows machine
             // uses for everything.
             ("vga".into(), "std".into()),
-            ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
+            (
+                "cicustom".into(),
+                format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}"),
+            ),
             ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
             (
                 "description".into(),
@@ -739,7 +821,10 @@ impl Client {
         // machine's goes on the NAT bridge instead: outbound internet, no
         // presence on the provider's LAN. Proxmox picks the MAC and its IPAM
         // hands the machine an address on that bridge.
-        config.push(("net0".to_string(), format!("virtio,bridge={EGRESS_BRIDGE}")));
+        config.push((
+            "net0".to_string(),
+            format!("virtio={},bridge={EGRESS_BRIDGE}", egress_mac(&spec.id)),
+        ));
         // A second interface on the network's own isolated segment, when the
         // buyer's project has a network. Nothing routes between the two.
         if let Some(net) = &spec.network {
@@ -878,11 +963,13 @@ impl Client {
         // Removed first, and best-effort: a snippet left behind must never stop
         // a machine being deleted, because a VM that outlives its delete is far
         // worse than a file that does.
-        let snippet = format!("{snippet_dir}/{}", crate::names::snippet_instance(id));
-        if let Err(e) = std::fs::remove_file(&snippet)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("instance {id}: cloud-init snippet not removed: {e}");
+        for name in [crate::names::snippet_instance(id), crate::names::snippet_network(id)] {
+            let snippet = format!("{snippet_dir}/{name}");
+            if let Err(e) = std::fs::remove_file(&snippet)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("instance {id}: cloud-init snippet not removed: {e}");
+            }
         }
 
         let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(id)).await? else {
@@ -1114,6 +1201,57 @@ mod tests {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode("nvidia")[..6].to_string()
         }) || true);
+    }
+
+    /// The network config is what cloud-init renders in `init-local`, before
+    /// networkd — so it has to parse, and it has to name both interfaces.
+    #[test]
+    fn the_network_config_names_both_interfaces_by_mac() {
+        let spec = spec_enrolled_on_a_network();
+        let nc = network_config(&spec);
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&nc).expect("network-config must be valid YAML");
+        assert_eq!(doc["version"].as_i64(), Some(2));
+        let eth = doc["ethernets"].as_mapping().expect("ethernets is a mapping");
+        assert_eq!(eth.len(), 2, "both NICs, or a link is unconfigured at wait time");
+        // The segment NIC: on-link across the project prefix, no gateway, no
+        // resolver. Same address the bootcmd copy writes.
+        let seg = &doc["ethernets"]["onv1"];
+        assert_eq!(seg["dhcp4"].as_bool(), Some(false));
+        assert_eq!(
+            seg["addresses"][0].as_str(),
+            Some("10.200.99.10/24"),
+            "the address must match what private_network writes in bootcmd"
+        );
+        assert!(seg.get("gateway4").is_none(), "the segment has no gateway");
+        assert!(seg.get("nameservers").is_none(), "names come from the overlay client");
+        // The egress NIC takes DHCP from the host.
+        assert_eq!(doc["ethernets"]["onv0"]["dhcp4"].as_bool(), Some(true));
+    }
+
+    /// Two NICs on one machine must never share a MAC, which is what reusing
+    /// one hash for both would have produced.
+    #[test]
+    fn the_two_interfaces_have_different_macs() {
+        let id = "abcdef12-0000-0000-0000-000000000000";
+        assert_ne!(marketplace_mac(id), egress_mac(id));
+        // Both locally administered and unicast, and stable across calls.
+        for m in [marketplace_mac(id), egress_mac(id)] {
+            assert!(m.starts_with("02:"), "{m} is not locally administered");
+        }
+        assert_eq!(egress_mac(id), egress_mac(id));
+        assert_ne!(egress_mac(id), egress_mac("other"));
+    }
+
+    /// A machine with no private network still gets its egress NIC named, or
+    /// cloud-init renders nothing and the machine has no internet.
+    #[test]
+    fn a_machine_with_no_network_still_configures_egress() {
+        let nc = network_config(&InstanceSpec { network: None, ..spec_with_network() });
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&nc).expect("valid YAML");
+        let eth = doc["ethernets"].as_mapping().expect("ethernets");
+        assert_eq!(eth.len(), 1);
+        assert_eq!(doc["ethernets"]["onv0"]["dhcp4"].as_bool(), Some(true));
     }
 
     /// **A machine with a network *and* an enrolment**, which is every real
