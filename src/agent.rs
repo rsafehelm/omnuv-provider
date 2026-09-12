@@ -407,29 +407,49 @@ async fn mirror_images(
         .unwrap_or(std::path::Path::new(crate::names::VAR))
         .join("import");
 
+    // **Bytes that are already right are not fetched again.** Set
+    // `OMNUV_FORCE_IMAGE_REFETCH=1` to download regardless — for the case
+    // where the file is suspected of being wrong in a way its own digest
+    // cannot show, which is rare and should cost a deliberate act.
+    let force = std::env::var("OMNUV_FORCE_IMAGE_REFETCH").is_ok_and(|v| v == "1");
+
     for (artefact, vmid) in wanted {
         let dest = dir.join(crate::images::artefact_file(&artefact.id));
-        crate::audit::record("image.mirror", "core", &artefact.id, "fetching", None);
 
-        if let Err(e) = core.download_artefact(artefact, &dest).await {
-            crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
-            eprintln!("image {}: {e}", artefact.id);
-            continue;
-        }
+        // A staged artefact from an interrupted pass. Re-downloading six
+        // gigabytes to arrive at bytes already on the disk is the most
+        // expensive possible no-op, and the digest is exactly the thing that
+        // can say so without trusting anything.
+        let staged_ok = !force
+            && dest.exists()
+            && crate::images::digest_of_file(&dest)
+                .is_ok_and(|d| d == artefact.sha256);
 
-        // Hashed again, from the file, because the check above proves the
-        // transfer was clean and this proves the thing about to be imported is
-        // still that file.
-        match crate::images::digest_of_file(&dest) {
-            Ok(d) if d == artefact.sha256 => {}
-            Ok(d) => {
-                let _ = std::fs::remove_file(&dest);
-                eprintln!("image {}: on-disk digest {d} is not {}", artefact.id, artefact.sha256);
+        if staged_ok {
+            eprintln!("image {}: already staged and matching; not downloading again", artefact.id);
+            crate::audit::record("image.mirror", "core", &artefact.id, "staged", None);
+        } else {
+            crate::audit::record("image.mirror", "core", &artefact.id, "fetching", None);
+            if let Err(e) = core.download_artefact(artefact, &dest).await {
+                crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
+                eprintln!("image {}: {e}", artefact.id);
                 continue;
             }
-            Err(e) => {
-                eprintln!("image {}: cannot read back what was written: {e}", artefact.id);
-                continue;
+
+            // Hashed again, from the file, because the check during the
+            // download proves the transfer was clean and this proves the thing
+            // about to be imported is still that file.
+            match crate::images::digest_of_file(&dest) {
+                Ok(d) if d == artefact.sha256 => {}
+                Ok(d) => {
+                    let _ = std::fs::remove_file(&dest);
+                    eprintln!("image {}: on-disk digest {d} is not {}", artefact.id, artefact.sha256);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("image {}: cannot read back what was written: {e}", artefact.id);
+                    continue;
+                }
             }
         }
 
