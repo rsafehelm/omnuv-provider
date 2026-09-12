@@ -415,6 +415,23 @@ impl Client {
     /// where the network's gateway is.
     async fn ensure_segment(&self, node: &str, vmid: u32, net: &NetworkAttachment) -> anyhow::Result<()> {
         let bridge = marketplace_bridge(net);
+
+        // **The segment is created here, because nothing else creates it any
+        // more.** Under topology v1 the per-provider gateway made the vnet on
+        // its way up, and every buyer machine attached to one that already
+        // existed. Topology v2 removed the gateway and left this attaching a
+        // NIC to a bridge nobody had built: the first buyer machine on the
+        // rebuilt platform failed with
+        //
+        //     proxmox task failed: bridge 'onve0de2' does not exist
+        //
+        // which is the right error and names the one thing that was missing.
+        //
+        // Idempotent, and cheap: `ensure_vnet` returns immediately when the
+        // vnet is already defined, so every machine after the first on a given
+        // provider pays nothing.
+        self.ensure_vnet(node, &bridge).await?;
+
         let cfg: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await?;
         let current = cfg.get("net1").and_then(|v| v.as_str()).unwrap_or_default();
         if current.split(',').any(|kv| kv == format!("bridge={bridge}")) {
