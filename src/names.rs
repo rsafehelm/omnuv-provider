@@ -155,6 +155,36 @@ pub fn snippet_worker(id: &str) -> String {
     format!("{PREFIX}-{id}.yaml")
 }
 
+/// The range this provider numbers its marketplace segments from.
+///
+/// **The driver's choice, as of protocol 5**, because a segment is
+/// per-project, per-provider and has no uplink: an address on it needs to be
+/// unique on that one wire and nowhere else. Core used to send the address and
+/// the prefix, which made it responsible for numbering a network it cannot
+/// see — the same mistake as naming the bridge, one field along.
+///
+/// The same range on every provider and in every project on purpose. Two
+/// segments never meet: different vnets, no routing between them, and nothing
+/// beyond this provider is reached over the segment at all. What must not
+/// collide is two machines *on one segment*, and `segment_address` keys that on
+/// the VMID, which Proxmox guarantees unique per node.
+///
+/// Outside the marketplace's own pools (`10.200.0.0/13` for project networks,
+/// `10.208.0.0/13` for overlay peers) so that a capture is never ambiguous
+/// about which layer an address belongs to.
+pub const SEGMENT_RANGE: &str = "10.216.0.0/16";
+
+/// A machine's address on its project's segment on this provider.
+///
+/// Keyed on the VMID because that is what the hypervisor guarantees unique, and
+/// uniqueness is only needed within one segment. `.0` and `.255` are skipped so
+/// the result is always a usable host address.
+pub fn segment_address(vmid: u32) -> String {
+    let host = vmid % 254 + 1;
+    let third = (vmid / 254) % 256;
+    format!("10.216.{third}.{host}")
+}
+
 /// The per-network segment on this provider.
 ///
 /// A Proxmox SDN id is at most eight alphanumerics starting with a letter, so
@@ -225,6 +255,48 @@ mod tests {
         // The id arrives hyphenated; filtering non-alphanumerics before taking
         // five is what stops `onvc4d9` losing a digit to a separator.
         assert_eq!(vnet("c4d9-0fd2"), "onvc4d90");
+    }
+
+    /// **Two machines on one segment must never share an address**, and a
+    /// segment holds one project's machines on one provider — so uniqueness is
+    /// needed per VMID, which is what the hypervisor guarantees.
+    #[test]
+    fn no_two_vmids_on_a_segment_share_an_address() {
+        use std::collections::HashSet;
+        // A provider will not run 4 000 marketplace machines, and this is the
+        // range Proxmox actually hands out.
+        let seen: HashSet<String> = (100..4_000).map(segment_address).collect();
+        assert_eq!(seen.len(), 3_900, "two VMIDs collided");
+    }
+
+    /// Never a network or broadcast address, whatever the VMID.
+    #[test]
+    fn every_segment_address_is_a_usable_host() {
+        for vmid in [100u32, 353, 354, 607, 100_000] {
+            let a = segment_address(vmid);
+            let last: u32 = a.rsplit('.').next().unwrap().parse().unwrap();
+            assert!((1..=254).contains(&last), "{a} is not a host address");
+            assert!(a.starts_with("10.216."), "{a} is outside the segment range");
+        }
+    }
+
+    /// It is a pure function of the VMID: the same machine gets the same
+    /// address on every pass, so a reconcile never renumbers it.
+    #[test]
+    fn the_segment_address_is_stable() {
+        assert_eq!(segment_address(103), segment_address(103));
+        assert_ne!(segment_address(103), segment_address(104));
+    }
+
+    /// The segment range must not overlap the marketplace's own pools, or a
+    /// capture is ambiguous about which layer an address belongs to.
+    #[test]
+    fn the_segment_range_is_outside_the_marketplace_pools() {
+        // 10.200.0.0/13 is project networks, 10.208.0.0/13 is overlay peers.
+        for a in [segment_address(100), segment_address(3_999)] {
+            let second: u32 = a.split('.').nth(1).unwrap().parse().unwrap();
+            assert!(!(200..=215).contains(&second), "{a} overlaps a marketplace pool");
+        }
     }
 
     /// Proxmox caps an SDN id at eight characters, and every id we mint has to

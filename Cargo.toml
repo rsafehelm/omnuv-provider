@@ -15,7 +15,7 @@ name = "onv-provider"
 path = "src/main.rs"
 
 [dependencies]
-omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.10.1" }
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.11.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

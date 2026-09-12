@@ -316,7 +316,7 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
 /// prefix with no gateway and no resolver, for the reasons in
 /// `private_network` — which still writes the same address in `bootcmd`, so it
 /// converges on every later boot even if the drive is refreshed.
-fn network_config(spec: &InstanceSpec) -> String {
+fn network_config(spec: &InstanceSpec, vmid: u32) -> String {
     let egress = egress_mac(&spec.id);
     let Some(net) = &spec.network else {
         // No private network: the egress NIC alone, and nothing said about a
@@ -338,12 +338,12 @@ fn network_config(spec: &InstanceSpec) -> String {
          dhcp4: false\n    \
          addresses: [{address}/{prefix}]\n",
         mac = net.mac,
-        address = net.address,
-        prefix = prefix_of(&net.cidr),
+        address = crate::names::segment_address(vmid),
+        prefix = SEGMENT_PREFIX,
     )
 }
 
-fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>) -> String {
+fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>, vmid: u32) -> String {
     // Written before `packages:` so cloud-init rewrites sources.list first.
     // Empty when the provider has not named one, which leaves the image's own
     // default — correct for a provider who has not been asked yet, and slow
@@ -441,7 +441,7 @@ runcmd:
         password = if spec.console_password_hash.is_some() { "ssh_pwauth: false\n" } else { "" },
         nested = render("      "),
         top = render("  "),
-        network = spec.network.as_ref().map(private_network).unwrap_or_default(),
+        network = spec.network.as_ref().map(|n| private_network(n, vmid)).unwrap_or_default(),
         // Binds the marketplace NIC to our networkd file on first boot. By the
         // time this link appeared, networkd had already bound it to the
         // image's catch-all (dracut's DHCP-everything); a new file is only
@@ -489,7 +489,7 @@ runcmd:
 /// network map carries — not by a `DNS=` line pointing at the gateway's `.1`,
 /// which after v2 would have sent every `.internal` lookup to a dead address
 /// and timed out while every status said `RUNNING`.
-fn private_network(net: &NetworkAttachment) -> String {
+fn private_network(net: &NetworkAttachment, vmid: u32) -> String {
     // One YAML block scalar (`- |`), not `[ sh, -c, "..." ]` flow entries: the
     // MAC-resolution shell needs both single quotes (awk) and double quotes
     // (`[ -n "$DEV" ]`), and a double quote inside a flow scalar closes it and
@@ -530,21 +530,15 @@ fn private_network(net: &NetworkAttachment) -> String {
     # file so it always wins the match.
     printf '[Match]\nMACAddress={mac}\n\n[Link]\nRequiredForOnline=degraded\n\n[Network]\nAddress={address}/{prefix}\n' > /etc/systemd/network/05-onv.network
 "#,
-        address = net.address,
-        prefix = prefix_of(&net.cidr),
+        address = crate::names::segment_address(vmid),
+        prefix = SEGMENT_PREFIX,
         mac = net.mac,
         resolve = resolve_dev(&net.mac),
     )
 }
 
-/// The prefix length out of a CIDR, defaulting to a /24.
-///
-/// A default rather than a failure, and the default is what every project
-/// network has been: a machine that comes up on the wrong prefix length can
-/// still be reached and corrected, and one that does not come up at all cannot.
-fn prefix_of(cidr: &str) -> u8 {
-    cidr.split_once('/').and_then(|(_, p)| p.parse().ok()).filter(|p| *p <= 32).unwrap_or(24)
-}
+/// The prefix the segment range is carved from — see `names::SEGMENT_RANGE`.
+const SEGMENT_PREFIX: u8 = 16;
 
 impl Client {
     /// Moves the machine's marketplace interface onto its network's segment
@@ -690,7 +684,7 @@ impl Client {
                         vm.vmid,
                         snippet_dir,
                         &crate::names::snippet_instance(&spec.id),
-                        &cloud_init(spec, self.apt_mirror.as_deref()),
+                        &cloud_init(spec, self.apt_mirror.as_deref(), vm.vmid),
                     )
                     .await
             {
@@ -715,10 +709,15 @@ impl Client {
             // would leak the provider's network and show the wrong IP. Fall back
             // to the guest address only when the instance has no project network.
             let guest_ip = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+            // **The segment address is the driver's now (protocol 5)**, so it
+            // is derived here rather than read off the spec. Reported only once
+            // the guest agent answers: before that the machine may be anywhere
+            // in its boot and claiming an address it might not hold would be a
+            // belief presented as an observation.
             let private_ip = spec
                 .network
                 .as_ref()
-                .map(|n| n.address.clone())
+                .map(|_| crate::names::segment_address(vm.vmid))
                 .filter(|_| guest_ip.is_some())
                 .or_else(|| guest_ip.clone());
             return Ok(InstanceStatus {
@@ -795,8 +794,15 @@ impl Client {
         // The image decides how first boot is rendered. Only cloud-init is
         // implemented; a Cloudbase-Init image is refused here with the reason
         // reported, never built wrong. Adding Windows is this one arm.
+        // **The VMID first, because the machine's segment address is derived
+        // from it.** Protocol 5 stopped Core numbering a provider's segment: an
+        // address there needs to be unique on one wire, and the hypervisor's
+        // own id is what guarantees that. A read, so taking it earlier costs
+        // nothing.
+        let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
+
         let user_data = match spec.image.first_boot {
-            FirstBoot::CloudInit => cloud_init(spec, self.apt_mirror.as_deref()),
+            FirstBoot::CloudInit => cloud_init(spec, self.apt_mirror.as_deref(), vmid),
             FirstBoot::CloudbaseInit => anyhow::bail!(
                 "image {}: Cloudbase-Init first boot is not implemented in this agent version",
                 spec.image.id
@@ -809,10 +815,9 @@ impl Client {
         // `init-local` — before networkd, and before the user data's `bootcmd`.
         // See `network_config`.
         let netfile = crate::names::snippet_network(&spec.id);
-        std::fs::write(format!("{snippet_dir}/{netfile}"), network_config(spec))
+        std::fs::write(format!("{snippet_dir}/{netfile}"), network_config(spec, vmid))
             .map_err(|e| anyhow::anyhow!("writing cloud-init network config: {e}"))?;
 
-        let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
         audit::record("instance.create", "core", &spec.id, "starting", Some(&vmid.to_string()));
 
         let upid: String = self
@@ -1150,7 +1155,7 @@ mod tests {
             gpu: true,
             post_up: vec!["apt-get install -y lightdm".into()],
         });
-        let ci = cloud_init(&spec, None);
+        let ci = cloud_init(&spec, None, 103);
         assert!(!ci.contains("get.docker.com") || {
             // It rides encoded, so check the decoded steps rather than the YAML.
             let line = ci.lines().find(|l| l.contains("base64 -d")).unwrap();
@@ -1189,7 +1194,7 @@ mod tests {
             gpu: true,
             post_up: vec!["docker compose exec -T app true".into()],
         });
-        let ci = cloud_init(&spec, None);
+        let ci = cloud_init(&spec, None, 103);
         let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid cloud-config");
         // The compose file rides as base64 so its YAML can never break ours.
         let files = parsed["write_files"].as_sequence().expect("write_files");
@@ -1246,7 +1251,7 @@ mod tests {
         assert!(script.contains("STEP=1/"), "each step names itself for the trap");
         // Without a GPU, no toolkit.
         spec.recipe.as_mut().unwrap().gpu = false;
-        assert!(!cloud_init(&spec, None).contains(&{
+        assert!(!cloud_init(&spec, None, 103).contains(&{
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode("nvidia")[..6].to_string()
         }) || true);
@@ -1257,7 +1262,7 @@ mod tests {
     #[test]
     fn the_network_config_names_both_interfaces_by_mac() {
         let spec = spec_enrolled_on_a_network();
-        let nc = network_config(&spec);
+        let nc = network_config(&spec, 103);
         let doc: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&nc).expect("network-config must be valid YAML");
         assert_eq!(doc["version"].as_i64(), Some(2));
@@ -1269,7 +1274,7 @@ mod tests {
         assert_eq!(seg["dhcp4"].as_bool(), Some(false));
         assert_eq!(
             seg["addresses"][0].as_str(),
-            Some("10.200.99.10/24"),
+            Some(format!("{}/16", crate::names::segment_address(103)).as_str()),
             "the address must match what private_network writes in bootcmd"
         );
         assert!(seg.get("gateway4").is_none(), "the segment has no gateway");
@@ -1296,7 +1301,7 @@ mod tests {
     /// cloud-init renders nothing and the machine has no internet.
     #[test]
     fn a_machine_with_no_network_still_configures_egress() {
-        let nc = network_config(&InstanceSpec { network: None, ..spec_with_network() });
+        let nc = network_config(&InstanceSpec { network: None, ..spec_with_network() }, 103);
         let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&nc).expect("valid YAML");
         let eth = doc["ethernets"].as_mapping().expect("ethernets");
         assert_eq!(eth.len(), 1);
@@ -1327,7 +1332,7 @@ mod tests {
     /// `runcmd` is a list whose entries are separate entries.
     #[test]
     fn an_enrolled_machine_on_a_network_is_still_valid_yaml() {
-        let ci = cloud_init(&spec_enrolled_on_a_network(), None);
+        let ci = cloud_init(&spec_enrolled_on_a_network(), None, 103);
         let doc: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&ci).expect("cloud-init must be valid YAML");
         let run = doc.get("runcmd").expect("has runcmd");
@@ -1382,8 +1387,6 @@ mod tests {
             reboot_token: None,
             network: Some(NetworkAttachment {
                 network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
-                address: "10.200.99.10".into(),
-                cidr: "10.200.99.0/24".into(),
                 dns_name: Some("gpu-1.internal".into()),
                 mac: "02:09:a4:76:f8:ee".into(),
             }),
@@ -1413,7 +1416,7 @@ echo 'single' "double" `backtick` \$escaped
             gpu: true,
             post_up: vec![nasty.to_string()],
         });
-        let ci = cloud_init(&spec, None);
+        let ci = cloud_init(&spec, None, 103);
         // None of it appears literally, so none of it can be parsed as YAML.
         assert!(!ci.contains("APPS"), "the script must ride encoded, not inline");
         assert!(!ci.contains("bigpicture"));
@@ -1421,7 +1424,7 @@ echo 'single' "double" `backtick` \$escaped
             serde_yaml_ng::from_str(&ci).expect("cloud-init must still be valid YAML");
         // The mirror block, when a provider named one, must not break the
         // document it is spliced into.
-        let mirrored = cloud_init(&spec, Some("http://mirrors.up.pt/ubuntu"));
+        let mirrored = cloud_init(&spec, Some("http://mirrors.up.pt/ubuntu"), 103);
         let m: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&mirrored).expect("a mirror must not break the YAML");
         assert_eq!(
@@ -1455,10 +1458,12 @@ echo 'single' "double" `backtick` \$escaped
     /// in runcmd (first boot only, after a slow apt that may not have finished).
     #[test]
     fn marketplace_network_is_in_bootcmd_before_runcmd() {
-        let ci = cloud_init(&spec_with_network(), None);
+        let ci = cloud_init(&spec_with_network(), None, 103);
         let boot = ci.find("bootcmd:").expect("has bootcmd");
         let run = ci.find("runcmd:").expect("has runcmd");
-        let addr = ci.find("10.200.99.10/24").expect("configures the address on-link");
+        let addr = ci
+            .find(&format!("{}/16", crate::names::segment_address(103)))
+            .expect("configures the address on-link");
         assert!(boot < addr, "address must be under bootcmd");
         assert!(addr < run, "address must come before runcmd, not inside it");
         // The agent is still installed and started so Core can read the IP back.
@@ -1532,7 +1537,7 @@ echo 'single' "double" `backtick` \$escaped
             }),
             ..Default::default()
         };
-        let ci = cloud_init(&spec, None);
+        let ci = cloud_init(&spec, None, 103);
         let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
         assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
         assert!(ci.contains("netbird up"), "the machine must enrol itself");
@@ -1554,7 +1559,7 @@ echo 'single' "double" `backtick` \$escaped
             disk_gib: 20,
             ..Default::default()
         };
-        let ci = cloud_init(&spec, None);
+        let ci = cloud_init(&spec, None, 103);
         assert!(!ci.contains("netbird"));
         let _: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
     }
@@ -1566,7 +1571,7 @@ echo 'single' "double" `backtick` \$escaped
     /// `contains()` check cannot see that; parsing as YAML can.
     #[test]
     fn cloud_init_is_valid_yaml() {
-        let ci = cloud_init(&spec_with_network(), None);
+        let ci = cloud_init(&spec_with_network(), None, 103);
         let doc: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&ci).expect("cloud-init must be valid YAML");
         let boot = doc.get("bootcmd").expect("has bootcmd");
@@ -1574,7 +1579,8 @@ echo 'single' "double" `backtick` \$escaped
         // The network setup is one block-scalar string entry that mentions the
         // address and the "$DEV" test that broke the flow form.
         let joined = serde_yaml_ng::to_string(boot).unwrap();
-        assert!(joined.contains("10.200.99.10/24"));
+        // The address the *driver* picked for VMID 103, not one Core sent.
+        assert!(joined.contains(&format!("{}/16", crate::names::segment_address(103))));
         assert!(joined.contains("$DEV"));
     }
 
@@ -1584,7 +1590,7 @@ echo 'single' "double" `backtick` \$escaped
     fn no_network_still_has_a_bootcmd_body() {
         let mut spec = spec_with_network();
         spec.network = None;
-        let ci = cloud_init(&spec, None);
+        let ci = cloud_init(&spec, None, 103);
         let boot = ci.find("bootcmd:").expect("has bootcmd");
         let after = &ci[boot + "bootcmd:".len()..];
         // The first entry, past any comment lines.
