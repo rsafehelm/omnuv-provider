@@ -434,25 +434,12 @@ impl Client {
     /// Moves the machine's marketplace interface onto its network's segment
     /// if it is anywhere else. Its address never changes; the segment is
     /// where the network's gateway is.
+    /// Attaches an existing machine's `net1` to its network's segment.
+    ///
+    /// The segment itself is ensured by `ensure_instance`, before this — see
+    /// the comment there for why it cannot live in here.
     async fn ensure_segment(&self, node: &str, vmid: u32, net: &NetworkAttachment) -> anyhow::Result<()> {
         let bridge = marketplace_bridge(net);
-
-        // **The segment is created here, because nothing else creates it any
-        // more.** Under topology v1 the per-provider gateway made the vnet on
-        // its way up, and every buyer machine attached to one that already
-        // existed. Topology v2 removed the gateway and left this attaching a
-        // NIC to a bridge nobody had built: the first buyer machine on the
-        // rebuilt platform failed with
-        //
-        //     proxmox task failed: bridge 'onve0de2' does not exist
-        //
-        // which is the right error and names the one thing that was missing.
-        //
-        // Idempotent, and cheap: `ensure_vnet` returns immediately when the
-        // vnet is already defined, so every machine after the first on a given
-        // provider pays nothing.
-        self.ensure_vnet(node, &bridge).await?;
-
         let cfg: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await?;
         let current = cfg.get("net1").and_then(|v| v.as_str()).unwrap_or_default();
         if current.split(',').any(|kv| kv == format!("bridge={bridge}")) {
@@ -475,6 +462,31 @@ impl Client {
         snippet_dir: &str,
         spec: &InstanceSpec,
     ) -> anyhow::Result<InstanceStatus> {
+        // **The segment, before either branch.** Both of them attach a NIC to
+        // it: the create path writes `net1` into the clone's configuration, and
+        // the reconcile path re-plugs an existing machine. So this is the one
+        // place both routes pass through, and it is the only place the vnet can
+        // be ensured once.
+        //
+        // It was in `ensure_segment` alone, which only the *reconcile* branch
+        // calls — so the very first buyer machine on this provider failed with
+        //
+        //     proxmox task failed: bridge 'onvfc5ca' does not exist
+        //
+        // twice: once before topology v2's segment reaper, and again after a
+        // fix that was correct and in the half of the code that runs second.
+        // The create path is the one that runs first for every machine that has
+        // never existed, which is every machine at the moment it matters.
+        //
+        // Idempotent and cheap: `ensure_vnet` returns immediately when the vnet
+        // is defined and applied, so every machine after the first on a given
+        // provider pays one API read.
+        if let Some(net) = &spec.network
+            && spec.lifecycle != Lifecycle::Deleted
+        {
+            self.ensure_vnet(node, &marketplace_bridge(net)).await?;
+        }
+
         if let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(&spec.id)).await? {
             let mut running = vm.status.as_deref() == Some("running");
 
