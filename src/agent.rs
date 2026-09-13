@@ -628,7 +628,7 @@ async fn reconcile_workers(
     for spec in &desired.inference_workers {
         let result = match spec.lifecycle {
             Lifecycle::Deleted => driver
-                .delete_inference_worker(node, &spec.id)
+                .delete_inference_worker(node, &spec.id, &cfg.proxmox.snippet_dir)
                 .await
                 .map(|_| WorkerStatus {
                     id: spec.id.clone(),
@@ -672,6 +672,56 @@ async fn reconcile_workers(
                 telemetry: None,
             }
         }));
+    }
+
+    // **The sweep that makes the best-effort delete safe.** `delete_*` removes a
+    // snippet without letting a failure stop the machine's deletion, which is
+    // right — and would make a failed removal permanent if nothing looked again.
+    //
+    // The view is built from what this pass actually observed, and its
+    // completeness decides whether anything is collected at all. `desired` is
+    // every id Core wants, including a worker being created right now: that
+    // machine has no VM yet and its snippet is what it will boot from, so
+    // runtime absence alone must never make it disposable.
+    {
+        let mut known = crate::snippets::Known { complete: true, ..Default::default() };
+        for spec in &desired.inference_workers {
+            if spec.lifecycle != Lifecycle::Deleted {
+                known.desired.insert(spec.id.clone());
+            }
+        }
+        for spec in &desired.instances {
+            if spec.lifecycle != Lifecycle::Deleted {
+                known.desired.insert(spec.id.clone());
+            }
+        }
+        // A status the driver could not determine leaves the view incomplete
+        // rather than implying the machine is gone.
+        for st in &statuses {
+            match st.state {
+                WorkerState::Error => known.complete = false,
+                _ => {
+                    known.live.insert(st.id.clone());
+                }
+            }
+        }
+        let swept = crate::snippets::sweep(
+            std::path::Path::new(&cfg.proxmox.snippet_dir),
+            &known,
+            |path| std::fs::remove_file(path),
+        );
+        if let Some(why) = &swept.refused {
+            eprintln!("snippet sweep collected nothing: {why}");
+        }
+        if !swept.collected.is_empty() {
+            eprintln!("snippet sweep collected {} file(s)", swept.collected.len());
+        }
+        for name in &swept.uncertain {
+            eprintln!("snippet {name}: ours by prefix, claimed by nothing, left in place");
+        }
+        for failure in &swept.failed {
+            eprintln!("snippet not collected, will retry: {failure}");
+        }
     }
 
     {

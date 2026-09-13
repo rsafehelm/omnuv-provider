@@ -387,7 +387,37 @@ impl Client {
         })
     }
 
-    pub async fn delete_inference_worker(&self, node: &str, worker_id: &str) -> anyhow::Result<()> {
+    pub async fn delete_inference_worker(
+        &self,
+        node: &str,
+        worker_id: &str,
+        snippet_dir: &str,
+    ) -> anyhow::Result<()> {
+        // **The snippet goes with the worker.** Until 13 September 2026 this
+        // function stopped the VM, deleted the VM, and touched no file — so every
+        // inference worker ever built left its cloud-init behind, carrying that
+        // worker's credentials to Core, in a directory nothing swept.
+        //
+        // Both generations, because a rename is a migration and the old name is
+        // what every existing file is called.
+        //
+        // Best-effort and first, for the same reason the instance path is: a
+        // snippet left behind must never stop a machine being deleted, because a
+        // VM that outlives its delete is far worse than a file that does. What
+        // makes that safe rather than permanent is `sweep_snippets`, which looks
+        // again.
+        for name in [
+            crate::names::snippet_worker(worker_id),
+            crate::names::snippet_worker_legacy(worker_id),
+        ] {
+            let snippet = format!("{snippet_dir}/{name}");
+            if let Err(e) = std::fs::remove_file(&snippet)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("worker {worker_id}: cloud-init snippet not removed: {e}");
+            }
+        }
+
         let Some(vm) = self.find_worker_vm(node, worker_id).await? else { return Ok(()) };
         if vm.status.as_deref() == Some("running") {
             let upid: String =

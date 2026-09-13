@@ -151,8 +151,64 @@ pub fn snippet_network(id: &str) -> String {
     format!("{PREFIX}-net-{id}.yaml")
 }
 
+/// The cloud-init snippet an inference worker reads at first boot.
+///
+/// **Named for its kind, as of 13 September 2026.** It used to be
+/// `onv-<id>.yaml` — the prefix and a uuid, and nothing saying what it was. The
+/// other two snippets carry their kind (`onv-instance-…`, `onv-net-…`), and a
+/// sweep needs the same of this one: without it, the only way to recognise a
+/// worker snippet is to subtract the patterns you do know and delete the rest,
+/// which is the shape that eats something it did not understand.
+///
+/// A rename is a migration, so `snippet_worker_legacy` still exists and every
+/// removal path matches both. Drop it only once no provider can be holding one,
+/// which is not a date anybody can predict — so it stays.
 pub fn snippet_worker(id: &str) -> String {
+    format!("{PREFIX}-worker-{id}.yaml")
+}
+
+/// What `snippet_worker` produced before it carried its kind. Recognised for
+/// removal, never written.
+pub fn snippet_worker_legacy(id: &str) -> String {
     format!("{PREFIX}-{id}.yaml")
+}
+
+/// Is this filename one of ours, and for which marketplace id?
+///
+/// **Recognition, not authority.** A prefix says a file looks like ours; the
+/// caller still has to hold a valid claim on the id before touching it. This
+/// returns the id so the caller *can* check, and `None` for anything whose
+/// grammar we do not know — which is reported rather than collected.
+pub fn snippet_owner(filename: &str) -> Option<(SnippetKind, &str)> {
+    let rest = filename.strip_prefix(PREFIX)?.strip_prefix('-')?;
+    let body = rest.strip_suffix(".yaml")?;
+    for (prefix, kind) in [
+        ("instance-", SnippetKind::Instance),
+        ("net-", SnippetKind::Network),
+        ("worker-", SnippetKind::Worker),
+    ] {
+        if let Some(id) = body.strip_prefix(prefix) {
+            return (!id.is_empty()).then_some((kind, id));
+        }
+    }
+    // No kind: the legacy worker name. Only a uuid-shaped body qualifies, so
+    // `onv-snippets` itself or a hand-made `onv-notes.yaml` is not mistaken for
+    // a machine's file.
+    let uuidish = body.len() == 36
+        && body.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && body.matches('-').count() == 4;
+    uuidish.then_some((SnippetKind::WorkerLegacy, body))
+}
+
+/// Which kind of machine a snippet belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnippetKind {
+    Instance,
+    Network,
+    Worker,
+    /// A worker snippet written before the rename. Its origin is ours by
+    /// grammar, but a file of uncertain origin is reported rather than removed.
+    WorkerLegacy,
 }
 
 /// The range this provider numbers its marketplace segments from.
@@ -222,7 +278,8 @@ mod tests {
         assert!(short_tag("2f8a1c0d-dead-beef").starts_with("onv-"));
         assert!(snippet_instance("x").starts_with("onv-"));
         assert!(snippet_network("x").starts_with("onv-"));
-        assert!(snippet_worker("x").starts_with("onv-"));
+        assert!(snippet_worker("x").starts_with("onv-worker-"));
+        assert_eq!(snippet_worker_legacy("x"), "onv-x.yaml");
         assert!(vnet("c4d90fd2-be3d").starts_with("onv"));
         for n in [POOL, POOL_BUYERS, STORAGE_SNIPPETS, SDN_ZONE, SDN_ZONE_NAT,
                   TAG_INSTANCE, TAG_GATEWAY, TAG_WORKER, AGENT, EGRESS_TABLE] {
@@ -337,5 +394,43 @@ mod tests {
         assert!(LEGACY_PREFIXES.contains(&"omnuv-"));
         assert!(LEGACY_PREFIXES.contains(&"omnu-"));
         assert!(!LEGACY_PREFIXES.iter().any(|p| p.starts_with(PREFIX)));
+    }
+}
+
+#[cfg(test)]
+mod snippet_grammar_tests {
+    use super::*;
+
+    /// Both generations are recognised, with their kind and their id. A rename
+    /// that stopped matching the old name would leave every file written before
+    /// it on the provider forever.
+    #[test]
+    fn both_worker_generations_are_recognised() {
+        let id = "b3e77a10-5c44-4de9-8f02-91ab6e4c7d58";
+        assert_eq!(snippet_owner(&snippet_worker(id)), Some((SnippetKind::Worker, id)));
+        assert_eq!(
+            snippet_owner(&snippet_worker_legacy(id)),
+            Some((SnippetKind::WorkerLegacy, id))
+        );
+        assert_eq!(snippet_owner(&snippet_instance(id)), Some((SnippetKind::Instance, id)));
+        assert_eq!(snippet_owner(&snippet_network(id)), Some((SnippetKind::Network, id)));
+    }
+
+    /// **A prefix is recognition, not authority.** Anything whose grammar we do
+    /// not know returns `None`, so a caller cannot mistake it for a machine's
+    /// file — and the sweep reports those rather than collecting them.
+    #[test]
+    fn a_prefix_alone_is_not_a_claim() {
+        for name in [
+            "onv-notes.yaml",            // ours by prefix, no id: not a machine's
+            "onv-.yaml",                 // empty id
+            "onv-worker-.yaml",          // empty id, with a kind
+            "onv-snippets",              // the storage, not a snippet
+            "user-data.yaml",            // somebody else's
+            "onv-b3e77a10.yaml",         // short: not a uuid, so not the legacy name
+            "onv-instance-x.yml",        // wrong extension
+        ] {
+            assert_eq!(snippet_owner(name), None, "{name} was claimed");
+        }
     }
 }

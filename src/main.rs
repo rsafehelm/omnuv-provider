@@ -1,4 +1,5 @@
 mod names;
+mod snippets;
 mod agent;
 mod audit;
 mod config;
