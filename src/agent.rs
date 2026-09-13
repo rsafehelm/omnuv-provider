@@ -4,6 +4,24 @@
 //! and reports normalized state upward. It never receives marketplace decision
 //! logic and never exposes the Proxmox API outward.
 
+/// **Generation and sequence, both process-scoped.**
+///
+/// `sequence` orders reports from one agent process. `generation` changes when
+/// the process does, which is what stops Core reading a restart as a reordering:
+/// a fresh agent starts at sequence 0 again, and comparing that against the last
+/// sequence of the previous process would discard its first report.
+///
+/// Seeded from the clock rather than persisted: a monotonic counter on disk is a
+/// file that can be lost, restored from a backup, or copied onto a second host,
+/// and each of those makes two live agents claim one generation.
+static GENERATION: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+});
+static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use omnuv_protocol::{
     DesiredState, InstanceState, InstanceStatus, Lifecycle, StatusReport, WorkerState, WorkerStatus,
 };
@@ -331,10 +349,44 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
+mod handshake_tests {
+    /// The agent offers every version it can speak, not only the newest.
+    ///
+    /// Advertising a point makes an upgrade order impossible in whichever
+    /// direction happens to move first: an agent shipped ahead of Core finds no
+    /// common version and is refused, and so does one left behind by a
+    /// rollback. Core had exactly this defect from its own side and it would
+    /// have disconnected every provider on deploy.
+    #[test]
+    fn the_agent_offers_a_range() {
+        let offered: Vec<u32> =
+            (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION).collect();
+        assert!(offered.len() > 1, "a single-element range is a point again");
+        assert!(offered.contains(&omnuv_protocol::PROTOCOL_VERSION));
+        assert!(offered.contains(&omnuv_protocol::MINIMUM_PROTOCOL_VERSION));
+
+        // Split so the needle does not match this line itself — a source-check
+        // that finds its own assertion proves nothing and fails forever.
+        let needle = format!("[omnuv_protocol::{}]", "PROTOCOL_VERSION");
+        assert!(
+            !include_str!("agent.rs").contains(&needle),
+            "the handshake must not advertise a single version"
+        );
+    }
+}
+
 async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u64> {
     let body = serde_json::json!({
         "agent_version": AGENT_VERSION,
-        "protocol_versions": [omnuv_protocol::PROTOCOL_VERSION],
+        // **A range, not a point**, and the same defect Core had from the other
+        // side: advertising only the current version means a Core that has not
+        // been upgraded yet — or one rolled back — finds no common version and
+        // refuses an agent that could have spoken its dialect perfectly well.
+        // Core picks the highest both sides list.
+        "protocol_versions":
+            (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION)
+                .collect::<Vec<_>>(),
         "drivers": { "compute": [driver.kind().as_str()] },
     });
 
@@ -626,8 +678,8 @@ async fn reconcile_workers(
 
     let mut statuses = Vec::new();
     for spec in &desired.inference_workers {
-        let result = match spec.lifecycle {
-            Lifecycle::Deleted => driver
+        let result = match spec.intent {
+            Lifecycle::Absent => driver
                 .delete_inference_worker(node, &spec.id, &cfg.proxmox.snippet_dir)
                 .await
                 .map(|_| WorkerStatus {
@@ -686,12 +738,12 @@ async fn reconcile_workers(
     {
         let mut known = crate::snippets::Known { complete: true, ..Default::default() };
         for spec in &desired.inference_workers {
-            if spec.lifecycle != Lifecycle::Deleted {
+            if spec.intent != Lifecycle::Absent {
                 known.desired.insert(spec.id.clone());
             }
         }
         for spec in &desired.instances {
-            if spec.lifecycle != Lifecycle::Deleted {
+            if spec.intent != Lifecycle::Absent {
                 known.desired.insert(spec.id.clone());
             }
         }
@@ -753,8 +805,8 @@ async fn reconcile_workers(
     // Buyer instances converge on the same pass and by the same rules.
     let mut instances = Vec::new();
     for spec in &desired.instances {
-        let result = match spec.lifecycle {
-            Lifecycle::Deleted => driver.delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir).await.map(|_| InstanceStatus {
+        let result = match spec.intent {
+            Lifecycle::Absent => driver.delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir).await.map(|_| InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Stopped,
@@ -803,6 +855,49 @@ async fn reconcile_workers(
         println!("instance {} -> {:?} {}", i.id, i.state, i.private_ip.as_deref().unwrap_or(""));
     }
 
+    // **What this report covers, said honestly.**
+    //
+    // The loops above iterate `desired.*` — this agent reports a result for each
+    // thing Core asked about, and does *not* survey the hypervisor. So the scope
+    // is the desired set, not the provider: a machine Core has never heard of
+    // cannot appear here, and its absence from this report is not evidence of
+    // anything. That is why Core keeps an independent orphan check, and why the
+    // plan says a delta cannot reveal an object omitted from both inputs.
+    //
+    // `complete` therefore means: every desired item produced a result on this
+    // pass. It is false the moment one did not, because a report missing an
+    // item it was supposed to cover must not let Core conclude that item is
+    // gone.
+    let mut incomplete_because: Vec<String> = Vec::new();
+    if instances.len() != desired.instances.len() {
+        incomplete_because.push(format!(
+            "{} of {} desired instances produced no result",
+            desired.instances.len() - instances.len(),
+            desired.instances.len()
+        ));
+    }
+    if statuses.len() != desired.inference_workers.len() {
+        incomplete_because.push(format!(
+            "{} of {} desired workers produced no result",
+            desired.inference_workers.len() - statuses.len(),
+            desired.inference_workers.len()
+        ));
+    }
+    let observation = omnuv_protocol::Observation {
+        generation: *GENERATION,
+        sequence: SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        collected_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        // Named for what they are: the *desired* set this pass covered. Calling
+        // them `instances` would invite Core to read absence into them.
+        scope: vec!["desired_instances".into(), "desired_workers".into()],
+        complete: incomplete_because.is_empty(),
+        incomplete_because,
+        desired_revision: Some(desired.version),
+    };
+
     let report = StatusReport {
         protocol_version: omnuv_protocol::PROTOCOL_VERSION,
         // What this agent actually did since the last report, in its own
@@ -814,6 +909,7 @@ async fn reconcile_workers(
         // is only sent on failure is indistinguishable from one that stopped
         // running.
         checks,
+        observation: Some(observation),
     };
     let res = core.post("/provider/v1/status", Some(serde_json::to_value(&report)?)).await?;
     if !res.status().is_success() {

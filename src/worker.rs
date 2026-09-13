@@ -254,14 +254,14 @@ impl Client {
             // Converge, do not merely observe: a worker that exists but is not
             // running when Core wants it running must be started on this pass,
             // otherwise a failed first boot leaves it stopped forever.
-            if !running && spec.lifecycle == Lifecycle::Running {
+            if !running && spec.intent == Lifecycle::Running {
                 let upid: String = self
                     .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
                     .await?;
                 self.wait_task(node, &upid).await?;
                 running = true;
             }
-            if running && spec.lifecycle == Lifecycle::Stopped {
+            if running && spec.intent == Lifecycle::Stopped {
                 let upid: String = self
                     .post_form(&format!("/nodes/{node}/qemu/{}/status/shutdown", vm.vmid), NO_FORM)
                     .await?;
@@ -592,7 +592,7 @@ mod tests {
         let spec = InferenceWorkerSpec {
             id: "w1".into(),
             budget_secs: None,
-            lifecycle: Lifecycle::Running,
+            intent: Lifecycle::Running,
             image: "vllm/vllm-openai:latest".into(),
             model_repo: "org/model".into(),
             vllm_args: vec!["--model".into(), "org/model".into(), "--max-model-len".into(), "8192".into()],
@@ -665,7 +665,7 @@ mod workload_agent_tests {
     fn spec() -> InferenceWorkerSpec {
         InferenceWorkerSpec {
             id: "worker_abc".into(),
-            lifecycle: Lifecycle::Running,
+            intent: Lifecycle::Running,
             image: "vllm/vllm-openai:latest".into(),
             model_repo: "org/model".into(),
             vllm_args: vec!["--model".into(), "org/model".into()],
@@ -769,7 +769,7 @@ mod workload_unit_tests {
         super::cloud_init(
             &InferenceWorkerSpec {
                 id: "worker_abc".into(),
-                lifecycle: Lifecycle::Running,
+                intent: Lifecycle::Running,
                 image: "vllm/vllm-openai:latest".into(),
                 model_repo: "org/model".into(),
                 vllm_args: vec!["--model".into(), "org/model".into()],

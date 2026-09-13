@@ -621,7 +621,7 @@ impl Client {
         // is defined and applied, so every machine after the first on a given
         // provider pays one API read.
         if let Some(net) = &spec.network
-            && spec.lifecycle != Lifecycle::Deleted
+            && spec.intent != Lifecycle::Absent
         {
             self.ensure_vnet(node, &marketplace_bridge(net)).await?;
         }
@@ -634,7 +634,7 @@ impl Client {
             // re-plugs a running machine's interface live, and the guest's
             // own configuration does not change.
             if let Some(net) = &spec.network
-                && spec.lifecycle != Lifecycle::Deleted
+                && spec.intent != Lifecycle::Absent
             {
                 self.ensure_segment(node, vm.vmid, net).await?;
             }
@@ -645,13 +645,13 @@ impl Client {
             // lose its internet quietly. Proxmox re-plugs a running machine's
             // interface live and the guest's own configuration does not change,
             // exactly as for the segment above.
-            if spec.lifecycle != Lifecycle::Deleted {
+            if spec.intent != Lifecycle::Absent {
                 self.ensure_egress(node, vm.vmid).await?;
             }
 
             // Converge toward the requested lifecycle rather than merely
             // reporting what is there.
-            match spec.lifecycle {
+            match spec.intent {
                 Lifecycle::Running if !running => {
                     let upid: String = self
                         .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
@@ -677,7 +677,7 @@ impl Client {
             // rebooting it to apply a marketplace change is not ours to
             // decide. It takes effect at their next boot — including the one
             // they may ask for on the line below.
-            if spec.lifecycle != Lifecycle::Deleted
+            if spec.intent != Lifecycle::Absent
                 && let Err(e) = self
                     .sync_cloud_init(
                         node,
@@ -693,7 +693,7 @@ impl Client {
 
             // One-shot: performed here and echoed back so Core can clear it.
             let mut rebooted_token = None;
-            if running && spec.lifecycle == Lifecycle::Running
+            if running && spec.intent == Lifecycle::Running
                 && let Some(token) = &spec.reboot_token {
                     let upid: String = self
                         .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
@@ -742,7 +742,7 @@ impl Client {
                 // in it.
                 waiting_on: match (running, guest_ip.is_some()) {
                     (true, false) => Some("first boot to finish".to_string()),
-                    (false, _) if spec.lifecycle == Lifecycle::Running => {
+                    (false, _) if spec.intent == Lifecycle::Running => {
                         Some("the machine to start".to_string())
                     }
                     _ => None,
@@ -775,7 +775,7 @@ impl Client {
             });
         }
 
-        if spec.lifecycle == Lifecycle::Deleted {
+        if spec.intent == Lifecycle::Absent {
             return Ok(InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
@@ -977,7 +977,7 @@ impl Client {
     pub async fn maintain(&self, node: &str, specs: &[InstanceSpec]) -> anyhow::Result<usize> {
         let mut restarted = 0;
         for spec in specs {
-            if !maintenance_may_touch(spec.lifecycle, true, false) {
+            if !maintenance_may_touch(spec.intent, true, false) {
                 continue;
             }
             // Never create: absence is exactly the case where the stale
@@ -986,7 +986,7 @@ impl Client {
                 continue;
             };
             let running = vm.status.as_deref() == Some("running");
-            if !maintenance_may_touch(spec.lifecycle, true, running) {
+            if !maintenance_may_touch(spec.intent, true, running) {
                 continue;
             }
             let upid: String = self
@@ -1126,8 +1126,8 @@ mod tests {
         assert!(!maintenance_may_touch(Lifecycle::Running, true, true), "already running");
         assert!(!maintenance_may_touch(Lifecycle::Running, false, false), "absent: creating is deciding");
         assert!(!maintenance_may_touch(Lifecycle::Stopped, true, true), "stopping is deciding");
-        assert!(!maintenance_may_touch(Lifecycle::Deleted, true, true), "deleting is deciding");
-        assert!(!maintenance_may_touch(Lifecycle::Deleted, true, false), "a stale delete must not start it either");
+        assert!(!maintenance_may_touch(Lifecycle::Absent, true, true), "deleting is deciding");
+        assert!(!maintenance_may_touch(Lifecycle::Absent, true, false), "a stale delete must not start it either");
     }
 
     use super::*;
@@ -1375,7 +1375,7 @@ mod tests {
         InstanceSpec {
             id: "abcdef12-0000-0000-0000-000000000000".into(),
             budget_secs: None,
-            lifecycle: Lifecycle::Running,
+            intent: Lifecycle::Running,
             name: "gpu-1".into(),
             image: omnuv_protocol::ImageSpec::default(),
             vcpus: 2,
@@ -1526,7 +1526,7 @@ echo 'single' "double" `backtick` \$escaped
         let spec = InstanceSpec {
             id: "i-1".into(),
             name: "gpu-1".into(),
-            lifecycle: omnuv_protocol::Lifecycle::Running,
+            intent: omnuv_protocol::Lifecycle::Running,
             vcpus: 2,
             memory_mib: 2048,
             disk_gib: 20,
@@ -1553,7 +1553,7 @@ echo 'single' "double" `backtick` \$escaped
         let spec = InstanceSpec {
             id: "i-2".into(),
             name: "gpu-2".into(),
-            lifecycle: omnuv_protocol::Lifecycle::Running,
+            intent: omnuv_protocol::Lifecycle::Running,
             vcpus: 2,
             memory_mib: 2048,
             disk_gib: 20,
