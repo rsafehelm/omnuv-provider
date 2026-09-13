@@ -89,4 +89,10 @@ docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -c "
 # same one-definition-in-two-places mistake that produced this bug.
 cp "$OUT/onv-provider_${VERSION}_${ARCH}.deb" "$OUT/onv-provider_current_${ARCH}.deb"
 
+# Written beside it, so the deploy can assert that the agent Core ends up seeing
+# is the one that was packaged. The controller has no dpkg-deb to ask, and a
+# version hard-coded in the play would be the same two-definitions mistake in a
+# new place.
+printf '%s\n' "$VERSION" > "$OUT/onv-provider_current.version"
+
 echo "  $(basename "$OUT")/onv-provider_${VERSION}_${ARCH}.deb"
