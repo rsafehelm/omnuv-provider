@@ -1,0 +1,32 @@
+{
+  "protocol_version": 6,
+  "version": 41,
+  "unchanged": false,
+  "inference_workers": [],
+  "instances": [
+    {
+      "budget_secs": null,
+      "id": "66666666-6666-6666-6666-666666666666",
+      "lifecycle": "running",
+      "name": "gpu-1",
+      "image": {
+        "id": "ubuntu-26.04",
+        "os_family": "linux",
+        "first_boot": "cloud-init",
+        "default_user": "omnuv",
+        "auth_mode": "ssh-key"
+      },
+      "vcpus": 4,
+      "memory_mib": 16384,
+      "disk_gib": 100,
+      "ssh_keys": [],
+      "console_password_hash": null,
+      "gpu_local_ids": [],
+      "reboot_token": null,
+      "network": null,
+      "recipe": null,
+      "overlay": null
+    }
+  ],
+  "images": []
+}
