@@ -40,7 +40,7 @@ pub struct ConsoleStream {
     pub from_vm: mpsc::Receiver<Vec<u8>>,
     /// A secret the viewer authenticates with inside the protocol (VNC), for
     /// this session only.
-    pub credential: Option<String>,
+    pub credential: Option<omnuv_protocol::Redacted>,
 }
 
 /// The runtime-neutral face of a console, so the tunnel never sees the
@@ -56,17 +56,22 @@ pub trait ConsoleOpener: Send + Sync {
 #[derive(serde::Deserialize)]
 struct TermProxy {
     port: serde_json::Value,
-    ticket: String,
+    /// One session's authorization to the hypervisor, spent twice below: once
+    /// in the websocket URL and once in the login line. Redacted because these
+    /// two structs are `Deserialize`-only today by nobody's decision — there
+    /// was no rule keeping `Debug` off them, only the fact that no one had
+    /// needed it yet.
+    ticket: omnuv_protocol::Redacted,
     user: String,
 }
 
 #[derive(serde::Deserialize)]
 struct VncProxy {
     port: serde_json::Value,
-    ticket: String,
+    ticket: omnuv_protocol::Redacted,
     /// The VNC password the hypervisor minted for this proxy session.
     #[serde(default)]
-    password: Option<String>,
+    password: Option<omnuv_protocol::Redacted>,
 }
 
 impl Client {
@@ -99,10 +104,10 @@ impl Client {
             "wss://{host}/api2/json/nodes/{node}/qemu/{}/vncwebsocket?port={}&vncticket={}",
             vm.vmid,
             urlencode(&port),
-            urlencode(&tp.ticket)
+            urlencode(tp.ticket.expose())
         );
         let mut request = url.into_client_request()?;
-        request.headers_mut().insert("authorization", self.auth.parse()?);
+        request.headers_mut().insert("authorization", self.auth.expose().parse()?);
         request.headers_mut().insert("sec-websocket-protocol", "binary".parse()?);
         let connector = tokio_tungstenite::Connector::Rustls(self.tls.clone());
         let (socket, _) =
@@ -113,7 +118,7 @@ impl Client {
 
         // termproxy's handshake: `user:ticket`, answered with "OK" and then
         // the terminal's bytes.
-        sink.send(Message::text(format!("{}:{}\n", tp.user, tp.ticket))).await?;
+        sink.send(Message::text(format!("{}:{}\n", tp.user, tp.ticket.expose()))).await?;
         let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
             .await
             .map_err(|_| anyhow::anyhow!("console did not answer"))?
@@ -185,10 +190,10 @@ impl Client {
         let url = format!(
             "wss://{host}/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port={}&vncticket={}",
             urlencode(&port),
-            urlencode(&vp.ticket)
+            urlencode(vp.ticket.expose())
         );
         let mut request = url.into_client_request()?;
-        request.headers_mut().insert("authorization", self.auth.parse()?);
+        request.headers_mut().insert("authorization", self.auth.expose().parse()?);
         request.headers_mut().insert("sec-websocket-protocol", "binary".parse()?);
         let connector = tokio_tungstenite::Connector::Rustls(self.tls.clone());
         let (socket, _) =

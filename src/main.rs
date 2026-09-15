@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
         return join::run(join::JoinArgs {
             core: need("--core")?,
-            token: need("--token")?,
+            token: need("--token")?.into(),
             region: arg("--region").unwrap_or_else(|| "eu-west".into()),
             cpu_cores: num("--cpu", 8) as u32,
             memory_mib: num("--memory-gb", 16) * 1024,

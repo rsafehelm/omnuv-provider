@@ -125,7 +125,10 @@ pub struct Client {
     /// The pinned TLS configuration, shared with the console websocket.
     pub(crate) tls: std::sync::Arc<rustls::ClientConfig>,
     pub(crate) base: String,
-    pub(crate) auth: String,
+    /// `PVEAPIToken=<id>=<secret>` — the secret with its wrapper on, which
+    /// makes this the most valuable string in the agent. Redacted at the field
+    /// rather than at the five places it is spent.
+    pub(crate) auth: omnuv_protocol::Redacted,
     node: Option<String>,
     contribute: Contribution,
     location: Option<omnuv_protocol::GeoLocation>,
@@ -185,7 +188,7 @@ impl Client {
             http: crate::tls::client(tls.clone())?,
             tls,
             base: api_url.trim_end_matches('/').to_string(),
-            auth: format!("PVEAPIToken={token_id}={token_secret}"),
+            auth: format!("PVEAPIToken={token_id}={token_secret}").into(),
             node,
             contribute,
             location,
@@ -290,7 +293,7 @@ impl Client {
         let res = self
             .http
             .request(method, format!("{}/api2/json{path}", self.base))
-            .header("Authorization", &self.auth)
+            .header("Authorization", self.auth.expose())
             .form(&pairs)
             .send()
             .await
@@ -310,7 +313,7 @@ impl Client {
         let res = self
             .http
             .delete(format!("{}/api2/json{path}", self.base))
-            .header("Authorization", &self.auth)
+            .header("Authorization", self.auth.expose())
             .send()
             .await?;
         let status = res.status();
@@ -344,7 +347,7 @@ impl Client {
         let res = self
             .http
             .get(format!("{}/api2/json{path}", self.base))
-            .header("Authorization", &self.auth)
+            .header("Authorization", self.auth.expose())
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("GET {path}: {e}"))?;

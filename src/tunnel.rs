@@ -28,7 +28,7 @@ pub type ResolveWorker = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 pub async fn run(
     core_url: &str,
-    token: &str,
+    token: &omnuv_protocol::Redacted,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -121,7 +121,7 @@ mod url_lite {
 
 async fn connect(
     ws_url: &str,
-    token: &str,
+    token: &omnuv_protocol::Redacted,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -129,7 +129,11 @@ async fn connect(
     let mut request = ws_url.into_client_request()?;
     request
         .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse()?);
+        // `.expose()` rather than `{token}`: `Redacted`'s `Display` prints
+        // `<redacted>`, so interpolating it would build a header that is
+        // perfectly well formed and that Core refuses — an agent reconnecting
+        // into a 401 forever, with the reason redacted out of its own log.
+        .insert("authorization", format!("Bearer {}", token.expose()).parse()?);
 
     let parts = url_lite::parse(ws_url)?;
     let proxy = proxy_for(ws_url);
@@ -354,5 +358,30 @@ mod tests {
         assert_eq!(url_lite::parse("ws://core.example/x").unwrap().port, 80);
         // Credentials in a proxy URL must not be mistaken for the host.
         assert_eq!(url_lite::parse("http://user:pw@proxy:3128").unwrap().host, "proxy");
+    }
+
+    /// **A redacted secret is still a JSON string on the wire.**
+    ///
+    /// `ConsoleCredential.password` became `Redacted` so that no `{:?}` can
+    /// print it. That type is `#[serde(transparent)]`, so the bytes are
+    /// unchanged and `PROTOCOL_VERSION` does not move — but "unchanged" is a
+    /// claim about somebody else's crate, fetched by tag, and this is the one
+    /// frame the agent builds that carries one. Asserted against a literal
+    /// rather than a round-trip: a round-trip through the same two impls agrees
+    /// with itself no matter what either of them does, which is the shape that
+    /// confirms nothing.
+    ///
+    /// If this ever fails, the fix is in `omnuv-protocol` and it is a wire
+    /// break — not a `.to_string()` here to paper over it.
+    #[test]
+    fn a_redacted_secret_leaves_the_agent_as_a_plain_json_string() {
+        let frame = omnuv_protocol::TunnelFrame::ConsoleCredential {
+            id: "c-1".into(),
+            password: "vnc-secret-9f2a".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&frame).expect("a frame must serialize"),
+            r#"{"t":"console_credential","id":"c-1","password":"vnc-secret-9f2a"}"#
+        );
     }
 }

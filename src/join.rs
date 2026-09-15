@@ -69,7 +69,7 @@ fi
 
 pub struct JoinArgs {
     pub core: String,
-    pub token: String,
+    pub token: omnuv_protocol::Redacted,
     pub region: String,
     pub cpu_cores: u32,
     pub memory_mib: u64,
@@ -289,7 +289,7 @@ proxmox:
 {gpus}
 "#,
         core = a.core,
-        token = a.token,
+        token = a.token.expose(),
         cpu = a.cpu_cores,
         mem = a.memory_mib,
         disk = a.disk_gib,

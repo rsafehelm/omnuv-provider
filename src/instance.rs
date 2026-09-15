@@ -109,6 +109,39 @@ const RECIPE_DIR: &str = "/opt/onv/recipe";
 /// read with `VM.GuestAgent.FileRead` and nothing wider — see `recipe_progress`.
 const RECIPE_STATUS: &str = "/etc/onv/recipe-status";
 
+/// Where a recipe leaves the stream login it minted for itself.
+///
+/// **A second path, and it cannot be avoided by folding it into the first.**
+/// The recipe runs under a trap that does `printf … > RECIPE_STATUS` on every
+/// exit, which truncates — so anything the recipe wrote into that file would be
+/// gone before this ever looked at it, and the body runs as a child shell that
+/// cannot re-arm its parent's trap. Two files, one extra read.
+const RECIPE_STREAM_CREDENTIAL: &str = "/etc/onv/recipe-stream-credential";
+
+/// The login out of that file, or None when it is not there yet or not whole.
+///
+/// `user=…\npassword=…` — the same `key=value` shape the status file uses, and
+/// unknown keys are ignored, so the recipe can add one without an agent that
+/// predates it refusing to parse.
+///
+/// **Both halves or neither.** A blank user with a blank password is a login
+/// nobody can use, handed up as one that works — the failure `CLAUDE.md` calls
+/// worse than an absent credential, because a non-empty string passes every
+/// `length > 0` check on the way and then refuses every sign-in at the end.
+fn parse_stream_credentials(content: &str) -> Option<omnuv_protocol::StreamCredentials> {
+    let (mut user, mut password) = (None, None);
+    for line in content.lines() {
+        match line.split_once('=') {
+            Some(("user", v)) => user = Some(v.trim().to_string()),
+            Some(("password", v)) => password = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+    let (user, password) = (user?, password?);
+    (!user.is_empty() && !password.is_empty())
+        .then_some(omnuv_protocol::StreamCredentials { user, password: password.into() })
+}
+
 /// The recipe's compose file, written before any package runs. Base64: a
 /// compose file is YAML inside YAML, and escaping it would be a bug farm.
 fn recipe_files(recipe: &omnuv_protocol::RecipeSpec) -> String {
@@ -195,7 +228,16 @@ fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment) -> String {
         "  - [ sh, -c, \"netbird up --management-url {url} --setup-key {key}{host_arg} \
          >/var/log/onv-overlay.log 2>&1 || true\" ]\n",
         url = o.management_url,
-        key = o.setup_key,
+        // `.expose()`, and the reason is that the compiler does not object to
+        // its absence. `Redacted`'s `Display` prints `<redacted>`, so
+        // `{key}` alone yields a cloud-config that is valid YAML, embeds a
+        // syntactically fine `netbird up --setup-key <redacted>`, and enrols
+        // nothing — behind `|| true`, on a machine that then boots, answers its
+        // console and reports RUNNING. This is the one place in the agent where
+        // the redaction could have shipped as a silent outage rather than as a
+        // build error, which is why the test below asserts the key's own bytes
+        // reach the guest rather than that this file compiles.
+        key = o.setup_key.expose(),
     )
 }
 
@@ -916,35 +958,27 @@ impl Client {
         })
     }
 
-    /// How the recipe's install went, read from the one file the recipe writes.
+    /// How the recipe's install went, read from the files the recipe writes.
     ///
     /// The recipe reports its own outcome — the step it reached and the exit
-    /// code — and this reads that single path and nothing else. Reading a known
-    /// file needs `VM.GuestAgent.FileRead`; asking the guest to run
-    /// `cloud-init status` instead would need `VM.GuestAgent.Unrestricted`,
-    /// which is arbitrary command execution inside a machine the buyer owns.
-    /// The marketplace must never be able to do that, so it does not ask for it.
+    /// code — and, once it has succeeded, the stream login it minted for
+    /// itself. Two known paths and nothing else. Reading a known file needs
+    /// `VM.GuestAgent.FileRead`; asking the guest to run `cloud-init status`
+    /// instead would need `VM.GuestAgent.Unrestricted`, which is arbitrary
+    /// command execution inside a machine the buyer owns. The marketplace must
+    /// never be able to do that, so it does not ask for it — and a second path
+    /// of the same kind does not widen it by anything.
     ///
     /// Best-effort by construction: a guest with no agent, a machine still
     /// installing, or an image that never wrote the file all return None, and
     /// None means "not known", never "failed".
     async fn recipe_progress(&self, node: &str, vmid: u32) -> Option<omnuv_protocol::RecipeProgress> {
-        #[derive(serde::Deserialize)]
-        struct FileRead {
-            content: String,
-        }
-
-        let read: FileRead = self
-            .get_json(&format!(
-                "/nodes/{node}/qemu/{vmid}/agent/file-read?file={RECIPE_STATUS}"
-            ))
-            .await
-            .ok()?;
+        let status = self.read_guest_file(node, vmid, RECIPE_STATUS).await?;
 
         // step=3/6\nrc=100 — written by the recipe's own EXIT trap.
         let mut step = None;
         let mut rc = None;
-        for line in read.content.lines() {
+        for line in status.lines() {
             match line.split_once('=') {
                 Some(("step", v)) => step = Some(v.trim().to_string()),
                 Some(("rc", v)) => rc = v.trim().parse::<i32>().ok(),
@@ -963,7 +997,43 @@ impl Client {
             step: step.filter(|s| s != "finished" && s != "starting"),
             detail: (rc != 0)
                 .then(|| format!("The recipe stopped with exit code {rc}. Its output is in the machine's own /var/log/cloud-init-output.log.")),
+            // Only after the install succeeded: a recipe that failed has no
+            // stream to sign in to, and this is a guest-agent call per poll for
+            // as long as the machine lives.
+            //
+            // Read every time rather than once, because **the agent cannot know
+            // whether Core received it.** A delivery that was lost is not
+            // recoverable — nothing can mint this credential twice — and
+            // re-reporting costs nothing, because Core writes only where
+            // `stream_credential_at is null`. The guest leaves the file in
+            // place for exactly that reason.
+            stream_credentials: match rc {
+                0 => self
+                    .read_guest_file(node, vmid, RECIPE_STREAM_CREDENTIAL)
+                    .await
+                    .and_then(|c| parse_stream_credentials(&c)),
+                _ => None,
+            },
         })
+    }
+
+    /// One known path out of a guest, or None.
+    ///
+    /// Never `VM.GuestAgent.Unrestricted` — see `recipe_progress`. None is
+    /// "could not look", never "the file says no": a guest with no agent, a
+    /// machine still booting, and a path that does not exist are one answer
+    /// here, and every caller has to treat them as one.
+    async fn read_guest_file(&self, node: &str, vmid: u32, path: &str) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct FileRead {
+            content: String,
+        }
+
+        let read: FileRead = self
+            .get_json(&format!("/nodes/{node}/qemu/{vmid}/agent/file-read?file={path}"))
+            .await
+            .ok()?;
+        Some(read.content)
     }
 
     /// While Core is unreachable: **maintain, do not decide.**
@@ -1541,7 +1611,15 @@ echo 'single' "double" `backtick` \$escaped
         let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
         assert!(doc.get("runcmd").is_some_and(|r| r.is_sequence()));
         assert!(ci.contains("netbird up"), "the machine must enrol itself");
-        assert!(ci.contains("--setup-key 0E38B183"), "with its own key");
+        // The whole key, not a prefix of it. This is the assertion that stands
+        // between a redacted secret type and a fleet of machines that boot,
+        // report RUNNING and enrol nothing: it fails on `<redacted>`, and it
+        // also fails on a key truncated anywhere after the eighth character,
+        // which a prefix match would have waved through.
+        assert!(
+            ci.contains("--setup-key 0E38B183-B8B6-45CE-B93B-2EF63F3D14E4"),
+            "the enrolment key must reach the guest whole: {ci}"
+        );
         assert!(ci.contains("|| true"), "and a failure must not stop the boot");
     }
 
@@ -1596,5 +1674,39 @@ echo 'single' "double" `backtick` \$escaped
         // The first entry, past any comment lines.
         let first = after.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
         assert!(first.starts_with("- ["), "bootcmd has at least one item, got {first:?}");
+    }
+
+    /// A half-written credential is not a credential.
+    ///
+    /// The file is written by a `printf` in the recipe, so this reads it before
+    /// it exists, while it is being written, and after — and the only shape
+    /// that may produce a `Some` is the whole one. A blank half handed upward
+    /// would be a login that passes every `length > 0` check between here and
+    /// the buyer's screen, and then refuses to sign in: worse than none at all,
+    /// because absence is detectable.
+    #[test]
+    fn a_stream_credential_is_delivered_whole_or_not_at_all() {
+        let whole = parse_stream_credentials("user=onv-Ab3xK9zQ\npassword=s3cr3tXYZ\n")
+            .expect("both halves present");
+        assert_eq!(whole.user, "onv-Ab3xK9zQ");
+        assert_eq!(whole.password.expose(), "s3cr3tXYZ");
+
+        for partial in [
+            "",                              // not written yet
+            "user=onv-Ab3xK9zQ\n",           // caught mid-printf
+            "password=s3cr3tXYZ\n",          // the user line lost
+            "user=\npassword=s3cr3tXYZ\n",   // blank halves are not halves
+            "user=onv-Ab3xK9zQ\npassword=\n",
+            "step=3/6\nrc=0\n",              // the *other* file, by mistake
+        ] {
+            assert!(
+                parse_stream_credentials(partial).is_none(),
+                "must not deliver a partial credential: {partial:?}"
+            );
+        }
+
+        // Unknown keys are ignored rather than fatal, so the recipe can add one
+        // without an agent that predates it refusing the whole file.
+        assert!(parse_stream_credentials("port=47990\nuser=u\npassword=p\n").is_some());
     }
 }

@@ -59,6 +59,15 @@ pub struct Contribution {
     pub gpu_vram_mib: std::collections::HashMap<String, u64>,
 }
 
+/// The *names* of the two environment variables holding the credentials —
+/// never the values. `Debug` here prints `OMNUV_PVE_TOKEN_SECRET`, which is
+/// exactly what somebody reading a log needs to see.
+///
+/// Said out loud because `secret: String` beside a redacted `token_secret`
+/// looks like an omission. It is the opposite: a redaction driven by field
+/// *name* rather than by type would hide this one, and a `<redacted>` standing
+/// where a variable name belongs teaches everyone to skim past the redactions
+/// that matter.
 #[derive(Debug, Deserialize)]
 pub struct TokenEnv {
     pub id: String,
@@ -126,6 +135,51 @@ developmentInfrastructure:
         assert_eq!(t.contribute.memory_mib, 16384);
         assert_eq!(t.contribute.storage, vec!["zfs-fast"]);
     }
+
+    /// **The agent's two credentials survive `{:?}` on the struct that holds
+    /// them**, which is the whole reason their type changed.
+    ///
+    /// `AgentConfig` derives `Debug` and is passed by reference to four places
+    /// in `agent.rs`. Before `Redacted` this test could not have been written
+    /// to pass: one `tracing::debug!(?cfg)` on a bad afternoon printed the Core
+    /// bearer token and the Proxmox API secret into the journal, side by side,
+    /// out of a file the deployment deliberately keeps at mode `0600`.
+    ///
+    /// Asserted on the *formatted output* rather than on the source, because
+    /// the defect is what `Debug` emits and a grep for `derive(Debug` would
+    /// match the eighty legitimate ones — and its own needle. The second half
+    /// matters as much as the first: a redaction that also hid the value from
+    /// the code that has to spend it would be a broken agent, not a safe one.
+    #[test]
+    fn debug_on_the_agent_config_redacts_both_credentials() {
+        let cfg: super::AgentConfig = serde_yaml_ng::from_str(
+            r#"
+core:
+  url: https://api.omnuv.com
+  token: core-bearer-AAAA1111
+proxmox:
+  apiUrl: https://127.0.0.1:8006
+  tokenId: onv@pve!agent
+  tokenSecret: pve-secret-BBBB2222
+"#,
+        )
+        .expect("agent config must parse");
+
+        let shown = format!("{cfg:?}");
+        for secret in ["core-bearer-AAAA1111", "pve-secret-BBBB2222"] {
+            assert!(!shown.contains(secret), "Debug leaked {secret}: {shown}");
+        }
+        assert_eq!(shown.matches("<redacted>").count(), 2, "both, not one: {shown}");
+
+        // `token_id` is a username, not a credential, and stays readable — a
+        // redaction driven by field name rather than by type would have taken
+        // it too, and trained everyone to skim the redaction.
+        assert!(shown.contains("onv@pve!agent"), "the token id is not a secret: {shown}");
+
+        // And the value is still reachable by the code that spends it.
+        assert_eq!(cfg.core.token.expose(), "core-bearer-AAAA1111");
+        assert_eq!(cfg.proxmox.token_secret.expose(), "pve-secret-BBBB2222");
+    }
 }
 
 // ---------- agent configuration ----------
@@ -151,7 +205,15 @@ fn default_inventory_secs() -> u64 {
 #[derive(Debug, Deserialize)]
 pub struct CoreEndpoint {
     pub url: String,
-    pub token: String,
+    /// `0600` protects the file; the type protects the log.
+    ///
+    /// `AgentConfig` derives `Debug` and holds this *and* the Proxmox secret
+    /// below, so a single `tracing::debug!(?cfg)` at any of the four sites that
+    /// take `&cfg` would write both credentials to the journal — where the file
+    /// mode buys exactly nothing. A hand-written `Debug` on `AgentConfig` would
+    /// fix today's two fields and nothing about the third one somebody adds, so
+    /// the redaction lives on the field's type instead.
+    pub token: omnuv_protocol::Redacted,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +223,10 @@ pub struct ProxmoxRuntime {
     pub node: Option<String>,
     pub tls_fingerprint_sha256: Option<String>,
     pub token_id: String,
-    pub token_secret: String,
+    /// Redacted for the reason given on `CoreEndpoint::token`: a different
+    /// blast radius reached through the same derive, by the same one-line
+    /// mistake. `token_id` beside it is a username and stays readable.
+    pub token_secret: omnuv_protocol::Redacted,
     /// Template cloned for marketplace-managed VMs (inference workers, the
     /// overlay gateway), and for the shipped Linux image when `images` is not
     /// set.

@@ -55,7 +55,7 @@ const AGENT_VERSION: &str = match option_env!("OMNUV_BUILD") {
 struct Core {
     http: reqwest::Client,
     base: String,
-    token: String,
+    token: omnuv_protocol::Redacted,
 }
 
 impl Core {
@@ -70,7 +70,7 @@ impl Core {
     /// Certificates are verified against the platform roots. `http://` is
     /// refused unless the operator sets `OMNUV_ALLOW_PLAINTEXT_CORE=1`, which
     /// exists for a LAN development loop and says so in the log.
-    fn new(url: &str, token: &str) -> anyhow::Result<Self> {
+    fn new(url: &str, token: &omnuv_protocol::Redacted) -> anyhow::Result<Self> {
         let base = url.trim_end_matches('/').to_string();
         if base.starts_with("http://") {
             let allowed = std::env::var("OMNUV_ALLOW_PLAINTEXT_CORE").is_ok_and(|v| v == "1");
@@ -87,14 +87,14 @@ impl Core {
             .https_only(!base.starts_with("http://"))
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http, base, token: token.to_string() })
+        Ok(Self { http, base, token: token.clone() })
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let res = self
             .http
             .get(format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose())
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await?;
@@ -128,7 +128,7 @@ impl Core {
         let res = self
             .http
             .get(&a.url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose())
             // Deliberately long, and not the 30 seconds every other call uses:
             // a 6 GB transfer over a provider's uplink is not a hung request,
             // and killing it at 30 seconds would mean no image ever arrives.
@@ -174,7 +174,7 @@ impl Core {
         let mut req = self
             .http
             .post(format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose())
             .timeout(std::time::Duration::from_secs(30));
         if let Some(b) = body {
             req = req.json(&b);
@@ -233,7 +233,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         &cfg.proxmox.api_url,
         cfg.proxmox.tls_fingerprint_sha256.as_deref(),
         &cfg.proxmox.token_id,
-        &cfg.proxmox.token_secret,
+        cfg.proxmox.token_secret.expose(),
         cfg.proxmox.node.clone(),
         cfg.proxmox.contribute.clone(),
         match (cfg.proxmox.latitude, cfg.proxmox.longitude) {
