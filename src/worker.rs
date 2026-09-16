@@ -33,6 +33,21 @@ pub(crate) struct VmRef {
 /// card's ROM and a guest driver reading it fails to initialize the adapter.
 /// Verified on hardware against an RTX 3090 that was its host's boot display:
 /// with the ROM bar hidden the guest's driver loads and `nvidia-smi` lists it.
+///
+/// **What this does not fix, and what looked like it did.** On 16 September a
+/// second RTX 3090 on the same host — not its boot display — failed in the
+/// guest with `RmInitAdapter failed! (0x62:0x65:2830)`, and `rombar` was the
+/// obvious suspect. It was not: the card failed identically with the ROM bar
+/// hidden, with it visible, with a VBIOS dumped from the working card and
+/// passed as `romfile=`, and as the guest's primary display. The cause was
+/// that the Proxmox mapping named the *video function* (`0000:21:00.0`)
+/// rather than the card (`0000:21:00`), so the audio function stayed bound to
+/// the host. With the whole device mapped it comes up first time, with no
+/// `romfile` and no other change — see `deploy-agent.yml`, which builds the
+/// mapping.
+///
+/// Recorded because three plausible fixes were tested and discarded here, and
+/// the next person to meet a 0x62 should check the mapping's path first.
 pub(crate) fn mapping_name(pci: &str) -> String {
     crate::names::gpu_mapping(pci)
 }
