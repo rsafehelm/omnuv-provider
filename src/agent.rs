@@ -144,12 +144,54 @@ impl Core {
         let mut hasher = sha2::Sha256::new();
         let mut written: u64 = 0;
         let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            hasher.update(&chunk);
-            written += chunk.len() as u64;
-            f.write_all(&chunk).await?;
+
+        // **A stall is not an error, and that is what wedged a provider for an
+        // hour.** The six-hour budget above is a *whole-request* timeout,
+        // chosen so a slow transfer is not killed. It says nothing about a
+        // connection that stops sending without closing: `next()` then waits,
+        // for up to six hours, and this runs on the task that also applies
+        // desired state — so on 16 September a partial image sat at a fixed
+        // byte count for fifty minutes while a teardown reported `reconciling`
+        // eight times and a machine Core had already released went on holding
+        // an RTX 3090.
+        //
+        // Each chunk gets its own deadline instead. Bytes must keep arriving;
+        // a longer gap is a dead transfer, and the right thing to do with one
+        // is abort so the next tick can start again.
+        const IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+        let outcome: anyhow::Result<()> = async {
+            loop {
+                match tokio::time::timeout(IDLE, stream.next()).await {
+                    Err(_) => anyhow::bail!(
+                        "no bytes for {}s after {written} of {}; the transfer is dead",
+                        IDLE.as_secs(),
+                        a.bytes
+                    ),
+                    Ok(None) => break,
+                    Ok(Some(chunk)) => {
+                        let chunk = chunk?;
+                        hasher.update(&chunk);
+                        written += chunk.len() as u64;
+                        f.write_all(&chunk).await?;
+                    }
+                }
+            }
+            Ok(())
         }
+        .await;
+
+        // **The partial is removed on every failure, not only on a bad
+        // digest.** It used to leak: an error propagated straight out of the
+        // loop, leaving a `.part` the next attempt truncated and restarted
+        // from zero — which is why a retry was seen going 6.67 GB to 2.24 GB
+        // rather than resuming. Nothing here resumes yet, so the least it can
+        // do is not leave several gigabytes on a provider's disk per failure.
+        if let Err(e) = outcome {
+            drop(f);
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+
         f.flush().await?;
         drop(f);
 
