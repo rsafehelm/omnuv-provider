@@ -125,24 +125,90 @@ impl Core {
         use tokio::io::AsyncWriteExt as _;
 
         let part = dest.with_extension("part");
-        let res = self
+        if let Some(parent) = part.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // **What a previous attempt left, and whether it is still the right
+        // bytes.** The filename is per image id, so a partial from before the
+        // catalogue moved would be resumed onto a *different* artefact and
+        // only caught by the digest at the end, after paying for the whole
+        // transfer. A sidecar naming the digest it was being fetched for is
+        // what makes resuming safe rather than merely fast.
+        let stamp = dest.with_extension("part.sha256");
+        let resumable = match tokio::fs::read_to_string(&stamp).await {
+            Ok(s) if s.trim() == a.sha256 => true,
+            _ => false,
+        };
+        let have: u64 = if resumable {
+            tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0)
+        } else {
+            // A partial for something else, or one with no provenance. Neither
+            // is worth the risk of appending to.
+            let _ = tokio::fs::remove_file(&part).await;
+            0
+        };
+        // A partial at or beyond the published size is not a resume point; it
+        // is a file that should already have been finished or discarded.
+        let have = if have > 0 && have < a.bytes { have } else { 0 };
+        if have == 0 {
+            let _ = tokio::fs::remove_file(&part).await;
+            tokio::fs::write(&stamp, &a.sha256).await?;
+        }
+
+        let mut req = self
             .http
             .get(&a.url)
             .bearer_auth(self.token.expose())
             // Deliberately long, and not the 30 seconds every other call uses:
             // a 6 GB transfer over a provider's uplink is not a hung request,
             // and killing it at 30 seconds would mean no image ever arrives.
-            .timeout(std::time::Duration::from_secs(6 * 3600))
-            .send()
-            .await?;
+            .timeout(std::time::Duration::from_secs(6 * 3600));
+        if have > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let res = req.send().await?;
         anyhow::ensure!(res.status().is_success(), "GET {}: {}", a.url, res.status());
 
-        if let Some(parent) = part.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        // **206 means the server honoured the range; 200 means it ignored it
+        // and is sending the whole file from zero.** Appending to a partial in
+        // that case would produce a file that is too long and hashes to
+        // nothing — so the answer decides, never the request.
+        let appending = have > 0 && res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        if have > 0 && !appending {
+            eprintln!(
+                "image {}: asked to resume at {have} and the server sent the whole file; starting again",
+                a.id
+            );
         }
-        let mut f = tokio::fs::File::create(&part).await?;
+
         let mut hasher = sha2::Sha256::new();
         let mut written: u64 = 0;
+        if appending {
+            // The hash is over the whole artefact, and a streaming digest
+            // cannot be resumed — so the bytes already on disk are read back
+            // through it first. That costs a local read of what was already
+            // fetched, which is the cheap half of the transfer and is why
+            // resuming is worth it at all.
+            use tokio::io::AsyncReadExt as _;
+            let mut existing = tokio::fs::File::open(&part).await?;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = existing.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                written += n as u64;
+            }
+            eprintln!("image {}: resuming at {written} of {}", a.id, a.bytes);
+        }
+
+        let mut f = if appending {
+            tokio::fs::OpenOptions::new().append(true).open(&part).await?
+        } else {
+            tokio::fs::File::create(&part).await?
+        };
         let mut stream = res.bytes_stream();
 
         // **A stall is not an error, and that is what wedged a provider for an
@@ -180,15 +246,24 @@ impl Core {
         }
         .await;
 
-        // **The partial is removed on every failure, not only on a bad
-        // digest.** It used to leak: an error propagated straight out of the
-        // loop, leaving a `.part` the next attempt truncated and restarted
-        // from zero — which is why a retry was seen going 6.67 GB to 2.24 GB
-        // rather than resuming. Nothing here resumes yet, so the least it can
-        // do is not leave several gigabytes on a provider's disk per failure.
+        // **The partial is kept on failure, which is the opposite of what this
+        // did an hour ago and is right for the opposite reason.** When nothing
+        // resumed, a leaked `.part` was pure cost: the next attempt truncated
+        // it and started from zero, which is how a retry was seen going 6.67 GB
+        // to 2.24 GB. Now that the next attempt asks for `bytes=<len>-`, those
+        // same bytes are the thing that makes the retry cheap.
+        //
+        // What makes keeping it safe is the sidecar written above: a partial
+        // is only ever resumed when it names the digest now being fetched. A
+        // stale one is deleted rather than appended to.
         if let Err(e) = outcome {
+            f.flush().await?;
             drop(f);
-            let _ = tokio::fs::remove_file(&part).await;
+            eprintln!(
+                "image {}: keeping {written} bytes at {} to resume from",
+                a.id,
+                part.display()
+            );
             return Err(e);
         }
 
@@ -198,8 +273,12 @@ impl Core {
         let got = crate::images::hex(&hasher.finalize());
         if got != a.sha256 || written != a.bytes {
             // Removed, not kept for inspection: a file that is nearly right is
-            // the most dangerous thing in this directory.
+            // the most dangerous thing in this directory. The sidecar goes
+            // with it, so nothing later mistakes these bytes for a resume
+            // point — a complete-but-wrong transfer is the one case where the
+            // partial must not survive.
             let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(&stamp).await;
             anyhow::bail!(
                 "{}: the marketplace published {} bytes sha256 {}; {written} bytes sha256 {got} \
                  arrived. Not imported.",
@@ -209,6 +288,7 @@ impl Core {
             );
         }
         tokio::fs::rename(&part, dest).await?;
+        let _ = tokio::fs::remove_file(&stamp).await;
         Ok(())
     }
 
