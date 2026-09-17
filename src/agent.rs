@@ -52,6 +52,10 @@ const AGENT_VERSION: &str = match option_env!("OMNUV_BUILD") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+// Cloned rather than borrowed, and that is what lets the image mirror run off
+// the reconcile path: `reqwest::Client` is an Arc around one connection pool,
+// so a clone shares the pool instead of opening a second one.
+#[derive(Clone)]
 struct Core {
     http: reqwest::Client,
     base: String,
@@ -351,6 +355,9 @@ async fn startup_checks(
 }
 
 pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
+    // Shared with the image mirror's own task, which outlives no call here
+    // but does outlive every reconcile pass.
+    let cfg = Arc::new(cfg);
     let driver = Arc::new(proxmox::Client::new(
         &cfg.proxmox.api_url,
         cfg.proxmox.tls_fingerprint_sha256.as_deref(),
@@ -425,6 +432,49 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // orchestration store the architecture forbids.
     let held: Arc<Mutex<Option<DesiredState>>> = Arc::new(Mutex::new(None));
 
+    // **The image mirror runs beside the reconcile loop, never inside it.**
+    //
+    // It was an `.await` in the middle of `reconcile_workers`, and that is a
+    // seven-gigabyte transfer holding the task that also applies desired
+    // state. Measured twice on 16 September: a teardown reported
+    // `reconciling  waiting on 1 machine(s)` for ten passes while a healthy
+    // download ran for twelve minutes, and then a *dead* one sat at
+    // 6,672,056,096 bytes for fifty minutes while a machine Core had already
+    // released went on holding an RTX 3090. The idle timeout fixed the second
+    // case and could not fix the first, because a long download is not a
+    // fault — it is work that simply does not belong on this path.
+    //
+    // **Coalesced by `Notify`, not queued.** A nudge that arrives while a
+    // mirror is running leaves exactly one permit, so the next pass fetches
+    // the catalogue as it is *then* rather than replaying every catalogue it
+    // was told about in between. The desired list is a destination, and the
+    // thousandth identical send means the same as the first.
+    let mirror_wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Arc::new(Mutex::new(Vec::new()));
+    let mirror_kick = Arc::new(tokio::sync::Notify::new());
+    {
+        let core = core.clone();
+        let driver = driver.clone();
+        let cfg = cfg.clone();
+        let wanted = mirror_wanted.clone();
+        let kick = mirror_kick.clone();
+        tokio::spawn(async move {
+            let node = cfg.proxmox.node.clone().unwrap_or_default();
+            loop {
+                kick.notified().await;
+                let catalogue = wanted.lock().map(|w| w.clone()).unwrap_or_default();
+                if catalogue.is_empty() {
+                    continue;
+                }
+                // Logged, never propagated: an image that will not download is
+                // a provider with fewer things it can earn from, and this task
+                // exiting would mean it never tried again.
+                if let Err(e) = mirror_images(&core, &driver, &cfg, &node, &catalogue).await {
+                    eprintln!("image mirror: {e}");
+                }
+            }
+        });
+    }
+
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
     let mut inventory = tokio::time::interval(std::time::Duration::from_secs(cfg.inventory_every_secs));
     // Reconciliation is push-driven; this interval is only the fallback for a
@@ -450,12 +500,12 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 }
             }
             _ = nudge.notified() => {
-                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held).await {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
                     eprintln!("reconcile (pushed) failed: {e}");
                 }
             }
             _ = reconcile.tick() => {
-                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held).await {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
                     eprintln!("reconcile failed: {e}");
                 }
             }
@@ -680,6 +730,11 @@ async fn reconcile_workers(
     cfg: &AgentConfig,
     endpoints: &Arc<Mutex<HashMap<String, String>>>,
     held: &Arc<Mutex<Option<DesiredState>>>,
+    // Where the image mirror reads its work from, and how it is woken. This
+    // function only ever writes and notifies; the transfer happens in another
+    // task, for the reason written where that task is spawned.
+    mirror_wanted: &Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>>,
+    mirror_kick: &Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
     let node = cfg.proxmox.node.as_deref().unwrap_or_default();
 
@@ -762,13 +817,16 @@ async fn reconcile_workers(
     // first machine was placed on it — which is the one moment the download
     // needs to have already happened.
     //
-    // Failures are logged, not propagated. An image that will not download is
-    // a provider with fewer things it can earn from; it is not a reason to
-    // stop converging the machines it already has.
-    if !desired.images.is_empty()
-        && let Err(e) = mirror_images(core, driver, cfg, node, &desired.images).await
-    {
-        eprintln!("image mirror: {e}");
+    // **Handed over rather than awaited.** This used to be the transfer
+    // itself, which put seven gigabytes on the task that also applies desired
+    // state — so a machine Core had released went on holding a card until the
+    // download finished. Writing the catalogue and waking the mirror costs a
+    // lock and a notify.
+    if !desired.images.is_empty() {
+        if let Ok(mut w) = mirror_wanted.lock() {
+            w.clone_from(&desired.images);
+        }
+        mirror_kick.notify_one();
     }
 
     // Segments whose last machine has gone. Before the early return below,
@@ -1038,4 +1096,43 @@ async fn reconcile_workers(
         anyhow::bail!("core rejected status report: {}", res.status());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    /// The transfer is not on the reconcile path.
+    ///
+    /// **Why a source check and not a behavioural one.** The property is
+    /// *where* an await happens, and nothing observable distinguishes a fast
+    /// mirror awaited inline from one handed to another task — the difference
+    /// only appears with seven gigabytes and a teardown waiting behind it,
+    /// which is exactly the run this test exists so nobody has to repeat.
+    ///
+    /// **Scoped to one function body**, per the rule this repository has paid
+    /// for three times: a file-wide search for `mirror_images` would match the
+    /// spawn in `run`, the definition, and the sentence you are reading.
+    #[test]
+    fn reconcile_hands_the_mirror_off_rather_than_awaiting_it() {
+        let src = include_str!("agent.rs");
+        let start = src
+            .find("async fn reconcile_workers(")
+            .expect("reconcile_workers is gone; this check has to move with it");
+        // The body ends at the first closing brace in column zero after it,
+        // which is how every top-level item in this file ends.
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("unterminated function");
+        let body = &body[..end];
+
+        assert!(
+            !body.contains("mirror_images("),
+            "reconcile_workers awaits the image transfer again. A 7 GB download on this path \
+             holds desired state: on 16 September a machine Core had released went on holding \
+             an RTX 3090 for fifty minutes. Write the catalogue to mirror_wanted and notify."
+        );
+        assert!(
+            body.contains("mirror_kick.notify_one()"),
+            "reconcile_workers no longer wakes the mirror, so images would only ever be fetched \
+             when something else happened to notify it."
+        );
+    }
 }
