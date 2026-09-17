@@ -164,7 +164,7 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     // do neither to anything else on this hypervisor.
     println!("\nConfining the agent to its own pools:");
     for (pool, comment) in
-        [(GATEWAY_POOL, "Omnuv overlay gateways"), (BUYER_POOL, "Omnuv buyer machines")]
+        [(GATEWAY_POOL, "Omnuv marketplace-owned machines"), (BUYER_POOL, "Omnuv buyer machines")]
     {
         step(
             &format!("pool {pool}"),
@@ -176,16 +176,15 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         )?;
     }
     for (role, privs, pool) in [
-        // Write, to keep a gateway's generated configuration current; and read,
-        // because a gateway that cannot be *read* cannot report whether it can
-        // reach anything. Without the read the self-check is permanently
-        // "unknown" — truthful, and useless, which is how a gateway that had
-        // lost the overlay looked healthy for a whole afternoon.
+        // Read, because a Workload Agent reports through a file its worker
+        // writes; and `Pool.Audit`, because an ACL on the pool replaces what is
+        // inherited from `/`, and without it the agent cannot see the pool it
+        // clones into. The same role `deploy-agent.yml` writes.
         //
-        // Still `FileRead` and never `Unrestricted`: the latter is arbitrary
-        // command execution inside the guest, and the marketplace has no
-        // business holding that on any machine.
-        ("OnvGatewayFiles", "VM.GuestAgent.FileWrite,VM.GuestAgent.FileRead", GATEWAY_POOL),
+        // No `FileWrite`: it existed to refresh a gateway's configuration, and
+        // topology v2 removed gateways. Never `Unrestricted`, which is
+        // arbitrary command execution inside the guest.
+        ("OnvWorkloadFiles", "VM.GuestAgent.FileRead,Pool.Audit", GATEWAY_POOL),
         ("OnvConsole", "VM.Console", BUYER_POOL),
         // Reads one file: the outcome a recipe writes about its own install.
         // Deliberately `FileRead` and not `Unrestricted` — the latter is
