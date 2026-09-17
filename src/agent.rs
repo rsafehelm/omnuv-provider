@@ -632,6 +632,20 @@ async fn mirror_images(
     let offered = cfg.proxmox.image_map();
     let held = crate::images::held(driver, node, &offered).await;
     let wanted = crate::images::outstanding(catalogue, &offered, &held);
+
+    let dir = std::path::Path::new(&cfg.proxmox.snippet_dir)
+        .parent()
+        .unwrap_or(std::path::Path::new(crate::names::VAR))
+        .join("import");
+
+    // **Before the early return**, because the partials worth removing belong
+    // exactly to the passes that have nothing left to fetch.
+    let keep: Vec<&str> = wanted.iter().map(|(a, _)| a.id.as_str()).collect();
+    for name in crate::images::reap_stale_partials(&dir, &keep) {
+        eprintln!("image mirror: removed stale partial {name}");
+        crate::audit::record("image.mirror", "agent", &name, "reaped", None);
+    }
+
     if wanted.is_empty() {
         return Ok(());
     }
@@ -642,10 +656,6 @@ async fn mirror_images(
     // an arbitrary path to anyone but root@pam.
     let import_storage = crate::names::STORAGE_SNIPPETS;
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
-    let dir = std::path::Path::new(&cfg.proxmox.snippet_dir)
-        .parent()
-        .unwrap_or(std::path::Path::new(crate::names::VAR))
-        .join("import");
 
     // **Bytes that are already right are not fetched again.** Set
     // `OMNUV_FORCE_IMAGE_REFETCH=1` to download regardless — for the case

@@ -84,6 +84,38 @@ pub fn artefact_file(id: &str) -> String {
     format!("{id}.qcow2")
 }
 
+/// Remove partial downloads for artefacts nothing is fetching.
+///
+/// A partial is `<id>.part` beside a `<id>.part.sha256` sidecar, and the
+/// download path only ever looks at the partial for the id it is fetching. So a
+/// partial for an image this host already holds, or no longer offers, is never
+/// read, never resumed and never removed: one from an interrupted transfer sat
+/// in the import directory at 2.24 GB with its template long since built.
+///
+/// `keep` is the set of ids the current pass is still fetching. Only files
+/// ending exactly in `.part` or `.part.sha256` are candidates, so a finished
+/// `.qcow2` is never touched. Returns what was removed.
+pub fn reap_stale_partials(dir: &std::path::Path, keep: &[&str]) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let id = name
+            .strip_suffix(".part.sha256")
+            .or_else(|| name.strip_suffix(".part"));
+        if let Some(id) = id
+            && !keep.contains(&id)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed.push(name);
+        }
+    }
+    removed.sort();
+    removed
+}
+
 /// The volume id Proxmox imports from, for an artefact already on disk.
 pub fn artefact_volid(storage: &str, id: &str) -> String {
     format!("{storage}:import/{}", artefact_file(id))
@@ -314,6 +346,24 @@ pub async fn import(
 
 #[cfg(test)]
 mod tests {
+    /// A partial for an id still being fetched survives, a partial for any
+    /// other id goes with its sidecar, and a finished artefact is never a
+    /// candidate whatever its id.
+    #[test]
+    fn stale_partials_go_and_nothing_else_does() {
+        let d = tempfile::tempdir().unwrap();
+        for f in ["old.part", "old.part.sha256", "live.part", "live.part.sha256",
+                  "old.qcow2", "notes.txt"] {
+            std::fs::write(d.path().join(f), b"x").unwrap();
+        }
+        let removed = super::reap_stale_partials(d.path(), &["live"]);
+        assert_eq!(removed, vec!["old.part", "old.part.sha256"]);
+        for f in ["live.part", "live.part.sha256", "old.qcow2", "notes.txt"] {
+            assert!(d.path().join(f).exists(), "{f} should have survived");
+        }
+        assert!(super::reap_stale_partials(&d.path().join("absent"), &[]).is_empty());
+    }
+
     use super::*;
 
     fn artefact(id: &str, sha: &str) -> ImageArtefact {
