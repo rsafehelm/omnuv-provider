@@ -668,7 +668,12 @@ impl Client {
             self.ensure_vnet(node, &marketplace_bridge(net)).await?;
         }
 
-        if let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(&spec.id)).await? {
+        // **Cluster-wide, or a machine on another node is built twice.** The
+        // caller's `node` is where a *new* machine would go; an existing one is
+        // wherever it already is, and asking only the caller's node made a
+        // machine on `nuc3` look like one that had never been created.
+        if let Some((node, vm)) = self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await? {
+            let node = node.as_str();
             let mut running = vm.status.as_deref() == Some("running");
 
             // The machine's place on its network's segment. A machine built
@@ -833,45 +838,65 @@ impl Client {
             });
         }
 
-        // **A card that is not free is refused here, before anything is built.**
+        // **A card that is not free is refused before anything is built, and
+        // every node is asked.**
         //
-        // The agent already knows which cards are taken: `claimed_pci` lists
-        // every display controller on the node and subtracts the slots each
-        // existing guest holds in its `hostpci*` configuration. That answer was
-        // used on one side of the transaction only — to decide what to *offer*
-        // Core — and never to decide whether to *accept* a placement.
-        //
-        // So a request for a card another machine holds used to be attempted:
-        // the VM was cloned, the attach failed with Proxmox's own
+        // The agent already knew which cards are taken: `claimed_pci` lists
+        // every display controller on a node and subtracts the slots each guest
+        // holds in its `hostpci*` configuration. That answer was used on one
+        // side of the transaction only — to decide what to *offer* Core — and
+        // never to decide whether to *accept* a placement. So a request for a
+        // card another machine held was attempted: the VM was cloned, the attach
+        // failed with Proxmox's own
         //
         //     PCI device '0000:21:00.0' already in use by VMID '103'
         //
-        // and the refusal came back as a generic task failure, which reads as
-        // retryable. Core then re-drove an impossible request for as long as
-        // the other machine lived, and each attempt left a stopped shell
-        // holding a disk. Measured on Pluto with two RTX 3090s, 19 September.
+        // and that generic task failure read as retryable. Core re-drove an
+        // impossible request for as long as the other machine lived, and each
+        // attempt left a stopped shell holding a disk. Measured on Pluto with
+        // two RTX 3090s, 19 September 2026.
         //
-        // **This is one-shot.** A card in use is not a transient condition to
-        // wait out: it is a placement that was wrong when it was made, and the
-        // marketplace's answer is to place the machine elsewhere rather than to
-        // queue behind another tenant's machine. Nothing is created.
-        if !spec.gpu_local_ids.is_empty() {
-            let claims = self.claimed_pci(node, None).await;
-            // **An incomplete view refuses rather than proceeds.** "I could not
-            // read every guest" and "every card is free" must never be the same
-            // answer — that is how a card gets sold twice.
-            anyhow::ensure!(
-                claims.complete,
-                "cannot prove a GPU is free on {node}: the guest inventory is incomplete,                  so this placement is refused rather than risk selling a card twice"
-            );
-            for want in &spec.gpu_local_ids {
-                let slot = crate::proxmox::pci_slot(want);
-                anyhow::ensure!(
-                    claims.may_offer(&slot),
-                    "GPU {want} is not free on this provider: it is already assigned to                      another guest. This placement is refused and nothing was created;                      the marketplace should place this machine on a provider with a                      free card."
-                );
+        // **One-shot, and cluster-wide.** A card in use is not a transient
+        // condition to wait out — it is a placement that was wrong when it was
+        // made. But "wrong" is a statement about the *provider*, not about one
+        // of its nodes, so every node is asked before the provider refuses.
+        //
+        // **Every node, not one — and a refusal that says the provider is full.**
+        //
+        // A provider runtime may be a cluster, and this path knew only the node
+        // the caller named. So a card free on `nuc3` was invisible, and a
+        // cluster with capacity refused work it could have taken.
+        //
+        // The order is deterministic and the first node that fits wins. This is
+        // not the marketplace's scheduler — Core already chose *this provider* —
+        // it is the provider's own local placement, which CLAUDE.md puts behind
+        // the driver on purpose.
+        //
+        // **Feasibility first, never attempt-and-see.** Creating a machine on
+        // each node in turn until one sticks is how the GPU bug happened: a
+        // doomed clone, a failure at attach, a shell left behind. Each node is
+        // asked whether it *can* before anything is built, and when none can the
+        // answer is one sentence about the provider rather than five about nodes.
+        let candidates = self.placement_nodes().await?;
+        let mut refused: Vec<String> = Vec::new();
+        let mut chosen: Option<String> = None;
+        for candidate in &candidates {
+            match self.node_can_place(candidate, spec).await {
+                Ok(()) => {
+                    chosen = Some(candidate.clone());
+                    break;
+                }
+                Err(why) => refused.push(format!("{candidate}: {why}")),
             }
         }
+        let Some(node_owned) = chosen else {
+            anyhow::bail!(
+                "insufficient resources on this provider: none of its {} node(s) can place this machine. {}",
+                candidates.len(),
+                refused.join("; ")
+            );
+        };
+        let node = node_owned.as_str();
 
         // The image decides how first boot is rendered. Only cloud-init is
         // implemented; a Cloudbase-Init image is refused here with the reason
@@ -1136,7 +1161,19 @@ impl Client {
             }
         }
 
-        let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(id)).await? else {
+        // **Cluster-wide, for the same reason `ensure_instance` is.** A delete
+        // that looks on one node reports a machine on another as already gone —
+        // which is the worst possible answer: Core releases the allocation and
+        // the card, and the machine keeps running on hardware nobody believes is
+        // in use. The node the caller named is where a *new* machine would go,
+        // never where an existing one is.
+        let (found_node, found_vm) = match self.find_tagged_vm_anywhere(TAG, &short_tag(id)).await?
+        {
+            Some((n, v)) => (n, Some(v)),
+            None => (node.to_string(), None),
+        };
+        let node = found_node.as_str();
+        let Some(vm) = found_vm else {
             return Ok(());
         };
         if vm.status.as_deref() == Some("running") {
@@ -1805,5 +1842,89 @@ mod gpu_placement_is_one_shot {
         // check above was bypassed rather than that the card is permanently
         // gone.
         assert!(classify("proxmox task failed: PCI device '0000:21:00.0' already in use"));
+    }
+}
+
+impl crate::proxmox::Client {
+    /// Can **this node** take this machine? Asked before anything is created.
+    ///
+    /// The one resource checked today is the GPU, because it is the one that is
+    /// exclusive, scarce, and silently wrong when double-sold. CPU, memory and
+    /// storage are reserved by the marketplace ledger rather than here, and
+    /// adding them is a second arm of this function rather than a second shape.
+    ///
+    /// Every refusal is a sentence, because the caller joins them into the
+    /// message an operator reads when the whole provider is full.
+    pub(crate) async fn node_can_place(
+        &self,
+        node: &str,
+        spec: &omnuv_protocol::InstanceSpec,
+    ) -> anyhow::Result<()> {
+        if spec.gpu_local_ids.is_empty() {
+            return Ok(());
+        }
+        let claims = self.claimed_pci(node, None).await;
+        // **An incomplete view refuses rather than proceeds.** "I could not read
+        // every guest" and "every card is free" must never be the same answer —
+        // that is how a card gets sold twice.
+        anyhow::ensure!(
+            claims.complete,
+            "its guest inventory could not be read in full, so no card here can be proven free"
+        );
+        for want in &spec.gpu_local_ids {
+            let slot = crate::proxmox::pci_slot(want);
+            anyhow::ensure!(
+                claims.may_offer(&slot),
+                "GPU {want} is already assigned to another guest here"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod a_provider_is_not_a_node {
+    //! **A provider runtime may be one host or a cluster**, and this agent
+    //! treated it as one host everywhere. Three separate consequences, all
+    //! measured against the five-node NUC cluster on 19 September 2026:
+    //!
+    //! ```text
+    //! inventory   walked the cluster only when `omnuv_node` was unset, so a
+    //!             cluster offering one node advertised a twelfth of itself
+    //! placement   used `unwrap_or_default()` — the empty string — making every
+    //!             `/nodes//qemu` path malformed when unset, and pinning to one
+    //!             node when set. A card free on nuc3 was invisible
+    //! lookup      `find_tagged_vm` asked one node, so a machine on nuc3 looked
+    //!             like one that had never been created. Converging would have
+    //!             built a second copy while the first kept its card; deleting
+    //!             would have reported it already gone, releasing the allocation
+    //!             and the card while the machine kept running
+    //! ```
+    //!
+    //! The last is the worst, and it is why both `ensure_instance` and
+    //! `delete_instance` now ask `/cluster/resources` rather than one node.
+
+    /// The refusal names the **provider**, not five nodes.
+    ///
+    /// Asserted on the shape rather than against a live cluster: what an
+    /// operator reads when capacity runs out is one sentence about the
+    /// provider, with each node's reason behind it — not five errors they have
+    /// to add up themselves.
+    #[test]
+    fn a_full_provider_says_so_once() {
+        let refused = vec![
+            "nuc0: GPU 0000:21:00.0 is already assigned to another guest here".to_string(),
+            "nuc1: GPU 0000:21:00.0 is already assigned to another guest here".to_string(),
+        ];
+        let message = format!(
+            "insufficient resources on this provider: none of its {} node(s) can place this machine. {}",
+            refused.len(),
+            refused.join("; ")
+        );
+        assert!(message.starts_with("insufficient resources on this provider"));
+        assert!(message.contains("2 node(s)"));
+        // Every node's reason survives, because "it did not fit" without a
+        // reason is what makes somebody go and look by hand.
+        assert!(message.contains("nuc0:") && message.contains("nuc1:"));
     }
 }

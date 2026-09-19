@@ -233,6 +233,42 @@ impl Client {
         }))
     }
 
+    /// The same machine, looked for across **every node of the cluster**.
+    ///
+    /// **A provider is not a node.** `find_tagged_vm` above asks one node, and
+    /// that is what the whole agent used: a machine this agent built on `nuc3`
+    /// was invisible to a reconcile pointed at `nuc0`, so it looked like a
+    /// machine that had never been created — and converging would have built a
+    /// *second* copy while the first kept its card attached. That is the
+    /// duplicate the rename guard exists to prevent, reached by another door.
+    ///
+    /// `/cluster/resources` is the runtime's own answer to *where is this*, and
+    /// asking it is one request rather than one per node.
+    pub(crate) async fn find_tagged_vm_anywhere(
+        &self,
+        kind: &str,
+        id_tag: &str,
+    ) -> anyhow::Result<Option<(String, VmRef)>> {
+        #[derive(serde::Deserialize)]
+        struct ClusterVm {
+            node: String,
+            vmid: u32,
+            #[serde(default)]
+            tags: Option<String>,
+            #[serde(default)]
+            status: Option<String>,
+        }
+        let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
+        Ok(vms
+            .into_iter()
+            .find(|v| {
+                v.tags.as_deref().is_some_and(|t| {
+                    t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag)
+                })
+            })
+            .map(|v| (v.node, VmRef { vmid: v.vmid, tags: v.tags, status: v.status })))
+    }
+
     /// Machines this agent built under the project's old name.
     ///
     /// Their tags no longer match what the agent looks for, so to it they are

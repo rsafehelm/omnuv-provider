@@ -590,6 +590,39 @@ impl Client {
     /// Every raw or mapped PCI assignment, including stopped guests. An
     /// accounted marketplace allocation remains physical inventory while Core
     /// reserves it; foreign running and unaccounted marketplace claims do not.
+    /// The nodes this provider may place on, **in a deterministic order**.
+    ///
+    /// A provider runtime may be one host or a cluster — CLAUDE.md says so
+    /// explicitly — and the agent treated it as one host everywhere: inventory
+    /// walked the cluster only when `omnuv_node` was unset, and placement used
+    /// `unwrap_or_default()`, which is the *empty string* and makes every
+    /// `/nodes//qemu` path malformed. So a five-node cluster either offered one
+    /// node or could not place at all.
+    ///
+    /// `omnuv_node`, when set, stays a deliberate restriction: an operator
+    /// contributing one node of their cluster says so and is obeyed. Unset now
+    /// means the whole cluster, which is what it always read as.
+    ///
+    /// Offline nodes are excluded here rather than discovered at placement: a
+    /// node that is down is not a candidate, and finding that out from a failed
+    /// clone is three minutes and one misleading error later.
+    pub(crate) async fn placement_nodes(&self) -> anyhow::Result<Vec<String>> {
+        let entries: Vec<NodeEntry> = self.get("/nodes").await?;
+        let mut nodes: Vec<String> = entries
+            .into_iter()
+            .filter(|e| e.status.as_deref() != Some("offline"))
+            .map(|e| e.node)
+            .filter(|n| self.node.as_deref().is_none_or(|want| want == n))
+            .collect();
+        nodes.sort();
+        anyhow::ensure!(
+            !nodes.is_empty(),
+            "no node of this provider is online{}",
+            self.node.as_deref().map(|n| format!(" (restricted to {n})")).unwrap_or_default()
+        );
+        Ok(nodes)
+    }
+
     pub(crate) async fn claimed_pci(&self, node: &str, desired: Option<&DesiredState>) -> PciClaims {
         let mut claims = PciClaims { complete: true, ..Default::default() };
         let mut foreign = omnuv_protocol::HostCommitment {
