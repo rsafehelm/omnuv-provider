@@ -1132,10 +1132,21 @@ async fn reconcile_workers(
             // "retry forever". Named rather than fixed: closing it is a tagged
             // `omnuv-protocol` release carrying a reason code, and that is
             // queued.
+            // **Asked of the type, not of the words.** This matched the error
+            // text and broke the same afternoon it was written: the cluster
+            // walk reworded the refusal, the phrase here did not follow, and a
+            // one-shot refusal was reported retryable — so Core re-drove it,
+            // the retry succeeded once a card freed, and the machine took a
+            // recycled VMID. Measured on Pluto, 19 September 2026.
+            //
+            // `Unplaceable` carries the same fact as a type, which a rename
+            // cannot break. The image refusal is still a phrase and is still
+            // the hazard; it is left as one deliberately rather than changed
+            // blind, because it lives in a different function and deserves its
+            // own change.
+            let unplaceable = e.downcast_ref::<crate::instance::Unplaceable>();
             let no_image = why.contains("is not offered by this provider");
-            let no_card = why.contains("is not free on this provider")
-                || why.contains("cannot prove a GPU is free");
-            let retryable = !(no_image || no_card);
+            let retryable = !(no_image || unplaceable.is_some());
             InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
@@ -1143,10 +1154,8 @@ async fn reconcile_workers(
                 retryable: Some(retryable),
                 waiting_on: if no_image {
                     Some("a provider that offers this image".to_string())
-                } else if no_card {
-                    Some("a provider with a free card".to_string())
                 } else {
-                    None
+                    unplaceable.map(|u| u.waiting_on.to_string())
                 },
                 local_id: None,
                 private_ip: None,

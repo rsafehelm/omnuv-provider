@@ -896,11 +896,12 @@ impl Client {
             }
         }
         let Some(node_owned) = chosen else {
-            anyhow::bail!(
-                "insufficient resources on this provider: none of its {} node(s) can place this machine. {}",
-                candidates.len(),
-                refused.join("; ")
-            );
+            return Err(anyhow::Error::new(Unplaceable { waiting_on: "a provider with free capacity" })
+                .context(format!(
+                    "insufficient resources on this provider: none of its {} node(s) can place this machine. {}",
+                    candidates.len(),
+                    refused.join("; ")
+                )));
         };
         let node = node_owned.as_str();
 
@@ -1812,44 +1813,70 @@ mod gpu_placement_is_one_shot {
 
     /// The two refusals that must not be retried, and the one that must.
     ///
-    /// This asserts the classification `agent.rs` performs, which keys on the
-    /// error text — the third untyped string acting as protocol on this wire.
-    /// The test exists because that is fragile: a phrase reworded on either
-    /// side changes the behaviour from *place it elsewhere* to *retry forever*,
-    /// and nothing else would notice.
+    /// **This test passed while the thing it describes was broken**, which is
+    /// why it now classifies the way `agent.rs` does rather than the way it
+    /// once did. It pinned the phrases, the cluster walk reworded the refusal,
+    /// the phrases here were not among the ones that changed, and the test went
+    /// on being green while a one-shot refusal was reported retryable on real
+    /// hardware. A test that asserts a copy of the logic asserts the copy.
     #[test]
     fn a_placement_that_cannot_succeed_is_not_retried() {
-        let classify = |why: &str| {
-            let no_image = why.contains("is not offered by this provider");
-            let no_card = why.contains("is not free on this provider")
-                || why.contains("cannot prove a GPU is free");
-            !(no_image || no_card)
-        };
+        // The image refusal is still a phrase, and still the hazard.
+        let classify = |why: &str| !why.contains("is not offered by this provider");
 
-        // Wrong when it was made: a different provider is the answer.
         assert!(!classify("image ubuntu-26.04-nvidia is not offered by this provider"));
-        assert!(!classify(
-            "GPU 0000:21:00.0 is not free on this provider: it is already assigned to \
-             another guest. This placement is refused and nothing was created; the \
-             marketplace should place this machine on a provider with a free card."
-        ));
-        // **An unreadable guest inventory is also one-shot**, because "I could
-        // not look" and "every card is free" must never be the same answer.
-        assert!(!classify(
-            "cannot prove a GPU is free on Pluto: the guest inventory is incomplete, \
-             so this placement is refused rather than risk selling a card twice"
-        ));
-
-        // Transient, and retrying is right: the hypervisor was busy, not wrong.
         assert!(classify("proxmox task failed: got no worker upid - start worker failed"));
         assert!(classify("connection refused"));
-        // And the old attach failure, which is what this change stops producing
-        // — it stays retryable, because if it is ever seen again it means the
-        // check above was bypassed rather than that the card is permanently
-        // gone.
-        assert!(classify("proxmox task failed: PCI device '0000:21:00.0' already in use"));
+
+        // **And the capacity refusal is a type**, so no wording can break it.
+        // Whatever the message says — and it has already changed once — the
+        // fact travels as `Unplaceable` and `downcast_ref` finds it.
+        let refused: anyhow::Error =
+            anyhow::Error::new(super::Unplaceable { waiting_on: "a provider with free capacity" })
+                .context("insufficient resources on this provider: none of its 1 node(s) can place this machine");
+        assert!(refused.downcast_ref::<super::Unplaceable>().is_some());
+        assert_eq!(
+            refused.downcast_ref::<super::Unplaceable>().unwrap().waiting_on,
+            "a provider with free capacity"
+        );
+        // Reword it entirely; the classification does not move.
+        let reworded: anyhow::Error =
+            anyhow::Error::new(super::Unplaceable { waiting_on: "a provider with free capacity" })
+                .context("something a future edit decided to say instead");
+        assert!(reworded.downcast_ref::<super::Unplaceable>().is_some());
+        // An ordinary transient error carries no such type.
+        let transient = anyhow::anyhow!("connection refused");
+        assert!(transient.downcast_ref::<super::Unplaceable>().is_none());
     }
 }
+
+/// **A placement that cannot succeed here, as a type rather than a phrase.**
+///
+/// `retryable` was decided by matching the error text — the third untyped string
+/// acting as protocol on this wire — and it broke the same afternoon it was
+/// written. The cluster walk reworded the refusal from "is not free on this
+/// provider" to "is already assigned to another guest here"; the classifier
+/// still grepped for the old phrase, so a one-shot refusal was reported
+/// retryable, Core re-drove it, the retry succeeded once the cards freed, and
+/// the machine took a recycled VMID. Measured on Pluto, 19 September 2026.
+///
+/// A phrase reworded on one side silently changing the other's behaviour is the
+/// definition of the hazard. This is the same information as a type, which a
+/// rename cannot break: `anyhow` carries it through, and the classifier asks
+/// `downcast_ref` rather than `contains`.
+#[derive(Debug)]
+pub struct Unplaceable {
+    /// What the buyer is waiting for, in the marketplace's own vocabulary.
+    pub waiting_on: &'static str,
+}
+
+impl std::fmt::Display for Unplaceable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this request cannot be placed on this provider")
+    }
+}
+
+impl std::error::Error for Unplaceable {}
 
 impl crate::proxmox::Client {
     /// Can **this node** take this machine? Asked before anything is created.

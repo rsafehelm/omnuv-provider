@@ -400,11 +400,14 @@ impl Client {
             }
         }
         let Some(node_owned) = chosen else {
-            anyhow::bail!(
+            return Err(anyhow::Error::new(crate::instance::Unplaceable {
+                waiting_on: "a provider with free capacity",
+            })
+            .context(format!(
                 "insufficient resources on this provider: none of its {} node(s) can place this worker. {}",
                 candidates.len(),
                 refused.join("; ")
-            );
+            )));
         };
         let node = node_owned.as_str();
 
