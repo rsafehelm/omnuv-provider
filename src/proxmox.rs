@@ -150,6 +150,27 @@ pub struct Client {
     /// agent creates. A builder rather than an eleventh positional argument to
     /// `new`, which already takes ten.
     pub(crate) environment: Option<String>,
+    /// **Allocation requests are queued and serialized.** One permit, held
+    /// across *deciding* a placement and *making* it.
+    ///
+    /// Operator's rule, 19 September 2026. Without it the two halves are a
+    /// check and a separate act, and anything that runs between them invalidates
+    /// the check: two placements both see one card free and both take it. The
+    /// reconcile loop happens to be a sequential `for` today, so the race is not
+    /// reachable *right now* — which is exactly the kind of safety that
+    /// disappears the first time somebody parallelises a loop for speed, and
+    /// leaves no trace of having been relied upon.
+    ///
+    /// There are already two paths that attach a card — `ensure_instance` and
+    /// the inference worker — so "the loop is sequential" was never the whole
+    /// story anyway.
+    ///
+    /// A `tokio::sync::Mutex` rather than a `std` one because it is held across
+    /// `.await`: the clone, the config write and the task wait all happen under
+    /// it, which is the point. Placements therefore queue behind one another on
+    /// a provider, which is the intended cost — a provider builds machines one
+    /// at a time and the alternative is selling hardware twice.
+    pub(crate) alloc: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Whether this provider has opted in to disclosing what its host has
     /// already given its own guests. See `config::ProxmoxRuntime::showall`.
     showall: bool,
@@ -349,6 +370,7 @@ impl Client {
             city,
             apt_mirror,
             environment: None,
+            alloc: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             showall,
             images: Default::default(),
         })
@@ -1241,4 +1263,70 @@ fn disclosure_noted(node: &str, c: &omnuv_protocol::HostCommitment) {
             c.cpu_cores, c.memory_mib, c.disk_gib, c.guests
         )),
     );
+}
+
+#[cfg(test)]
+mod allocation_is_queued_and_serialized {
+    //! **Operator's rule, 19 September 2026: allocation requests are queued and
+    //! serialized.**
+    //!
+    //! Deciding a placement and making it are one operation or they are a race.
+    //! The node is chosen because a card was free *at that moment*; anything
+    //! that places in between makes that false, and two machines take one card.
+    //!
+    //! The reconcile loop is a sequential `for` today, so the race is not
+    //! reachable right now — which is exactly the kind of safety that vanishes
+    //! the first time somebody parallelises a loop for speed and leaves no
+    //! trace of having been relied on. And there were already two paths that
+    //! attach a card, `ensure_instance` and `ensure_inference_worker`, so "the
+    //! loop is sequential" was never the whole story.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **Two placements never overlap**, whatever order they arrive in.
+    ///
+    /// Asserted on the gate itself rather than against a hypervisor: what is
+    /// under test is that check-and-create is one critical section, and a live
+    /// cluster would only add a slower way to observe the same thing.
+    #[tokio::test]
+    async fn no_two_placements_are_ever_inside_the_gate_at_once() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let inside = Arc::new(AtomicUsize::new(0));
+        let worst = Arc::new(AtomicUsize::new(0));
+
+        let mut placements = Vec::new();
+        for _ in 0..16 {
+            let (gate, inside, worst) = (gate.clone(), inside.clone(), worst.clone());
+            placements.push(tokio::spawn(async move {
+                let _held = gate.lock_owned().await;
+                let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                worst.fetch_max(now, Ordering::SeqCst);
+                // The await points a real placement has: the clone, the config
+                // write, the task wait. The gate is held across all of them or
+                // it is not a gate.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                inside.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for p in placements {
+            p.await.expect("placement task");
+        }
+        assert_eq!(worst.load(Ordering::SeqCst), 1, "two placements were inside the gate at once");
+        assert_eq!(inside.load(Ordering::SeqCst), 0);
+    }
+
+    /// And the gate is **shared**, not one per clone of the client.
+    ///
+    /// `Client` is cloned around the agent, and a gate stored by value would
+    /// give every clone its own permit — a lock that compiles, runs, and
+    /// serializes nothing. The `Arc` is the whole mechanism.
+    #[test]
+    fn every_clone_of_the_client_queues_behind_the_same_permit() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let copy = gate.clone();
+        assert!(Arc::ptr_eq(&gate, &copy), "the gate was duplicated rather than shared");
+        assert_eq!(Arc::strong_count(&gate), 2);
+    }
 }

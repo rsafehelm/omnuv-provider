@@ -299,7 +299,17 @@ impl Client {
         spec: &InferenceWorkerSpec,
         core_url: &str,
     ) -> anyhow::Result<WorkerStatus> {
-        if let Some(vm) = self.find_worker_vm(node, &spec.id).await? {
+        // **Cluster-wide, and under the allocation gate — the same two rules as
+        // `ensure_instance`.** This path attaches a card too (`hostpci` below)
+        // and had neither: it looked on one node, so a worker on another was
+        // rebuilt; and it checked nothing before attaching, so it raced every
+        // instance placement for the same hardware. An inference worker and a
+        // buyer machine competing for one GPU is the exact case *one physical
+        // GPU, at most one active allocation* exists to forbid.
+        if let Some((found, vm)) =
+            self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await?
+        {
+            let node = found.as_str();
             let mut running = vm.status.as_deref() == Some("running");
 
             // Converge, do not merely observe: a worker that exists but is not
@@ -368,6 +378,31 @@ impl Client {
         let file = crate::names::snippet_worker(&spec.id);
         std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec, core_url))
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
+
+        // **Queued and serialized, and every node asked** — the same gate and the
+        // same walk as `ensure_instance`, because this path attaches a card and
+        // had neither. Held from the feasibility check until the machine exists.
+        let _allocating = self.alloc.clone().lock_owned().await;
+        let candidates = self.placement_nodes().await?;
+        let mut refused: Vec<String> = Vec::new();
+        let mut chosen: Option<String> = None;
+        for candidate in &candidates {
+            match self.worker_node_can_place(candidate, spec).await {
+                Ok(()) => {
+                    chosen = Some(candidate.clone());
+                    break;
+                }
+                Err(why) => refused.push(format!("{candidate}: {why}")),
+            }
+        }
+        let Some(node_owned) = chosen else {
+            anyhow::bail!(
+                "insufficient resources on this provider: none of its {} node(s) can place this worker. {}",
+                candidates.len(),
+                refused.join("; ")
+            );
+        };
+        let node = node_owned.as_str();
 
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
 
@@ -862,5 +897,38 @@ mod workload_unit_tests {
         assert!(ci.contains("NoNewPrivileges=yes"));
         assert!(ci.contains("ReadWritePaths=/run/onv"));
         assert!(!ci.contains("DynamicUser=yes"), "cannot install its own binary");
+    }
+}
+
+impl Client {
+    /// Can this node take this **worker**? The instance path's twin.
+    ///
+    /// Two functions rather than one generic over the spec, because the two
+    /// specs are different protocol types and a trait to unify them would be
+    /// more machinery than the four lines it saves. They must stay in step:
+    /// the shared part is `claimed_pci`, and both refuse on an incomplete view
+    /// for the same reason — "I could not look" and "every card is free" must
+    /// never be the same answer.
+    pub(crate) async fn worker_node_can_place(
+        &self,
+        node: &str,
+        spec: &InferenceWorkerSpec,
+    ) -> anyhow::Result<()> {
+        if spec.gpu_local_ids.is_empty() {
+            return Ok(());
+        }
+        let claims = self.claimed_pci(node, None).await;
+        anyhow::ensure!(
+            claims.complete,
+            "its guest inventory could not be read in full, so no card here can be proven free"
+        );
+        for want in &spec.gpu_local_ids {
+            let slot = crate::proxmox::pci_slot(want);
+            anyhow::ensure!(
+                claims.may_offer(&slot),
+                "GPU {want} is already assigned to another guest here"
+            );
+        }
+        Ok(())
     }
 }

@@ -877,6 +877,12 @@ impl Client {
         // doomed clone, a failure at attach, a shell left behind. Each node is
         // asked whether it *can* before anything is built, and when none can the
         // answer is one sentence about the provider rather than five about nodes.
+        // **The gate, held from here until the machine exists.** Deciding a
+        // placement and making it are one operation or they are a race: the
+        // node chosen below is chosen because a card was free *at that moment*,
+        // and anything that places in between makes that false.
+        let _allocating = self.alloc.clone().lock_owned().await;
+
         let candidates = self.placement_nodes().await?;
         let mut refused: Vec<String> = Vec::new();
         let mut chosen: Option<String> = None;
