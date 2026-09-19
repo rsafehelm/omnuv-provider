@@ -979,7 +979,6 @@ async fn reconcile_workers(
             _ => {
                 driver
                     .ensure_inference_worker(
-                        node,
                         cfg.proxmox.template_vmid,
                         storage,
                         &cfg.proxmox.snippet_dir,

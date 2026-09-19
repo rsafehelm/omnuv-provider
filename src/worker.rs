@@ -290,9 +290,13 @@ impl Client {
         self.find_tagged_vm(node, TAG, &short_tag(worker_id)).await
     }
 
+    /// **No `node` parameter, deliberately.** It took one and, since this path
+    /// began choosing its own node under the allocation gate, ignored it — a
+    /// signature that accepts a node it will not use is a lie the next caller
+    /// believes. Where a worker goes is the provider's own local placement,
+    /// which CLAUDE.md puts behind the driver on purpose.
     pub async fn ensure_inference_worker(
         &self,
-        node: &str,
         template_vmid: u32,
         storage: &str,
         snippet_dir: &str,
