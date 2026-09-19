@@ -135,6 +135,35 @@ pub fn short_tag(id: &str) -> String {
     format!("{PREFIX}-{}", id.replace('-', "").chars().take(12).collect::<String>())
 }
 
+/// Every tag a machine this agent creates carries, in one place.
+///
+/// Three things, answering three different questions:
+///
+/// ```text
+/// onv-instance   what this is, and that the marketplace owns it. The claim
+/// onv-<12 hex>   which marketplace resource it is. The key
+/// onv-<env>      which deployment built it: prod, test, dev. Not a claim
+/// ```
+///
+/// **The environment is not a claim, and that distinction is load-bearing.**
+/// `onv-test` says where a machine lives and authorizes nothing; only the first
+/// tag makes a machine the marketplace's to remove. A sweep that matched
+/// anything beginning `onv-` would eat a build rig, which is why matching is by
+/// whole token against the three claim constants and never by prefix.
+///
+/// **One function, because two call sites is how a grammar drifts.** The
+/// instance driver and the worker driver each built this string themselves, and
+/// a third kind would have built it a third way. A machine created before an
+/// environment was configured carries two tags and is still matched: the claim
+/// and the key are what anything looks for.
+pub fn tags(claim: &str, id: &str, environment: Option<&str>) -> String {
+    let mut out = format!("{claim};{}", short_tag(id));
+    if let Some(env) = environment.map(str::trim).filter(|e| !e.is_empty()) {
+        out.push_str(&format!(";{PREFIX}-{env}"));
+    }
+    out
+}
+
 /// The cloud-init snippet a machine of each kind reads at first boot.
 pub fn snippet_instance(id: &str) -> String {
     format!("{PREFIX}-instance-{id}.yaml")
@@ -432,5 +461,44 @@ mod snippet_grammar_tests {
         ] {
             assert_eq!(snippet_owner(name), None, "{name} was claimed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tag_grammar {
+    use super::*;
+
+    #[test]
+    fn a_machine_carries_its_claim_its_key_and_its_environment() {
+        let t = tags(TAG_INSTANCE, "3f2a1b4c-5d6e-7f80-9112-233445566778", Some("test"));
+        assert_eq!(t, "onv-instance;onv-3f2a1b4c5d6e;onv-test");
+        // Whole tokens, never a prefix: this is what a sweep matches on.
+        let parts: Vec<_> = t.split(';').collect();
+        assert!(parts.contains(&TAG_INSTANCE));
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn an_unstamped_agent_still_produces_what_everything_matches_on() {
+        // An agent deployed before `environment` existed. Its machines carry
+        // the claim and the key, which is what finds them.
+        for absent in [None, Some(""), Some("   ")] {
+            let t = tags(TAG_WORKER, "aaaa-bbbb", absent);
+            assert_eq!(t, format!("{TAG_WORKER};{}", short_tag("aaaa-bbbb")), "{absent:?}");
+        }
+    }
+
+    #[test]
+    fn the_environment_is_not_a_claim() {
+        // The 18 September rule, as a test: `onv-test` names where a machine
+        // lives and authorizes nothing. Only the first token claims it.
+        let t = tags(TAG_INSTANCE, "id", Some("test"));
+        let claims: Vec<_> = t.split(';')
+            .filter(|p| [TAG_INSTANCE, TAG_GATEWAY, TAG_WORKER].contains(p))
+            .collect();
+        assert_eq!(claims, vec![TAG_INSTANCE]);
+        assert!(!["onv-test", "onv-prod", "onv-dev"]
+            .iter()
+            .any(|e| [TAG_INSTANCE, TAG_GATEWAY, TAG_WORKER].contains(e)));
     }
 }

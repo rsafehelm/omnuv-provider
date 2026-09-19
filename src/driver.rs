@@ -7,14 +7,17 @@
 //! implement the same shape, and lifecycle methods land here in the phase that
 //! builds them rather than as unimplemented stubs today.
 
-use omnuv_protocol::{InventoryReport, RuntimeKind};
+use omnuv_protocol::{DesiredState, InventoryReport, RuntimeKind};
 
 pub trait ComputeDriver {
     fn kind(&self) -> RuntimeKind;
 
-    /// Normalized capabilities and marketplace-allocatable inventory.
+    /// Normalized physical supply after excluding foreign claims. Current
+    /// authenticated desired state accounts for devices already allocated by
+    /// Core, so those stay in inventory without becoming newly available.
     fn inventory(
         &self,
+        desired: &DesiredState,
     ) -> impl std::future::Future<Output = anyhow::Result<InventoryReport>> + Send;
 }
 
@@ -27,7 +30,8 @@ impl<T: ComputeDriver + Sync> ComputeDriver for std::sync::Arc<T> {
 
     fn inventory(
         &self,
+        desired: &DesiredState,
     ) -> impl std::future::Future<Output = anyhow::Result<InventoryReport>> + Send {
-        (**self).inventory()
+        (**self).inventory(desired)
     }
 }

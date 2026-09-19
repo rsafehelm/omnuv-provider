@@ -364,7 +364,7 @@ impl Client {
             ("agent".into(), "enabled=1".into()),
             ("ipconfig0".into(), "ip=dhcp".into()),
             ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
-            ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
+            ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
             ("description".into(), format!("Omnuv inference worker {}\nManaged by onv-provider. Do not edit.", spec.id)),
         ];
         // Mappings rather than raw addresses: a non-root token may only attach

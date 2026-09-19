@@ -31,7 +31,7 @@ use crate::names::{snippet_owner, SnippetKind};
 /// an incomplete view collects nothing.
 #[derive(Debug, Clone, Default)]
 pub struct Known {
-    /// Marketplace ids with a VM on this provider right now.
+    /// Marketplace ids referenced by cloud-init on any VM on this node.
     pub live: BTreeSet<String>,
     /// Marketplace ids Core currently wants, whether or not they exist yet.
     /// A worker being created is in here and has no VM, which is exactly the
@@ -39,6 +39,42 @@ pub struct Known {
     pub desired: BTreeSet<String>,
     /// False if any of the above could not be fully determined.
     pub complete: bool,
+}
+
+/// Read actual cloud-init references on every VM before calling absence safe.
+/// The reader is injected so incomplete/malformed runtime observations are
+/// tested without a hypervisor. It is the driver's authenticated GET in use.
+pub async fn observe<F, Fut>(node: &str, mut read: F) -> anyhow::Result<BTreeSet<String>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+{
+    let listed = read(format!("/nodes/{node}/qemu")).await?;
+    let vms = listed.as_array().ok_or_else(|| anyhow::anyhow!("VM listing is not an array"))?;
+    let mut live = BTreeSet::new();
+    for vm in vms {
+        let id = vm.get("vmid").and_then(|id| id.as_u64()).filter(|id| *id > 0)
+            .ok_or_else(|| anyhow::anyhow!("VM listing contains no usable VM identity"))?;
+        let config = read(format!("/nodes/{node}/qemu/{id}/config")).await?;
+        let config = config.as_object()
+            .ok_or_else(|| anyhow::anyhow!("VM configuration is not an object"))?;
+        let Some(custom) = config.get("cicustom") else { continue };
+        let custom = custom.as_str()
+            .ok_or_else(|| anyhow::anyhow!("cloud-init references are not a string"))?;
+        if custom.is_empty() {
+            continue;
+        }
+        for reference in custom.split(',') {
+            let (_, volume) = reference.split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("cloud-init reference is malformed"))?;
+            let name = volume.rsplit('/').next().filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("cloud-init reference has no file name"))?;
+            if let Some((_, owner)) = snippet_owner(name) {
+                live.insert(owner.to_string());
+            }
+        }
+    }
+    Ok(live)
 }
 
 /// What a sweep decided, and why. Returned rather than logged so a caller can
@@ -81,7 +117,11 @@ pub fn sweep(
             Some("provider view incomplete; collected nothing rather than guessing".into());
     }
 
-    let entries = match std::fs::read_dir(dir) {
+    // Finish the listing before the first removal. An error in a later entry
+    // must not turn a partial listing into deletion followed by a refusal.
+    let listed = std::fs::read_dir(dir)
+        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>());
+    let entries = match listed {
         Ok(e) => e,
         Err(e) => {
             out.refused = Some(format!("cannot read {}: {e}", dir.display()));
@@ -90,12 +130,6 @@ pub fn sweep(
     };
 
     for entry in entries {
-        let Ok(entry) = entry else {
-            // A directory entry that cannot be read makes this listing partial,
-            // and a partial listing is not a short world.
-            out.refused = Some("a directory entry could not be read; listing is partial".into());
-            continue;
-        };
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some((kind, id)) = snippet_owner(&name) else {
             out.foreign += 1;
@@ -261,5 +295,93 @@ mod tests {
         let d = dir_with(&[]);
         let s = sweep(d.path(), &known(&[], &[], true), real);
         assert_eq!(s, Swept::default());
+    }
+
+    async fn observed(entries: Vec<(&str, serde_json::Value)>) -> anyhow::Result<BTreeSet<String>> {
+        let mut reads: std::collections::BTreeMap<String, serde_json::Value> =
+            entries.into_iter().map(|(path, value)| (path.to_string(), value)).collect();
+        observe("fixture", |path| {
+            let result = reads.remove(&path).ok_or_else(|| anyhow::anyhow!("unavailable observation"));
+            std::future::ready(result)
+        }).await
+    }
+
+    #[tokio::test]
+    async fn empty_desired_state_keeps_every_runtime_reference_then_retries_final_cleanup() {
+        use serde_json::json;
+
+        let d = dir_with(&[
+            crate::names::snippet_worker(A),
+            crate::names::snippet_instance(B),
+            crate::names::snippet_network(B),
+            crate::names::snippet_worker(C),
+        ]);
+        let live = observed(vec![
+            ("/nodes/fixture/qemu", json!([
+                {"vmid": 100, "status": "stopped", "tags": "foreign"},
+                {"vmid": 101, "status": "running"},
+            ])),
+            ("/nodes/fixture/qemu/100/config", json!({
+                "cicustom": format!("user=onv-snippets:snippets/{}", crate::names::snippet_worker(A)),
+            })),
+            ("/nodes/fixture/qemu/101/config", json!({
+                "cicustom": format!("user=onv-snippets:snippets/{},network=onv-snippets:snippets/{}",
+                    crate::names::snippet_instance(B), crate::names::snippet_network(B)),
+            })),
+        ]).await.unwrap();
+        assert_eq!(live, BTreeSet::from([A.to_string(), B.to_string()]));
+        let s = sweep(d.path(), &Known { live, desired: BTreeSet::new(), complete: true }, real);
+        assert_eq!(s.kept, 3);
+        assert_eq!(s.collected, vec![crate::names::snippet_worker(C)]);
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 3);
+
+        // Core no longer lists the final machine, but runtime absence is only
+        // known on the next complete pass. Its last files are then collected.
+        let live = observed(vec![("/nodes/fixture/qemu", json!([]))]).await.unwrap();
+        let view = Known { live, desired: BTreeSet::new(), complete: true };
+        let s = sweep(d.path(), &view, real);
+        assert_eq!(s.collected.len(), 3);
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 0);
+        assert_eq!(sweep(d.path(), &view, real), Swept::default());
+    }
+
+    #[tokio::test]
+    async fn partial_runtime_observation_cannot_release_unlisted_snippets() {
+        use serde_json::json;
+
+        let d = dir_with(&[crate::names::snippet_worker(A), crate::names::snippet_worker(B)]);
+        let observation = observed(vec![
+            ("/nodes/fixture/qemu", json!([{"vmid": 100}, {"vmid": 101}])),
+            ("/nodes/fixture/qemu/100/config", json!({
+                "cicustom": format!("user=onv-snippets:snippets/{}", crate::names::snippet_worker(A)),
+            })),
+            // Reading VM 101 fails after VM 100 was observed successfully.
+        ]).await;
+        assert!(observation.is_err(), "a partial listing became a complete view");
+        let s = sweep(d.path(), &known(&[], &[], false), real);
+        assert!(s.collected.is_empty());
+        assert!(s.refused.is_some());
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_runtime_observations_fail_closed() {
+        use serde_json::json;
+
+        for listed in [json!({}), json!([{}]), json!([{"vmid": 0}]), json!([{"vmid": "100"}])] {
+            assert!(observed(vec![("/nodes/fixture/qemu", listed)]).await.is_err());
+        }
+        for config in [json!([]), json!({"cicustom": 42}), json!({"cicustom": "broken"}), json!({"cicustom": "user=local:snippets/"})] {
+            assert!(observed(vec![
+                ("/nodes/fixture/qemu", json!([{"vmid": 100}])),
+                ("/nodes/fixture/qemu/100/config", config),
+            ]).await.is_err());
+        }
+        for config in [json!({}), json!({"cicustom": ""}), json!({"cicustom": "user=local:snippets/operator.yaml"})] {
+            assert!(observed(vec![
+                ("/nodes/fixture/qemu", json!([{"vmid": 100}])),
+                ("/nodes/fixture/qemu/100/config", config),
+            ]).await.unwrap().is_empty());
+        }
     }
 }

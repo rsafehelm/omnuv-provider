@@ -10,6 +10,8 @@
 # layer exists so that a second runtime can arrive, and a package that requires
 # Proxmox is a package that cannot be installed on a Kubernetes provider.
 set -euo pipefail
+# Package directories need executable traversal even under a private caller umask.
+umask 022
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # One source of truth. The agent reports CARGO_PKG_VERSION to Core, so a version
@@ -44,7 +46,8 @@ echo "onv-provider $VERSION ($ARCH)"
 # the agent speaks TLS through rustls rather than the system OpenSSL, so the
 # only real link is glibc.
 docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
-    -e OMNUV_BUILD="$VERSION" -w /w rust:1.98 cargo build --release --quiet
+    -e OMNUV_BUILD="$VERSION" -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
+    -w /w rust:1.98 cargo build --release --quiet
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
@@ -77,7 +80,7 @@ Description: Omnuv Provider Agent
  Enrol a machine with: onv-provider join --token <token>
 CTL
 
-docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -c "
+docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -ec "
     apt-get -qq update >/dev/null 2>&1
     DEBIAN_FRONTEND=noninteractive apt-get -qq install -y fakeroot >/dev/null 2>&1
     fakeroot dpkg-deb --build .deb onv-provider_${VERSION}_${ARCH}.deb

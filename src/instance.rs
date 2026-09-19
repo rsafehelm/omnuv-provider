@@ -896,7 +896,7 @@ impl Client {
                 "cicustom".into(),
                 format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}"),
             ),
-            ("tags".into(), format!("{TAG};{}", short_tag(&spec.id))),
+            ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
             (
                 "description".into(),
                 format!("Omnuv instance {}\nManaged by onv-provider. Do not edit.", spec.id),

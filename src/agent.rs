@@ -375,7 +375,8 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         cfg.proxmox.apt_mirror.clone(),
         cfg.proxmox.showall,
     )?
-    .with_images(cfg.proxmox.image_map()));
+    .with_images(cfg.proxmox.image_map())
+    .with_environment(cfg.environment.clone()));
     let core = Core::new(&cfg.core.url, &cfg.core.token)?;
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
@@ -475,7 +476,13 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         });
     }
 
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+    // Runtime tasks can take minutes. Their progress must not suppress the
+    // liveness channel or make Core mark a working provider offline.
+    let mut heartbeat = spawn_heartbeat(
+        core.clone(),
+        driver.clone(),
+        std::time::Duration::from_secs(heartbeat_secs),
+    );
     let mut inventory = tokio::time::interval(std::time::Duration::from_secs(cfg.inventory_every_secs));
     // Reconciliation is push-driven; this interval is only the fallback for a
     // provider with no live tunnel.
@@ -486,18 +493,8 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                match core.post("/provider/v1/heartbeat", None).await {
-                    // A restarted core no longer knows this agent; re-handshake
-                    // rather than heartbeating into the void forever.
-                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                        eprintln!("heartbeat rejected; re-running handshake");
-                        let _ = handshake(&core, &driver).await;
-                    }
-                    Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
-                    Err(e) => eprintln!("heartbeat failed: {e}"),
-                    _ => {}
-                }
+            ended = &mut heartbeat => {
+                anyhow::bail!("heartbeat task ended unexpectedly: {ended:?}");
             }
             _ = nudge.notified() => {
                 if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
@@ -521,8 +518,105 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 }
 
+fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
+    core: Core,
+    driver: Arc<D>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match core.post("/provider/v1/heartbeat", None).await {
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    eprintln!("heartbeat rejected; re-running handshake");
+                    if let Err(e) = handshake(&core, &driver).await {
+                        eprintln!("heartbeat handshake failed: {e}");
+                    }
+                }
+                Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
+                Err(e) => eprintln!("heartbeat failed: {e}"),
+                _ => {}
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod handshake_tests {
+    use super::*;
+
+    struct HeartbeatDriver;
+
+    impl ComputeDriver for HeartbeatDriver {
+        fn kind(&self) -> omnuv_protocol::RuntimeKind {
+            omnuv_protocol::RuntimeKind::Proxmox
+        }
+
+        async fn inventory(&self, _: &DesiredState) -> anyhow::Result<omnuv_protocol::InventoryReport> {
+            anyhow::bail!("heartbeat must not wait for runtime inventory")
+        }
+    }
+
+    /// A runtime operation remains pending while several heartbeats arrive.
+    /// Even a rejected request does not end the task or wait for reconciliation.
+    #[tokio::test]
+    async fn heartbeat_progresses_during_a_pending_runtime_operation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let core = Core {
+            http: reqwest::Client::new(),
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            token: "heartbeat-fixture".into(),
+        };
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
+        let server = tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    assert!(n > 0 && request.len() + n < 8192);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                assert!(request.starts_with(b"POST /provider/v1/heartbeat HTTP/1.1\r\n"));
+                let status = if i == 0 { "500 Internal Server Error" } else { "204 No Content" };
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+                seen_tx.send(i).await.unwrap();
+            }
+        });
+        let heartbeat = spawn_heartbeat(
+            core,
+            Arc::new(HeartbeatDriver),
+            std::time::Duration::from_millis(20),
+        );
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut runtime_operation = tokio::spawn(async move { finish_rx.await.unwrap() });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for expected in 0..3 {
+                tokio::select! {
+                    _ = &mut runtime_operation => panic!("runtime operation finished prematurely"),
+                    seen = seen_rx.recv() => assert_eq!(seen, Some(expected)),
+                }
+            }
+        })
+        .await;
+        heartbeat.abort();
+        let _ = heartbeat.await;
+        server.abort();
+        let _ = server.await;
+        finish_tx.send(()).unwrap();
+        runtime_operation.await.unwrap();
+        assert!(result.is_ok(), "heartbeats stopped behind runtime work");
+    }
+
     /// The agent offers every version it can speak, not only the newest.
     ///
     /// Advertising a point makes an upgrade order impossible in whichever
@@ -593,7 +687,16 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
 }
 
 async fn report_inventory(core: &Core, driver: &impl ComputeDriver, offered_images: Vec<String>) -> anyhow::Result<()> {
-    let mut report = driver.inventory().await?;
+    // A full authenticated allocation view, never an unchanged delta or a
+    // remembered tag. This costs one GET per inventory pass and deliberately
+    // fails the pass when ownership cannot be observed. Deletions retain GPU
+    // ids here until their allocation is released, so a machine still being
+    // removed cannot make its card look free.
+    let desired: DesiredState = core.get_json("/provider/v1/desired-state").await
+        .map_err(|e| anyhow::anyhow!("cannot account for inventory GPU claims: {e}"))?;
+    anyhow::ensure!(!desired.unchanged && desired.protocol_version == omnuv_protocol::PROTOCOL_VERSION,
+                    "inventory GPU claims require a full compatible desired state");
+    let mut report = driver.inventory(&desired).await?;
     // Which marketplace images this provider can build — ids only; the
     // templates behind them are this provider's own configuration.
     report.images = offered_images;
@@ -820,12 +923,8 @@ async fn reconcile_workers(
         fetched
     };
 
-    // **Before the early return below, deliberately.** A provider with nothing
-    // running is precisely the provider that should be fetching images: it has
-    // no work to do and everything to prepare. Put this after the "nothing to
-    // reconcile" shortcut and a fresh provider would mirror nothing until its
-    // first machine was placed on it — which is the one moment the download
-    // needs to have already happened.
+    // An idle provider still prepares images and completes cleanup. Empty
+    // desired state is a real observation, never a reason to skip the pass.
     //
     // **Handed over rather than awaited.** This used to be the transfer
     // itself, which put seven gigabytes on the task that also applies desired
@@ -839,19 +938,12 @@ async fn reconcile_workers(
         mirror_kick.notify_one();
     }
 
-    // Segments whose last machine has gone. Before the early return below,
-    // for the same reason the image mirror is: a provider with nothing running
-    // is exactly the provider that has bridges left over, and putting this
-    // after the shortcut would mean they are only ever cleaned while something
-    // else is happening.
+    // Segments whose last machine has gone, including when this provider has
+    // no desired machines left.
     match driver.reap_unused_segments(node).await {
         Ok(0) => {}
         Ok(n) => eprintln!("removed {n} unused segment(s)"),
         Err(e) => eprintln!("segment reap: {e}"),
-    }
-
-    if desired.inference_workers.is_empty() && desired.instances.is_empty() {
-        return Ok(());
     }
 
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
@@ -937,14 +1029,17 @@ async fn reconcile_workers(
                 known.desired.insert(spec.id.clone());
             }
         }
-        // A status the driver could not determine leaves the view incomplete
-        // rather than implying the machine is gone.
-        for st in &statuses {
-            match st.state {
-                WorkerState::Error => known.complete = false,
-                _ => {
-                    known.live.insert(st.id.clone());
-                }
+        // Survey actual references, including stopped/foreign machines and
+        // workloads missing from desired state. A status for each desired
+        // worker is not a complete runtime inventory.
+        let observed = crate::snippets::observe(node, |path| async move {
+            driver.get_json(&path).await
+        }).await;
+        match observed {
+            Ok(live) => known.live = live,
+            Err(e) => {
+                known.complete = false;
+                eprintln!("snippet ownership observation failed: {e}");
             }
         }
         let swept = crate::snippets::sweep(

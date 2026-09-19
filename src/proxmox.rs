@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use omnuv_protocol::{ComputeCapabilities, GpuDevice, InventoryReport, NodeInventory, RuntimeKind};
+use omnuv_protocol::{ComputeCapabilities, DesiredState, GpuDevice, InventoryReport, NodeInventory, RuntimeKind};
 use serde::Deserialize;
 
 use crate::config::{Contribution, ProxmoxTarget};
@@ -93,15 +93,25 @@ struct VmEntry {
     tags: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct PciMapping {
+    id: String,
+    map: Vec<String>,
+}
+
 /// Which guests currently lay claim to a PCI device.
 #[derive(Default)]
 struct PciClaims {
-    /// Held by a guest that is running. Never sellable, whatever the operator declares.
+    /// Held by a guest that is running; retained in physical inventory only
+    /// when Core's current allocation and this VM's full identity account for it.
     running: HashSet<String>,
     /// Referenced only by stopped guests. Sellable if the operator explicitly
     /// offers it, because the conflict is theirs to accept: the stopped guest
     /// will simply fail to start while the device is allocated elsewhere.
     stopped: HashSet<String>,
+    accounted: HashSet<String>,
+    /// Conflicting or unaccounted marketplace claims are never free capacity.
+    blocked: HashSet<String>,
     /// What guests the marketplace did not create have already been given.
     ///
     /// A provider advertises capacity and the ledger books against that number
@@ -136,6 +146,10 @@ pub struct Client {
     /// The package mirror machines built here should use. See
     /// `config::ProxmoxRuntime::apt_mirror`.
     pub(crate) apt_mirror: Option<String>,
+    /// `config::AgentConfig::environment` — the third tag on every machine this
+    /// agent creates. A builder rather than an eleventh positional argument to
+    /// `new`, which already takes ten.
+    pub(crate) environment: Option<String>,
     /// Whether this provider has opted in to disclosing what its host has
     /// already given its own guests. See `config::ProxmoxRuntime::showall`.
     showall: bool,
@@ -152,8 +166,8 @@ impl ComputeDriver for Client {
         RuntimeKind::Proxmox
     }
 
-    async fn inventory(&self) -> anyhow::Result<InventoryReport> {
-        self.discover(self.node.as_deref(), &self.contribute).await
+    async fn inventory(&self, desired: &DesiredState) -> anyhow::Result<InventoryReport> {
+        self.discover_with_claims(self.node.as_deref(), &self.contribute, Some(desired)).await
     }
 }
 
@@ -164,6 +178,146 @@ pub(crate) fn pci_slot(raw: &str) -> String {
     let addr = addr.split('.').next().unwrap_or(addr);
     let full = if addr.matches(':').count() == 1 { format!("0000:{addr}") } else { addr.to_string() };
     full.to_lowercase()
+}
+
+/// Validate every address before normalizing functions to their physical slot.
+/// A multi-function assignment can mention the same card twice, or several
+/// cards; ignoring everything after the first would invent free capacity.
+fn pci_claim_slots(raw: &str) -> anyhow::Result<HashSet<String>> {
+    let mut slots = HashSet::new();
+    for address in raw.split(';') {
+        let (base, function) = match address.split_once('.') {
+            Some((base, function)) => (base, Some(function)),
+            None => (address, None),
+        };
+        anyhow::ensure!(function.is_none_or(|f| f.len() == 1 && matches!(f.as_bytes()[0], b'0'..=b'7')),
+                        "PCI function is malformed");
+        let parts: Vec<_> = base.split(':').collect();
+        let widths: &[usize] = match parts.len() {
+            2 => &[2, 2],
+            3 => &[4, 2, 2],
+            _ => anyhow::bail!("PCI address is malformed"),
+        };
+        anyhow::ensure!(parts.iter().zip(widths).all(|(p, n)| p.len() == *n && p.bytes().all(|b| b.is_ascii_hexdigit())),
+                        "PCI address is malformed");
+        anyhow::ensure!(u8::from_str_radix(parts.last().unwrap(), 16)? <= 31, "PCI device is out of range");
+        slots.insert(pci_slot(address));
+    }
+    Ok(slots)
+}
+
+fn property_fields(raw: &str) -> anyhow::Result<std::collections::HashMap<&str, &str>> {
+    let mut fields = std::collections::HashMap::new();
+    for field in raw.split(',') {
+        let (key, value) = field.split_once('=').ok_or_else(|| anyhow::anyhow!("PCI mapping property is malformed"))?;
+        anyhow::ensure!(!key.is_empty() && !value.is_empty() && fields.insert(key, value).is_none(),
+                        "PCI mapping property is empty or repeated");
+    }
+    Ok(fields)
+}
+
+fn resolve_pci_claim(raw: &str, node: &str, mappings: &[PciMapping]) -> anyhow::Result<HashSet<String>> {
+    let mut source = None;
+    for (index, field) in raw.split(',').enumerate() {
+        let candidate = match field.split_once('=') {
+            Some(("host", value)) => Some((false, value)),
+            Some(("mapping", value)) => Some((true, value)),
+            Some(_) => None,
+            None if index == 0 => Some((false, field)),
+            None => anyhow::bail!("PCI assignment property is malformed"),
+        };
+        if let Some(candidate) = candidate {
+            anyhow::ensure!(source.replace(candidate).is_none() && !candidate.1.is_empty(),
+                            "PCI assignment has no single source");
+        }
+    }
+    let (mapped, value) = source.ok_or_else(|| anyhow::anyhow!("PCI assignment has no source"))?;
+    if !mapped {
+        return pci_claim_slots(value);
+    }
+    let mut matching = mappings.iter().filter(|m| m.id == value);
+    let mapping = matching.next().ok_or_else(|| anyhow::anyhow!("PCI mapping is absent"))?;
+    anyhow::ensure!(matching.next().is_none(), "PCI mapping identity is ambiguous");
+    let mut slots = HashSet::new();
+    for entry in &mapping.map {
+        let fields = property_fields(entry)?;
+        let mapped_node = fields.get("node").ok_or_else(|| anyhow::anyhow!("PCI mapping node is absent"))?;
+        let path = fields.get("path").ok_or_else(|| anyhow::anyhow!("PCI mapping path is absent"))?;
+        if *mapped_node == node {
+            slots.extend(pci_claim_slots(path)?);
+        }
+    }
+    anyhow::ensure!(!slots.is_empty(), "PCI mapping has no devices on this node");
+    Ok(slots)
+}
+
+/// Runtime tags are truncated. The full UUID in the generated description
+/// must also match Core's authenticated desired state before a held GPU is
+/// retained as physical supply. The Core allocation remains its availability
+/// authority; a tag or a matching name alone never constitutes an allocation.
+fn accounted_pci(vm: &VmEntry, config: &serde_json::Map<String, serde_json::Value>, desired: Option<&DesiredState>) -> anyhow::Result<HashSet<String>> {
+    let Some(desired) = desired else { return Ok(HashSet::new()) };
+    anyhow::ensure!(!desired.unchanged && desired.protocol_version == omnuv_protocol::PROTOCOL_VERSION,
+                    "GPU ownership requires a full compatible desired state");
+    let tags: HashSet<_> = vm.tags.as_deref().unwrap_or("").split(';').collect();
+    let description = config.get("description").and_then(|v| v.as_str()).and_then(|v| v.lines().next());
+    let mut matched = 0;
+    let mut slots = HashSet::new();
+    let claims = desired.instances.iter().map(|s| (crate::names::TAG_INSTANCE, "instance", &s.id, &s.gpu_local_ids))
+        .chain(desired.inference_workers.iter().map(|s| (crate::names::TAG_WORKER, "inference worker", &s.id, &s.gpu_local_ids)));
+    for (kind, label, id, devices) in claims {
+        if tags.contains(kind) && tags.contains(crate::names::short_tag(id).as_str())
+            && description == Some(format!("Omnuv {label} {id}").as_str()) {
+            matched += 1;
+            for device in devices {
+                slots.extend(pci_claim_slots(device)?);
+            }
+        }
+    }
+    anyhow::ensure!(matched <= 1, "GPU ownership is ambiguous");
+    Ok(slots)
+}
+
+impl PciClaims {
+    fn may_offer(&self, slot: &str) -> bool {
+        self.complete && !self.blocked.contains(slot)
+            && (!self.running.contains(slot) || self.accounted.contains(slot))
+    }
+
+    fn observe_vm(&mut self, vm: &VmEntry, config: &serde_json::Value, node: &str, mappings: &[PciMapping], desired: Option<&DesiredState>) -> anyhow::Result<()> {
+        let result = (|| {
+            let map = config.as_object().ok_or_else(|| anyhow::anyhow!("VM configuration is not an object"))?;
+            let running = match vm.status.as_deref() {
+                Some("running" | "paused") => true,
+                Some("stopped") => false,
+                _ => anyhow::bail!("VM power state is unobserved"),
+            };
+            let mut slots = HashSet::new();
+            for (key, value) in map.iter().filter(|(k, _)| k.starts_with("hostpci")) {
+                let raw = value.as_str().ok_or_else(|| anyhow::anyhow!("{key} is not a PCI assignment"))?;
+                slots.extend(resolve_pci_claim(raw, node, mappings)?);
+            }
+            let accounted = accounted_pci(vm, map, desired)?;
+            for slot in slots {
+                if running && !self.running.insert(slot.clone()) {
+                    self.blocked.insert(slot.clone());
+                }
+                if accounted.contains(&slot) {
+                    self.accounted.insert(slot.clone());
+                } else if running || is_marketplace(vm.tags.as_deref()) {
+                    self.blocked.insert(slot.clone());
+                }
+                if !running {
+                    self.stopped.insert(slot);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.complete = false;
+        }
+        result
+    }
 }
 
 impl Client {
@@ -194,9 +348,16 @@ impl Client {
             location,
             city,
             apt_mirror,
+            environment: None,
             showall,
             images: Default::default(),
         })
+    }
+
+    /// Which deployment this agent belongs to; see `names::tags`.
+    pub fn with_environment(mut self, environment: Option<String>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// The images this provider offers, and where each one lives locally.
@@ -426,10 +587,10 @@ impl Client {
         }
     }
 
-    /// Every PCI address referenced by any VM config on the node, running or
-    /// stopped. A stopped VM still owns its passthrough device: selling it would
-    /// break the guest the moment its owner starts it again.
-    async fn claimed_pci(&self, node: &str) -> PciClaims {
+    /// Every raw or mapped PCI assignment, including stopped guests. An
+    /// accounted marketplace allocation remains physical inventory while Core
+    /// reserves it; foreign running and unaccounted marketplace claims do not.
+    async fn claimed_pci(&self, node: &str, desired: Option<&DesiredState>) -> PciClaims {
         let mut claims = PciClaims { complete: true, ..Default::default() };
         let mut foreign = omnuv_protocol::HostCommitment {
             cpu_cores: 0,
@@ -447,8 +608,15 @@ impl Client {
                 return claims;
             }
         };
+        let mappings: Vec<PciMapping> = match self.get("/cluster/mapping/pci").await {
+            Ok(mappings) => mappings,
+            Err(e) => {
+                eprintln!("  warning: cannot read PCI mappings ({e}); offering no GPUs");
+                claims.complete = false;
+                return claims;
+            }
+        };
         for vm in vms {
-            let running = vm.status.as_deref() == Some("running");
             let cfg: serde_json::Value =
                 match self.get(&format!("/nodes/{node}/qemu/{}/config", vm.vmid)).await {
                     Ok(c) => c,
@@ -458,6 +626,10 @@ impl Client {
                         continue;
                     }
                 };
+            if let Err(e) = claims.observe_vm(&vm, &cfg, node, &mappings, desired) {
+                eprintln!("  warning: cannot resolve PCI claims of vm {} ({e}); offering no GPUs", vm.vmid);
+                continue;
+            }
             let Some(map) = cfg.as_object() else { continue };
 
             // Anything the marketplace did not create is the provider's own,
@@ -469,19 +641,6 @@ impl Client {
                 foreign.disk_gib += configured_disk_gib(map);
             }
 
-            for (k, v) in map {
-                if !k.starts_with("hostpci") {
-                    continue;
-                }
-                if let Some(raw) = v.as_str() {
-                    let slot = pci_slot(raw);
-                    if running {
-                        claims.running.insert(slot);
-                    } else {
-                        claims.stopped.insert(slot);
-                    }
-                }
-            }
         }
         // Only when every guest was readable — a partial survey undercounts,
         // and an undercount here reads as free capacity — and only when this
@@ -501,6 +660,15 @@ impl Client {
         &self,
         want: Option<&str>,
         c: &Contribution,
+    ) -> anyhow::Result<InventoryReport> {
+        self.discover_with_claims(want, c, None).await
+    }
+
+    async fn discover_with_claims(
+        &self,
+        want: Option<&str>,
+        c: &Contribution,
+        desired: Option<&DesiredState>,
     ) -> anyhow::Result<InventoryReport> {
         let entries: Vec<NodeEntry> = self.get("/nodes").await?;
         let mut nodes = Vec::new();
@@ -527,7 +695,7 @@ impl Client {
                 .sum::<u64>()
                 / (1024 * 1024 * 1024);
 
-            let claims = self.claimed_pci(&entry.node).await;
+            let claims = self.claimed_pci(&entry.node, desired).await;
             let pci: Vec<PciEntry> =
                 self.get(&format!("/nodes/{}/hardware/pci", entry.node)).await.unwrap_or_default();
 
@@ -551,11 +719,11 @@ impl Client {
                     eprintln!("  skipping {slot}: guest inventory incomplete, cannot prove it is free");
                     continue;
                 }
-                if claims.running.contains(&slot) {
-                    eprintln!("  skipping {slot}: passed through to a RUNNING guest");
+                if !claims.may_offer(&slot) {
+                    eprintln!("  skipping {slot}: conflicting or unaccounted guest assignment");
                     continue;
                 }
-                if claims.stopped.contains(&slot) {
+                if claims.stopped.contains(&slot) && !claims.accounted.contains(&slot) {
                     eprintln!(
                         "  warning: {slot} is still referenced by a stopped guest; \
                          offering it anyway because it is explicitly declared. \
@@ -698,6 +866,167 @@ mod tests {
         assert_eq!(pci_slot("05:00"), pci_slot("0000:05:00.1"));
         assert_eq!(pci_slot("0000:5d:00,pcie=1,x-vga=1"), "0000:5d:00");
         assert_ne!(pci_slot("0000:21:00.0"), pci_slot("0000:22:00.0"));
+    }
+}
+
+#[cfg(test)]
+mod pci_claim_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mappings() -> Vec<PciMapping> {
+        serde_json::from_value(json!([{"id": "card", "map": [
+            "node=Titan,path=0000:05:00.0,id=10de:2204",
+            "node=Pluto,path=0000:21:00,id=10de:2204"
+        ]}])).unwrap()
+    }
+
+    fn desired() -> DesiredState {
+        let mut state: DesiredState = serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        state.instances[0].gpu_local_ids = vec!["0000:21:00.0".into()];
+        state
+    }
+
+    fn vm() -> VmEntry {
+        VmEntry { vmid: 200, status: Some("running".into()),
+            tags: Some(format!("onv-instance;{}", crate::names::short_tag(&desired().instances[0].id))) }
+    }
+
+    fn config() -> serde_json::Value {
+        json!({"hostpci0": "mapping=card,pcie=1,rombar=0",
+               "description": format!("Omnuv instance {}\nManaged by onv-provider. Do not edit.", desired().instances[0].id)})
+    }
+
+    fn claims() -> PciClaims {
+        PciClaims { complete: true, ..Default::default() }
+    }
+
+    #[test]
+    fn mapping_selects_physical_devices_on_the_current_node() {
+        let maps = mappings();
+        assert_eq!(resolve_pci_claim("mapping=card,pcie=1", "Pluto", &maps).unwrap(),
+                   HashSet::from(["0000:21:00".into()]));
+        assert_eq!(resolve_pci_claim("pcie=1,mapping=card", "Titan", &maps).unwrap(),
+                   HashSet::from(["0000:05:00".into()]));
+        assert!(resolve_pci_claim("mapping=card", "elsewhere", &maps).is_err());
+    }
+
+    #[test]
+    fn every_raw_function_and_every_mapped_device_is_reserved() {
+        let expected = HashSet::from(["0000:21:00".into(), "0000:5d:00".into()]);
+        assert_eq!(resolve_pci_claim("host=21:00.0;0000:21:00.1;0000:5D:00,pcie=1", "Pluto", &[]).unwrap(), expected);
+        let maps = vec![PciMapping { id: "multi".into(), map: vec![
+            "node=Pluto,path=0000:21:00.0;0000:21:00.1".into(),
+            "node=Pluto,path=0000:5d:00.0".into(),
+        ] }];
+        assert_eq!(resolve_pci_claim("mapping=multi", "Pluto", &maps).unwrap(), expected);
+    }
+
+    #[test]
+    fn incomplete_or_ambiguous_mapping_observations_never_resolve() {
+        assert!(serde_json::from_value::<Vec<PciMapping>>(json!([{"id":"card"}])).is_err());
+        assert!(serde_json::from_value::<Vec<PciMapping>>(json!([{"id":"card","map":"not-an-array"}])).is_err());
+        let maps = mappings();
+        for raw in ["mapping=missing", "mapping=card,host=21:00", "host=", "21:00.9", "21:00;not-an-address"] {
+            assert!(resolve_pci_claim(raw, "Pluto", &maps).is_err(), "{raw}");
+        }
+        for entry in ["node=Pluto", "path=21:00", "node=Pluto,path=bad", "node=Pluto,node=Titan,path=21:00"] {
+            let maps = [PciMapping { id: "card".into(), map: vec![entry.into()] }];
+            assert!(resolve_pci_claim("mapping=card", "Pluto", &maps).is_err(), "{entry}");
+        }
+        let mut maps = mappings();
+        maps.push(PciMapping { id: "card".into(), map: vec!["node=Pluto,path=5d:00".into()] });
+        assert!(resolve_pci_claim("mapping=card", "Pluto", &maps).is_err());
+    }
+
+    #[test]
+    fn allocated_marketplace_gpu_remains_physical_inventory() {
+        let mut observed = claims();
+        observed.observe_vm(&vm(), &config(), "Pluto", &mappings(), Some(&desired())).unwrap();
+        assert!(observed.running.contains("0000:21:00"));
+        assert!(observed.may_offer("0000:21:00"), "Core still reserves this physical card through its allocation");
+    }
+
+    #[test]
+    fn allocated_worker_is_accounted_by_its_full_identity_too() {
+        let mut state = desired();
+        let id = state.instances.remove(0).id;
+        state.inference_workers.push(serde_json::from_value(json!({
+            "id": id, "lifecycle": "running", "image": "test-image", "model_repo": "fixture",
+            "vcpus": 4, "memory_mib": 8192, "disk_gib": 20, "port": 8000,
+            "gpu_local_ids": ["0000:21:00.0"]
+        })).unwrap());
+        let worker = VmEntry { vmid: 201, status: Some("running".into()),
+            tags: Some(format!("onv-worker;{}", crate::names::short_tag(&id))) };
+        let config = json!({"hostpci0":"mapping=card", "description":format!("Omnuv inference worker {id}\nManaged by onv-provider. Do not edit.")});
+        let mut observed = claims();
+        observed.observe_vm(&worker, &config, "Pluto", &mappings(), Some(&state)).unwrap();
+        assert!(observed.may_offer("0000:21:00"));
+    }
+
+    #[test]
+    fn foreign_mapping_is_blocked_even_when_an_accounted_vm_has_the_same_card() {
+        let mut observed = claims();
+        observed.observe_vm(&vm(), &config(), "Pluto", &mappings(), Some(&desired())).unwrap();
+        let mut foreign = vm();
+        foreign.vmid = 101;
+        foreign.tags = None;
+        observed.observe_vm(&foreign, &config(), "Pluto", &mappings(), Some(&desired())).unwrap();
+        assert!(!observed.may_offer("0000:21:00"));
+    }
+
+    #[test]
+    fn full_uuid_and_allocated_physical_device_must_both_match() {
+        let mut collision = config();
+        let mut id = desired().instances[0].id.clone();
+        id.replace_range(35..36, "7"); // Same truncated tag, different full identity.
+        collision["description"] = json!(format!("Omnuv instance {id}"));
+        let mut observed = claims();
+        observed.observe_vm(&vm(), &collision, "Pluto", &mappings(), Some(&desired())).unwrap();
+        assert!(!observed.may_offer("0000:21:00"));
+        let mut wrong_card = desired();
+        wrong_card.instances[0].gpu_local_ids = vec!["0000:5d:00.0".into()];
+        let mut observed = claims();
+        observed.observe_vm(&vm(), &config(), "Pluto", &mappings(), Some(&wrong_card)).unwrap();
+        assert!(!observed.may_offer("0000:21:00"));
+    }
+
+    #[test]
+    fn deletion_keeps_reservation_until_core_releases_it_and_omission_never_frees_a_live_claim() {
+        let mut state = desired();
+        state.instances[0].intent = omnuv_protocol::Lifecycle::Absent;
+        let mut observed = claims();
+        observed.observe_vm(&vm(), &config(), "Pluto", &mappings(), Some(&state)).unwrap();
+        assert!(observed.may_offer("0000:21:00"), "deleting still owns its unreleased allocation");
+        state.instances.clear();
+        let mut observed = claims();
+        observed.observe_vm(&vm(), &config(), "Pluto", &mappings(), Some(&state)).unwrap();
+        assert!(!observed.may_offer("0000:21:00"));
+        let mut stopped = vm();
+        stopped.status = Some("stopped".into());
+        let mut observed = claims();
+        observed.observe_vm(&stopped, &config(), "Pluto", &mappings(), None).unwrap();
+        assert!(!observed.may_offer("0000:21:00"), "a stopped unaccounted marketplace VM still owns its card");
+    }
+
+    #[test]
+    fn malformed_guest_observations_block_all_capacity_not_only_the_named_card() {
+        for cfg in [json!(null), json!({"hostpci0": 42}), json!({"hostpci0": "mapping=missing"})] {
+            let mut observed = claims();
+            assert!(observed.observe_vm(&vm(), &cfg, "Pluto", &mappings(), Some(&desired())).is_err());
+            assert!(!observed.complete);
+            assert!(!observed.may_offer("0000:5d:00"));
+        }
+        let mut unknown = vm();
+        unknown.status = None;
+        let mut observed = claims();
+        assert!(observed.observe_vm(&unknown, &config(), "Pluto", &mappings(), Some(&desired())).is_err());
+        assert!(!observed.may_offer("0000:5d:00"));
+        let mut partial = desired();
+        partial.unchanged = true;
+        let mut observed = claims();
+        assert!(observed.observe_vm(&vm(), &config(), "Pluto", &mappings(), Some(&partial)).is_err());
+        assert!(!observed.may_offer("0000:5d:00"));
     }
 }
 

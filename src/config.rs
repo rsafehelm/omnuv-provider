@@ -150,6 +150,49 @@ developmentInfrastructure:
     /// match the eighty legitimate ones — and its own needle. The second half
     /// matters as much as the first: a redaction that also hid the value from
     /// the code that has to spend it would be a broken agent, not a safe one.
+    /// **The key the template writes is the key the agent reads.**
+    ///
+    /// `AgentConfig` carries `#[serde(rename_all = "camelCase")]`, so a field
+    /// whose name is more than one word arrives under a name the Ansible
+    /// template does not write, `#[serde(default)]` fills in `None`, and every
+    /// machine is built unstamped while nothing anywhere complains. That is the
+    /// same silence as a credential belonging to a destroyed store: the value
+    /// is valid, it is simply not the one anybody meant.
+    ///
+    /// So this parses what `templates/agent.yaml.j2` actually emits, including
+    /// the empty string an inventory with no environment renders.
+    #[test]
+    fn the_environment_arrives_under_the_name_the_template_writes() {
+        let with = |environment: &str| -> super::AgentConfig {
+            serde_yaml_ng::from_str(&format!(
+                r#"
+core:
+  url: https://api.test.omnuv.com
+  token: t
+environment: "{environment}"
+proxmox:
+  apiUrl: https://127.0.0.1:8006
+  tokenId: onv@pve!agent
+  tokenSecret: s
+"#
+            ))
+            .expect("config must parse")
+        };
+        assert_eq!(with("test").environment.as_deref(), Some("test"));
+        // An inventory that declares none renders the empty string, which
+        // `names::tags` treats as unstamped rather than as a tag called `onv-`.
+        assert_eq!(
+            crate::names::tags(crate::names::TAG_INSTANCE, "id", with("").environment.as_deref()),
+            format!("{};{}", crate::names::TAG_INSTANCE, crate::names::short_tag("id"))
+        );
+        // And a configuration written before the field existed still parses.
+        let older: super::AgentConfig = serde_yaml_ng::from_str(
+            "core:\n  url: https://api.omnuv.com\n  token: t\nproxmox:\n  apiUrl: https://127.0.0.1:8006\n  tokenId: onv@pve!agent\n  tokenSecret: s\n",
+        )
+        .expect("a config from before this field must still parse");
+        assert_eq!(older.environment, None);
+    }
+
     #[test]
     fn debug_on_the_agent_config_redacts_both_credentials() {
         let cfg: super::AgentConfig = serde_yaml_ng::from_str(
@@ -195,6 +238,19 @@ pub struct AgentConfig {
     /// frequent and are what drive online/offline.
     #[serde(default = "default_inventory_secs")]
     pub inventory_every_secs: u64,
+    /// Which deployment this agent belongs to: `prod`, `test`, `dev`.
+    ///
+    /// Stamped onto every machine it creates as a third tag, so that a person
+    /// reading a hypervisor's VM list can tell the marketplace's production
+    /// machines from a test run's without consulting anything. It is **not a
+    /// claim** and authorizes nothing — ownership is `onv-instance`,
+    /// `onv-worker` or `onv-gateway`, matched as whole tokens.
+    ///
+    /// Optional, and absent means unstamped rather than wrong: an agent
+    /// deployed before this existed keeps working, and its machines carry the
+    /// two tags everything actually matches on.
+    #[serde(default)]
+    pub environment: Option<String>,
     pub proxmox: ProxmoxRuntime,
 }
 
