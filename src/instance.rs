@@ -833,6 +833,46 @@ impl Client {
             });
         }
 
+        // **A card that is not free is refused here, before anything is built.**
+        //
+        // The agent already knows which cards are taken: `claimed_pci` lists
+        // every display controller on the node and subtracts the slots each
+        // existing guest holds in its `hostpci*` configuration. That answer was
+        // used on one side of the transaction only — to decide what to *offer*
+        // Core — and never to decide whether to *accept* a placement.
+        //
+        // So a request for a card another machine holds used to be attempted:
+        // the VM was cloned, the attach failed with Proxmox's own
+        //
+        //     PCI device '0000:21:00.0' already in use by VMID '103'
+        //
+        // and the refusal came back as a generic task failure, which reads as
+        // retryable. Core then re-drove an impossible request for as long as
+        // the other machine lived, and each attempt left a stopped shell
+        // holding a disk. Measured on Pluto with two RTX 3090s, 19 September.
+        //
+        // **This is one-shot.** A card in use is not a transient condition to
+        // wait out: it is a placement that was wrong when it was made, and the
+        // marketplace's answer is to place the machine elsewhere rather than to
+        // queue behind another tenant's machine. Nothing is created.
+        if !spec.gpu_local_ids.is_empty() {
+            let claims = self.claimed_pci(node, None).await;
+            // **An incomplete view refuses rather than proceeds.** "I could not
+            // read every guest" and "every card is free" must never be the same
+            // answer — that is how a card gets sold twice.
+            anyhow::ensure!(
+                claims.complete,
+                "cannot prove a GPU is free on {node}: the guest inventory is incomplete,                  so this placement is refused rather than risk selling a card twice"
+            );
+            for want in &spec.gpu_local_ids {
+                let slot = crate::proxmox::pci_slot(want);
+                anyhow::ensure!(
+                    claims.may_offer(&slot),
+                    "GPU {want} is not free on this provider: it is already assigned to                      another guest. This placement is refused and nothing was created;                      the marketplace should place this machine on a provider with a                      free card."
+                );
+            }
+        }
+
         // The image decides how first boot is rendered. Only cloud-init is
         // implemented; a Cloudbase-Init image is refused here with the reason
         // reported, never built wrong. Adding Windows is this one arm.
@@ -1708,5 +1748,62 @@ echo 'single' "double" `backtick` \$escaped
         // Unknown keys are ignored rather than fatal, so the recipe can add one
         // without an agent that predates it refusing the whole file.
         assert!(parse_stream_credentials("port=47990\nuser=u\npassword=p\n").is_some());
+    }
+}
+
+#[cfg(test)]
+mod gpu_placement_is_one_shot {
+    //! **A card that is not free is refused before anything is built.**
+    //!
+    //! The agent has always known which cards are taken — `claimed_pci` lists
+    //! every display controller and subtracts what each guest holds — and used
+    //! that answer only to decide what to *offer* Core, never to decide whether
+    //! to *accept* a placement. So a request for a card another machine held
+    //! was attempted: the VM was cloned, the attach failed with Proxmox's own
+    //! `PCI device '0000:21:00.0' already in use by VMID '103'`, and the generic
+    //! task failure read as retryable — so Core re-drove an impossible request
+    //! for as long as the other machine lived, each attempt leaving a stopped
+    //! shell holding a disk.
+    //!
+    //! Measured on Pluto with two RTX 3090s, 19 September 2026.
+
+    /// The two refusals that must not be retried, and the one that must.
+    ///
+    /// This asserts the classification `agent.rs` performs, which keys on the
+    /// error text — the third untyped string acting as protocol on this wire.
+    /// The test exists because that is fragile: a phrase reworded on either
+    /// side changes the behaviour from *place it elsewhere* to *retry forever*,
+    /// and nothing else would notice.
+    #[test]
+    fn a_placement_that_cannot_succeed_is_not_retried() {
+        let classify = |why: &str| {
+            let no_image = why.contains("is not offered by this provider");
+            let no_card = why.contains("is not free on this provider")
+                || why.contains("cannot prove a GPU is free");
+            !(no_image || no_card)
+        };
+
+        // Wrong when it was made: a different provider is the answer.
+        assert!(!classify("image ubuntu-26.04-nvidia is not offered by this provider"));
+        assert!(!classify(
+            "GPU 0000:21:00.0 is not free on this provider: it is already assigned to \
+             another guest. This placement is refused and nothing was created; the \
+             marketplace should place this machine on a provider with a free card."
+        ));
+        // **An unreadable guest inventory is also one-shot**, because "I could
+        // not look" and "every card is free" must never be the same answer.
+        assert!(!classify(
+            "cannot prove a GPU is free on Pluto: the guest inventory is incomplete, \
+             so this placement is refused rather than risk selling a card twice"
+        ));
+
+        // Transient, and retrying is right: the hypervisor was busy, not wrong.
+        assert!(classify("proxmox task failed: got no worker upid - start worker failed"));
+        assert!(classify("connection refused"));
+        // And the old attach failure, which is what this change stops producing
+        // — it stays retryable, because if it is ever seen again it means the
+        // check above was bypassed rather than that the card is permanently
+        // gone.
+        assert!(classify("proxmox task failed: PCI device '0000:21:00.0' already in use"));
     }
 }

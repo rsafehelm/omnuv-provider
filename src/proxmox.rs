@@ -101,7 +101,7 @@ struct PciMapping {
 
 /// Which guests currently lay claim to a PCI device.
 #[derive(Default)]
-struct PciClaims {
+pub(crate) struct PciClaims {
     /// Held by a guest that is running; retained in physical inventory only
     /// when Core's current allocation and this VM's full identity account for it.
     running: HashSet<String>,
@@ -127,7 +127,7 @@ struct PciClaims {
     committed: Option<omnuv_protocol::HostCommitment>,
     /// False if enumeration failed. Nothing is offered when we cannot prove
     /// a device is free.
-    complete: bool,
+    pub(crate) complete: bool,
 }
 
 pub struct Client {
@@ -279,7 +279,7 @@ fn accounted_pci(vm: &VmEntry, config: &serde_json::Map<String, serde_json::Valu
 }
 
 impl PciClaims {
-    fn may_offer(&self, slot: &str) -> bool {
+    pub(crate) fn may_offer(&self, slot: &str) -> bool {
         self.complete && !self.blocked.contains(slot)
             && (!self.running.contains(slot) || self.accounted.contains(slot))
     }
@@ -590,7 +590,7 @@ impl Client {
     /// Every raw or mapped PCI assignment, including stopped guests. An
     /// accounted marketplace allocation remains physical inventory while Core
     /// reserves it; foreign running and unaccounted marketplace claims do not.
-    async fn claimed_pci(&self, node: &str, desired: Option<&DesiredState>) -> PciClaims {
+    pub(crate) async fn claimed_pci(&self, node: &str, desired: Option<&DesiredState>) -> PciClaims {
         let mut claims = PciClaims { complete: true, ..Default::default() };
         let mut foreign = omnuv_protocol::HostCommitment {
             cpu_cores: 0,

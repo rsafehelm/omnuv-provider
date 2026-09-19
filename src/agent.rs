@@ -1120,13 +1120,35 @@ async fn reconcile_workers(
             // Why, and whether trying again could plausibly work. Without this
             // Core has to poll to learn anything, and it will re-drive an
             // impossible request until its horizon for no reason.
-            let retryable = !why.contains("is not offered by this provider");
+            // **What cannot be retried into working.** Both of these are
+            // placements that were wrong when they were made: a provider
+            // without the image, and a provider whose card is already sold.
+            // Retrying either re-drives an impossible request until Core's
+            // horizon; the marketplace's answer is a different provider.
+            //
+            // **And this is the third untyped string acting as protocol on
+            // this wire**, after the handshake and after `message: "deleted"`.
+            // A phrase changed on one side silently changes the other's
+            // behaviour, and here the change is from "place it elsewhere" to
+            // "retry forever". Named rather than fixed: closing it is a tagged
+            // `omnuv-protocol` release carrying a reason code, and that is
+            // queued.
+            let no_image = why.contains("is not offered by this provider");
+            let no_card = why.contains("is not free on this provider")
+                || why.contains("cannot prove a GPU is free");
+            let retryable = !(no_image || no_card);
             InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Error,
                 retryable: Some(retryable),
-                waiting_on: (!retryable).then(|| "a provider that offers this image".to_string()),
+                waiting_on: if no_image {
+                    Some("a provider that offers this image".to_string())
+                } else if no_card {
+                    Some("a provider with a free card".to_string())
+                } else {
+                    None
+                },
                 local_id: None,
                 private_ip: None,
                 adapters: Vec::new(),
