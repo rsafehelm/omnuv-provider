@@ -674,6 +674,33 @@ impl Client {
         // machine on `nuc3` look like one that had never been created.
         if let Some((node, vm)) = self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await? {
             let node = node.as_str();
+            // **`/cluster/resources` answers *where*; the node answers *what
+            // state*.** That aggregate is cached and lags by seconds, so a
+            // machine started moments ago still reads `stopped` in it — and
+            // converging on that stale reading tries to start a running machine
+            // and reports `proxmox task failed: VM 100 already running`, a
+            // false ERROR that Core may act on. Measured on the test cluster,
+            // 19 September 2026, eight of them before one machine settled.
+            //
+            // The previous code read `/nodes/{node}/qemu`, which is live, and
+            // the cluster-wide lookup lost that without replacing it. One extra
+            // read per machine per pass buys a status that is true.
+            let vm = match self
+                .get_json::<serde_json::Value>(&format!(
+                    "/nodes/{node}/qemu/{}/status/current",
+                    vm.vmid
+                ))
+                .await
+            {
+                Ok(live) => crate::worker::VmRef {
+                    status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
+                    ..vm
+                },
+                // A node that will not answer about one machine is a separate
+                // problem; the converge below will fail in its own words rather
+                // than acting on a guess.
+                Err(_) => vm,
+            };
             let mut running = vm.status.as_deref() == Some("running");
 
             // The machine's place on its network's segment. A machine built

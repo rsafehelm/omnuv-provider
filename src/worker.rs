@@ -314,6 +314,23 @@ impl Client {
             self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await?
         {
             let node = found.as_str();
+            // Live status from the node, not the cached cluster aggregate —
+            // the same correction as `ensure_instance`, for the same reason:
+            // converging on a stale `stopped` starts a running machine and
+            // reports a failure that never happened.
+            let vm = match self
+                .get_json::<serde_json::Value>(&format!(
+                    "/nodes/{node}/qemu/{}/status/current",
+                    vm.vmid
+                ))
+                .await
+            {
+                Ok(live) => VmRef {
+                    status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
+                    ..vm
+                },
+                Err(_) => vm,
+            };
             let mut running = vm.status.as_deref() == Some("running");
 
             // Converge, do not merely observe: a worker that exists but is not
