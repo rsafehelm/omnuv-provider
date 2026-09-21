@@ -14,6 +14,13 @@ description = "Omnuv Provider Agent. Executes normalized marketplace intent on a
 name = "onv-provider"
 path = "src/main.rs"
 
+# The Workload Agent, fetched by marketplace machines from Core's /downloads.
+# It was `src/bin/omnuv-workloadd.rs`, so it built as `omnuv-workloadd`, a name
+# nothing fetched.
+[[bin]]
+name = "onv-workloadd"
+path = "src/bin/onv-workloadd.rs"
+
 [dependencies]
 omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.17.0" }
 serde = { version = "1", features = ["derive"] }

@@ -125,6 +125,20 @@ mod tests {
     use super::*;
     use omnuv_protocol::{GpuTelemetry, WorkloadHealth};
 
+    /// **The writer and the reader name the same file.** The Workload Agent
+    /// wrote `/run/omnuv/workload.json` while this read `/run/onv/…`, so no
+    /// report ever arrived. The binary cannot import `WORKLOAD_STATUS` (this
+    /// crate has no library), so this reads its source and asks for the
+    /// constant as a whole string literal.
+    #[test]
+    fn the_workload_agent_writes_where_the_provider_agent_reads() {
+        let writer = include_str!("bin/onv-workloadd.rs");
+        let wanted = format!("const STATUS_PATH: &str = \"{WORKLOAD_STATUS}\";");
+        assert!(writer.contains(&wanted), "onv-workloadd does not declare {wanted}");
+        // The negative case: the old path must not satisfy the check.
+        assert!(!"const STATUS_PATH: &str = \"/run/omnuv/workload.json\";".contains(&wanted));
+    }
+
     fn report(id: &str, uptime_s: u64) -> WorkloadReport {
         WorkloadReport {
             workload_id: id.into(),

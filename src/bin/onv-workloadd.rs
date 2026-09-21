@@ -47,7 +47,12 @@ const INTERVAL: Duration = Duration::from_secs(15);
 /// On `tmpfs`, deliberately: a reboot must not leave yesterday's report behind
 /// looking current, and this is state about *now* that should not survive the
 /// process that produced it.
-const STATUS_PATH: &str = "/run/omnuv/workload.json";
+/// **The same path as `workload::WORKLOAD_STATUS`, which the Provider Agent
+/// reads.** This said `/run/omnuv` after the reader moved to `/run/onv`, so
+/// every report went where nothing looked. A binary cannot import from this
+/// crate, which has no library, so a test in `workload.rs` reads this file and
+/// holds the two equal.
+const STATUS_PATH: &str = "/run/onv/workload.json";
 
 /// Beyond this, a worker that answers is still not somewhere to send traffic.
 /// The number is deliberately generous — `/v1/models` is a trivial handler, so
@@ -73,7 +78,7 @@ impl Config {
             vllm_url: std::env::var("OMNUV_VLLM_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8000".into()),
             cache_dir: std::env::var("OMNUV_CACHE_DIR")
-                .unwrap_or_else(|_| "/opt/omnuv/hf".into()),
+                .unwrap_or_else(|_| "/opt/onv/hf".into()),
         })
     }
 }
@@ -360,7 +365,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(Duration::from_secs(1))
             .build()
             .map_err(|e| anyhow::anyhow!("http client: {e}"))?;
-        println!("omnuv-workloadd: ok");
+        println!("onv-workloadd: ok");
         return Ok(());
     }
 
@@ -380,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
     let mut last_bytes = dir_bytes(&cfg.cache_dir);
     let mut last_health: Option<WorkloadHealth> = None;
 
-    eprintln!("omnuv-workloadd: {} reporting to {STATUS_PATH}", cfg.workload_id);
+    eprintln!("onv-workloadd: {} reporting to {STATUS_PATH}", cfg.workload_id);
 
     loop {
         let (health, serving) = probe(&client, &cfg.vllm_url).await;
@@ -411,11 +416,11 @@ async fn main() -> anyhow::Result<()> {
             // process: the agent's own probe still decides the worker's state,
             // and a machine that stops reporting is a smaller problem than one
             // that stops running.
-            eprintln!("omnuv-workloadd: writing {STATUS_PATH}: {e}");
+            eprintln!("onv-workloadd: writing {STATUS_PATH}: {e}");
         }
 
         if last_health != Some(health) {
-            eprintln!("omnuv-workloadd: health {last_health:?} -> {health:?}");
+            eprintln!("onv-workloadd: health {last_health:?} -> {health:?}");
             last_health = Some(health);
         }
         tokio::time::sleep(INTERVAL).await;
