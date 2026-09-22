@@ -32,19 +32,69 @@ pub(crate) fn vnet_for(network_id: &str) -> String {
     crate::names::vnet(network_id)
 }
 
+/// What to do about a network's segment, given the vnet of that name as the
+/// cluster reports it (or none).
+///
+/// **The name carries only 20 bits of the network id**, because a Proxmox vnet
+/// id is at most eight characters and three are `onv`. Two networks whose ids
+/// share those bits get the same name, and reusing a vnet by name alone would
+/// put two tenants on one bridge without a word. So the vnet records the whole
+/// network id in its `alias`, and a vnet whose alias names another network is
+/// refused rather than joined. A vnet with no alias predates this and is
+/// adopted: nothing can say whose it was, which is no worse than before.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Segment {
+    /// No vnet of that name: create it, with the alias.
+    Create,
+    /// Ours and applied: nothing to do if the bridge is up.
+    Ready,
+    /// Ours, with a change still pending: apply.
+    Pending,
+    /// Ours by name only, from before the alias: write the alias, then apply.
+    Adopt,
+    /// Another network's segment. Carries that network's id.
+    Collision(String),
+}
+
+pub(crate) fn segment(existing: Option<&serde_json::Value>, network_id: &str) -> Segment {
+    let Some(v) = existing else { return Segment::Create };
+    match v.get("alias").and_then(|a| a.as_str()).map(str::trim).filter(|a| !a.is_empty()) {
+        Some(owner) if owner != network_id => Segment::Collision(owner.to_string()),
+        None => Segment::Adopt,
+        Some(_) if v.get("state").is_some() => Segment::Pending,
+        Some(_) => Segment::Ready,
+    }
+}
+
 impl Client {
     /// Creates the segment if it is missing and applies it, then waits for the
     /// bridge to exist on the node. Idempotent: an applied vnet is left alone.
-    pub(crate) async fn ensure_vnet(&self, node: &str, vnet: &str) -> anyhow::Result<()> {
+    pub(crate) async fn ensure_vnet(&self, node: &str, vnet: &str, network_id: &str) -> anyhow::Result<()> {
         let vnets: Vec<serde_json::Value> = self.get_json("/cluster/sdn/vnets?pending=1").await?;
-        match vnets.iter().find(|v| v["vnet"] == vnet) {
-            // Present and applied. `state` is only set while a change is pending.
-            Some(v) if v.get("state").is_none() && self.vnet_available(node, vnet).await? => return Ok(()),
-            Some(_) => {}
-            None => {
+        // `state` is only set while a change is pending. See `segment`.
+        match segment(vnets.iter().find(|v| v["vnet"] == vnet), network_id) {
+            Segment::Ready if self.vnet_available(node, vnet).await? => return Ok(()),
+            Segment::Ready | Segment::Pending => {}
+            Segment::Collision(owner) => anyhow::bail!(
+                "segment {vnet} belongs to network {owner}, not {network_id}: their ids share \
+                 the 20 bits a segment name holds, and joining it would put two tenants on \
+                 one bridge. Refusing."
+            ),
+            Segment::Adopt => {
+                self.put_form::<Option<serde_json::Value>>(
+                    &format!("/cluster/sdn/vnets/{vnet}"),
+                    &[("alias".to_string(), network_id.to_string())],
+                )
+                .await?;
+            }
+            Segment::Create => {
                 self.post_form::<Option<serde_json::Value>>(
                     "/cluster/sdn/vnets",
-                    &[("vnet".to_string(), vnet.to_string()), ("zone".to_string(), ZONE.to_string())],
+                    &[
+                        ("vnet".to_string(), vnet.to_string()),
+                        ("zone".to_string(), ZONE.to_string()),
+                        ("alias".to_string(), network_id.to_string()),
+                    ],
                 )
                 .await?;
             }
@@ -160,6 +210,28 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_segment_named_like_ours_is_joined_only_when_it_is_ours() {
+        let net = "c4d90fd2-be3d-4225-a4a6-265138a76e49";
+        // Same first five hex digits, a different network: the case the
+        // 20-bit name cannot tell apart.
+        let other = "c4d90aaa-0000-4000-8000-000000000000";
+        assert_eq!(vnet_for(net), vnet_for(other), "the fixture must collide on name");
+
+        assert_eq!(segment(None, net), Segment::Create);
+        let ours = json!({"vnet": "onvc4d90", "zone": "onv", "alias": net});
+        assert_eq!(segment(Some(&ours), net), Segment::Ready);
+        let pending = json!({"vnet": "onvc4d90", "alias": net, "state": "new"});
+        assert_eq!(segment(Some(&pending), net), Segment::Pending);
+        // Negative: another network's segment is refused, never joined.
+        assert_eq!(segment(Some(&ours), other), Segment::Collision(net.to_string()));
+        // From before the alias, as `onvaca8e` on the test cluster is today.
+        let legacy = json!({"vnet": "onvc4d90", "zone": "onv"});
+        assert_eq!(segment(Some(&legacy), net), Segment::Adopt);
+        assert_eq!(segment(Some(&json!({"vnet": "onvc4d90", "alias": " "})), net), Segment::Adopt);
+    }
 
     #[test]
     fn vnet_ids_fit_proxmox_and_are_stable() {

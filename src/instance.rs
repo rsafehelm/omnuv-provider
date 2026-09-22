@@ -665,7 +665,7 @@ impl Client {
         if let Some(net) = &spec.network
             && spec.intent != Lifecycle::Absent
         {
-            self.ensure_vnet(node, &marketplace_bridge(net)).await?;
+            self.ensure_vnet(node, &marketplace_bridge(net), &net.network_id).await?;
         }
 
         // **Cluster-wide, or a machine on another node is built twice.** The
