@@ -399,8 +399,53 @@ WantedBy=multi-user.target
 
 /// Removes everything `join` created. A provider must be able to leave as
 /// easily as they joined, without asking us.
+/// The machines a pool listing names, as `vmid`s. Pools are how the
+/// marketplace marks its own machines on a host.
+fn machines_in(pool: &serde_json::Value) -> Vec<u64> {
+    pool["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["type"] == "qemu")
+        .filter_map(|m| m["vmid"].as_u64())
+        .collect()
+}
+
+/// The marketplace's SDN objects in a vnet listing, in the order they must go:
+/// every vnet of the marketplace's two zones. Their subnets are removed per
+/// vnet before it, and the zones after.
+fn marketplace_vnets(vnets: &serde_json::Value) -> Vec<String> {
+    vnets
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["zone"] == SDN_ZONE || v["zone"] == EGRESS_ZONE)
+        .filter_map(|v| v["vnet"].as_str().map(str::to_string))
+        .collect()
+}
+
 pub fn leave(dry_run: bool) -> anyhow::Result<()> {
     println!("onv-provider leave{}", if dry_run { " (dry run)" } else { "" });
+
+    // **Refused while the marketplace still has a machine here.** What leave
+    // removes below includes the network every buyer machine is attached to;
+    // removing it from under a running machine would cut that machine off.
+    // Nothing is changed before this check.
+    let mut remaining = Vec::new();
+    for pool in [GATEWAY_POOL, BUYER_POOL] {
+        if let Ok(out) = sh(&format!("pvesh get /pools/{pool} --output-format json 2>/dev/null"))
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&out)
+        {
+            remaining.extend(machines_in(&v));
+        }
+    }
+    anyhow::ensure!(
+        remaining.is_empty(),
+        "the marketplace still has machines on this host ({remaining:?}). Leave the \
+         marketplace from the provider console first, so they are removed through it, \
+         then run leave again."
+    );
+
     for (label, cmd) in [
         ("stop service", "systemctl disable --now onv-provider 2>/dev/null || true"),
         ("remove unit", "rm -f /etc/systemd/system/onv-provider.service; systemctl daemon-reload"),
@@ -434,12 +479,67 @@ pub fn leave(dry_run: bool) -> anyhow::Result<()> {
         }
     }
     // The audit log is deliberately left in place: it is the provider's record.
+    // What join creates that the list above did not remove: the roles granted
+    // on the pools and the SDN zone, and the marketplace's two SDN zones with
+    // every vnet and subnet in them (the old `onat0` bridge included).
+    step(
+        "remove pool and SDN roles",
+        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus; do pveum role delete $r 2>/dev/null || true; done",
+        dry_run,
+    )?;
+    let vnets = if dry_run {
+        Vec::new()
+    } else {
+        sh("pvesh get /cluster/sdn/vnets --output-format json")
+            .ok()
+            .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
+            .map(|v| marketplace_vnets(&v))
+            .unwrap_or_default()
+    };
+    for vnet in &vnets {
+        step(
+            &format!("remove segment {vnet}"),
+            &format!(
+                "for s in $(pvesh get /cluster/sdn/vnets/{vnet}/subnets --output-format json 2>/dev/null \
+                   | grep -o '\"id\":\"[^\"]*\"' | cut -d'\"' -f4); do \
+                   pvesh delete /cluster/sdn/vnets/{vnet}/subnets/$s 2>/dev/null || true; done; \
+                 pvesh delete /cluster/sdn/vnets/{vnet} 2>/dev/null || true"
+            ),
+            dry_run,
+        )?;
+    }
+    step(
+        "remove SDN zones",
+        &format!(
+            "pvesh delete /cluster/sdn/zones/{SDN_ZONE} 2>/dev/null || true; \
+             pvesh delete /cluster/sdn/zones/{EGRESS_ZONE} 2>/dev/null || true; \
+             pvesh set /cluster/sdn"
+        ),
+        dry_run,
+    )?;
+
     println!("\nRemoved. /var/log/onv/audit.log is kept — it is your record, not ours.");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn leave_finds_the_marketplaces_machines_and_segments() {
+        use serde_json::json;
+        let pool = json!({"members": [
+            {"type": "qemu", "vmid": 120}, {"type": "storage", "storage": "onv-snippets"},
+            {"type": "qemu", "vmid": 121}]});
+        assert_eq!(super::machines_in(&pool), vec![120, 121]);
+        assert!(super::machines_in(&json!({"members": []})).is_empty());
+
+        let vnets = json!([
+            {"vnet": "onvc4d90", "zone": "onv"}, {"vnet": "onvnat0", "zone": "onvnat"},
+            {"vnet": "onat0", "zone": "onvnat"}, {"vnet": "lan", "zone": "operator"}]);
+        // Negative: an operator's own zone is never touched.
+        assert_eq!(super::marketplace_vnets(&vnets), vec!["onvc4d90", "onvnat0", "onat0"]);
+    }
     use super::*;
 
     /// The role must not carry a privilege that lets the agent reconfigure the
