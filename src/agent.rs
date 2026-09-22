@@ -1003,7 +1003,15 @@ async fn reconcile_workers(
     // project's SDN segment. Both halves moved: `ensure_segment` creates it
     // with the machine that needs it, and `reap_unused_segments` above removes
     // one no machine is attached to.
-    let checks: Vec<omnuv_protocol::SelfCheck> = Vec::new();
+    // **The one comparison the report never made (CORE-38).** Everything below
+    // iterates what Core asked about; this asks the hypervisor what it holds
+    // under our claim and says which of those Core did not ask about. It
+    // reports and decides nothing — see `survey`.
+    let surveyed = driver.guests().await.map_err(|e| e.to_string());
+    let checks: Vec<omnuv_protocol::SelfCheck> = crate::survey::checks(surveyed.as_deref().map_err(|e| e.clone()), &desired);
+    for c in checks.iter().filter(|c| c.name == "guest.unclaimed") {
+        eprintln!("  warning: {}", c.detail.as_deref().unwrap_or("a claimed guest Core did not ask about"));
+    }
 
     let mut statuses = Vec::new();
     let mut unobserved_workers = 0usize;

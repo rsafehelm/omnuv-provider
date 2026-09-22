@@ -680,6 +680,25 @@ impl Client {
         Ok(nodes)
     }
 
+    /// Every guest on every placement node, with its tags — what the CORE-38
+    /// survey compares against desired state. **Any node that cannot be listed
+    /// fails the whole call**: a survey of four nodes out of five would read as
+    /// a clean one, and "could not look" must never look like "nothing there".
+    /// Offline nodes are outside `placement_nodes` and so outside this survey;
+    /// a guest there is reported when its node comes back.
+    pub(crate) async fn guests(&self) -> anyhow::Result<Vec<crate::survey::ClaimedGuest>> {
+        let mut out = Vec::new();
+        for node in self.placement_nodes().await? {
+            let vms: Vec<VmEntry> = self.get(&format!("/nodes/{node}/qemu")).await?;
+            out.extend(vms.into_iter().map(|v| crate::survey::ClaimedGuest {
+                node: node.clone(),
+                vmid: v.vmid,
+                tags: v.tags.unwrap_or_default(),
+            }));
+        }
+        Ok(out)
+    }
+
     pub(crate) async fn claimed_pci(&self, node: &str, desired: Option<&DesiredState>) -> PciClaims {
         let mut claims = PciClaims { complete: true, ..Default::default() };
         let mut foreign = omnuv_protocol::HostCommitment {
