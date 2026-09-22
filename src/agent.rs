@@ -543,8 +543,28 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     })
 }
 
+/// Whether this agent can act on a payload stamped with protocol `v`.
+///
+/// **A range, the one the handshake negotiates in, not one number.** This
+/// demanded exactly `PROTOCOL_VERSION`, while Core stamped its own; so an agent
+/// and a Core one version apart agreed a version at the handshake and then
+/// disagreed on every desired state. Core now stamps the agreed version, and
+/// this accepts anything the handshake could have agreed.
+fn speaks(v: u32) -> bool {
+    (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION).contains(&v)
+}
+
 #[cfg(test)]
 mod handshake_tests {
+    #[test]
+    fn a_payload_in_the_negotiated_range_is_accepted() {
+        use super::speaks;
+        assert!(speaks(omnuv_protocol::PROTOCOL_VERSION));
+        assert!(speaks(omnuv_protocol::MINIMUM_PROTOCOL_VERSION));
+        assert!(!speaks(omnuv_protocol::MINIMUM_PROTOCOL_VERSION - 1));
+        assert!(!speaks(omnuv_protocol::PROTOCOL_VERSION + 1));
+    }
+
     use super::*;
 
     struct HeartbeatDriver;
@@ -694,7 +714,7 @@ async fn report_inventory(core: &Core, driver: &impl ComputeDriver, offered_imag
     // removed cannot make its card look free.
     let desired: DesiredState = core.get_json("/provider/v1/desired-state").await
         .map_err(|e| anyhow::anyhow!("cannot account for inventory GPU claims: {e}"))?;
-    anyhow::ensure!(!desired.unchanged && desired.protocol_version == omnuv_protocol::PROTOCOL_VERSION,
+    anyhow::ensure!(!desired.unchanged && speaks(desired.protocol_version),
                     "inventory GPU claims require a full compatible desired state");
     let mut report = driver.inventory(&desired).await?;
     // Which marketplace images this provider can build — ids only; the
@@ -897,10 +917,11 @@ async fn reconcile_workers(
                 return Err(e);
             }
         };
-    if fetched.protocol_version != omnuv_protocol::PROTOCOL_VERSION {
+    if !speaks(fetched.protocol_version) {
         anyhow::bail!(
-            "core speaks protocol v{}, this agent speaks v{}",
+            "core sent protocol v{}, and this agent speaks v{} to v{}",
             fetched.protocol_version,
+            omnuv_protocol::MINIMUM_PROTOCOL_VERSION,
             omnuv_protocol::PROTOCOL_VERSION
         );
     }
