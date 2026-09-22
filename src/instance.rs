@@ -1546,10 +1546,9 @@ mod tests {
             management_url: "https://example.invalid".into(),
             hostname: None,
         };
-        for (what, frag) in [("overlay", overlay_runcmd(&o))] {
-            assert!(frag.ends_with('\n'), "{what} fragment does not end a line");
-            assert!(!frag.starts_with('\n'), "{what} fragment starts a line it did not open");
-        }
+        let frag = overlay_runcmd(&o);
+        assert!(frag.ends_with('\n'), "overlay fragment does not end a line");
+        assert!(!frag.starts_with('\n'), "overlay fragment starts a line it did not open");
     }
 
     fn spec_with_network() -> InstanceSpec {
@@ -1972,7 +1971,7 @@ mod a_provider_is_not_a_node {
     /// to add up themselves.
     #[test]
     fn a_full_provider_says_so_once() {
-        let refused = vec![
+        let refused = [
             "nuc0: GPU 0000:21:00.0 is already assigned to another guest here".to_string(),
             "nuc1: GPU 0000:21:00.0 is already assigned to another guest here".to_string(),
         ];

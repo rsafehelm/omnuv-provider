@@ -140,10 +140,10 @@ impl Core {
         // transfer. A sidecar naming the digest it was being fetched for is
         // what makes resuming safe rather than merely fast.
         let stamp = dest.with_extension("part.sha256");
-        let resumable = match tokio::fs::read_to_string(&stamp).await {
-            Ok(s) if s.trim() == a.sha256 => true,
-            _ => false,
-        };
+        let resumable = matches!(
+            tokio::fs::read_to_string(&stamp).await,
+            Ok(s) if s.trim() == a.sha256
+        );
         let have: u64 = if resumable {
             tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0)
         } else {

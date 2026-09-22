@@ -34,12 +34,6 @@ use std::sync::{Arc, Mutex};
 /// so a reboot cannot leave yesterday's report behind looking current.
 pub const WORKLOAD_STATUS: &str = "/run/onv/workload.json";
 
-/// Reads with no advance in `uptime_s` before the reporter is presumed dead.
-///
-/// Staleness is measured by the guest's own uptime rather than by a clock or a
-/// timestamp in the file: a stopped reporter leaves a perfectly well-formed
-/// file behind, and the only thing that distinguishes it from a live one is
-/// that the number stops moving. Nothing here trusts the guest's wall clock.
 // **Written, tested, and not yet wired**, which is why the compiler calls it
 // dead. It is the staleness half of the workload-agent contract: a stopped
 // reporter leaves a perfectly well-formed file behind, and the only thing
@@ -49,7 +43,12 @@ pub const WORKLOAD_STATUS: &str = "/run/onv/workload.json";
 // passes, so nothing decides that a reporter has stopped being believable. Kept
 // rather than deleted because the tests below are the decision — deleting it
 // would throw away the reasoning and leave the gap unmarked.
-
+/// Reads with no advance in `uptime_s` before the reporter is presumed dead.
+///
+/// Staleness is measured by the guest's own uptime rather than by a clock or a
+/// timestamp in the file: a stopped reporter leaves a perfectly well-formed
+/// file behind, and the only thing that distinguishes it from a live one is
+/// that the number stops moving. Nothing here trusts the guest's wall clock.
 const STUCK_AFTER_READS: u32 = 3;
 
 #[derive(Clone, Default)]

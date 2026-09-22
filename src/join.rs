@@ -248,7 +248,7 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     // project network, this one carries their way out.
     step(
         &format!("egress {EGRESS_VNET}"),
-        &format!("{}", egress_script()),
+        &egress_script(),
         a.dry_run,
     )?;
 
@@ -378,6 +378,47 @@ LockPersonality=yes
 WantedBy=multi-user.target
 "#;
 
+/// Removes everything `join` created. A provider must be able to leave as
+/// easily as they joined, without asking us.
+pub fn leave(dry_run: bool) -> anyhow::Result<()> {
+    println!("onv-provider leave{}", if dry_run { " (dry run)" } else { "" });
+    for (label, cmd) in [
+        ("stop service", "systemctl disable --now onv-provider 2>/dev/null || true"),
+        ("remove unit", "rm -f /etc/systemd/system/onv-provider.service; systemctl daemon-reload"),
+        ("remove token", "pveum user token remove onv@pve agent 2>/dev/null || true"),
+        ("remove acl", "pveum acl delete / -token 'onv@pve!agent' -role OnvAgent 2>/dev/null || true; pveum acl delete / -user onv@pve -role OnvAgent 2>/dev/null || true"),
+        ("remove user", "pveum user delete onv@pve 2>/dev/null || true"),
+        ("remove role", "pveum role delete OnvAgent 2>/dev/null || true"),
+        ("remove config", "rm -f /etc/onv/agent.yaml"),
+        ("remove storage", "pvesm remove onv-snippets 2>/dev/null || true"),
+        ("remove pools", "pveum pool delete onv-buyers 2>/dev/null || true; pveum pool delete onv 2>/dev/null || true"),
+        // **Two older generations, and they are not optional.** `join` created
+        // `omnuv-` names before 11 September and `omnu-` before that, and a
+        // rename that leaves the old object running is not a rename — it is a
+        // second copy nobody is looking at. A provider who joined last month
+        // and leaves today must end up with nothing of ours, not with nothing
+        // of this month's.
+        //
+        // The Proxmox `dir` storage is first on purpose: on 11 September
+        // `omnuv-snippets` recreated the directory it pointed at, a minute
+        // after that directory was deleted.
+        ("remove legacy storage", "pvesm remove omnuv-snippets 2>/dev/null || true; pvesm remove omnu-snippets 2>/dev/null || true"),
+        ("remove legacy units", "for u in omnuv-provider omnu-provider omnuv-egress omnu-egress; do systemctl disable --now $u 2>/dev/null || true; rm -f /etc/systemd/system/$u.service; done; systemctl daemon-reload"),
+        ("remove legacy identity", "for u in omnuv omnu; do pveum user token remove $u@pve agent 2>/dev/null || true; pveum user delete $u@pve 2>/dev/null || true; done; for r in OmnuvAgent OmnuAgent; do pveum role delete $r 2>/dev/null || true; done"),
+        ("remove legacy pools", "for p in omnuv-buyers omnuv omnu-buyers omnu; do pveum pool delete $p 2>/dev/null || true; done"),
+        ("remove legacy nftables", "for t in onv_egress omnuv_egress omnu_egress; do nft delete table inet $t 2>/dev/null || true; done"),
+        ("remove legacy config", "rm -rf /etc/omnuv /etc/omnu"),
+    ] {
+        println!("  {label}\n    $ {cmd}");
+        if !dry_run {
+            let _ = sh(cmd);
+        }
+    }
+    // The audit log is deliberately left in place: it is the provider's record.
+    println!("\nRemoved. /var/log/onv/audit.log is kept — it is your record, not ours.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,45 +465,4 @@ mod tests {
         assert!(s.contains("--snat 1"), "no NAT, so a machine has no way out");
         assert!(s.contains("--isolate-ports 1"), "tenants would see each other on the bridge");
     }
-}
-
-/// Removes everything `join` created. A provider must be able to leave as
-/// easily as they joined, without asking us.
-pub fn leave(dry_run: bool) -> anyhow::Result<()> {
-    println!("onv-provider leave{}", if dry_run { " (dry run)" } else { "" });
-    for (label, cmd) in [
-        ("stop service", "systemctl disable --now onv-provider 2>/dev/null || true"),
-        ("remove unit", "rm -f /etc/systemd/system/onv-provider.service; systemctl daemon-reload"),
-        ("remove token", "pveum user token remove onv@pve agent 2>/dev/null || true"),
-        ("remove acl", "pveum acl delete / -token 'onv@pve!agent' -role OnvAgent 2>/dev/null || true; pveum acl delete / -user onv@pve -role OnvAgent 2>/dev/null || true"),
-        ("remove user", "pveum user delete onv@pve 2>/dev/null || true"),
-        ("remove role", "pveum role delete OnvAgent 2>/dev/null || true"),
-        ("remove config", "rm -f /etc/onv/agent.yaml"),
-        ("remove storage", "pvesm remove onv-snippets 2>/dev/null || true"),
-        ("remove pools", "pveum pool delete onv-buyers 2>/dev/null || true; pveum pool delete onv 2>/dev/null || true"),
-        // **Two older generations, and they are not optional.** `join` created
-        // `omnuv-` names before 11 September and `omnu-` before that, and a
-        // rename that leaves the old object running is not a rename — it is a
-        // second copy nobody is looking at. A provider who joined last month
-        // and leaves today must end up with nothing of ours, not with nothing
-        // of this month's.
-        //
-        // The Proxmox `dir` storage is first on purpose: on 11 September
-        // `omnuv-snippets` recreated the directory it pointed at, a minute
-        // after that directory was deleted.
-        ("remove legacy storage", "pvesm remove omnuv-snippets 2>/dev/null || true; pvesm remove omnu-snippets 2>/dev/null || true"),
-        ("remove legacy units", "for u in omnuv-provider omnu-provider omnuv-egress omnu-egress; do systemctl disable --now $u 2>/dev/null || true; rm -f /etc/systemd/system/$u.service; done; systemctl daemon-reload"),
-        ("remove legacy identity", "for u in omnuv omnu; do pveum user token remove $u@pve agent 2>/dev/null || true; pveum user delete $u@pve 2>/dev/null || true; done; for r in OmnuvAgent OmnuAgent; do pveum role delete $r 2>/dev/null || true; done"),
-        ("remove legacy pools", "for p in omnuv-buyers omnuv omnu-buyers omnu; do pveum pool delete $p 2>/dev/null || true; done"),
-        ("remove legacy nftables", "for t in onv_egress omnuv_egress omnu_egress; do nft delete table inet $t 2>/dev/null || true; done"),
-        ("remove legacy config", "rm -rf /etc/omnuv /etc/omnu"),
-    ] {
-        println!("  {label}\n    $ {cmd}");
-        if !dry_run {
-            let _ = sh(cmd);
-        }
-    }
-    // The audit log is deliberately left in place: it is the provider's record.
-    println!("\nRemoved. /var/log/onv/audit.log is kept — it is your record, not ours.");
-    Ok(())
 }
