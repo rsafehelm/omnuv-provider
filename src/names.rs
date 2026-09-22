@@ -290,8 +290,49 @@ pub fn vnet(network_id: &str) -> String {
     format!("{PREFIX}{hex}")
 }
 
+/// Writes a file that holds a secret, with `mode` from the moment it exists.
+///
+/// `fs::write` creates a file with the process umask (world-readable under the
+/// usual 022) and a `chmod` afterwards leaves a window in which anyone on the
+/// host can read it; and a file that already existed keeps whatever mode it
+/// had. So the file is created with `mode`, and re-tightened if it existed.
+pub fn write_private(path: &str, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    f.write_all(contents)?;
+    f.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::write_private;
+
+    /// Born with its mode, and a file that already existed wider is tightened.
+    #[test]
+    fn a_secret_file_is_never_wider_than_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("onv-private-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        let p = path.to_str().unwrap();
+
+        write_private(p, b"one", 0o600).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(p, b"two", 0o640).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]

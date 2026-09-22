@@ -950,13 +950,15 @@ impl Client {
             ),
         };
         let file = crate::names::snippet_instance(&spec.id);
-        std::fs::write(format!("{snippet_dir}/{file}"), user_data)
+        // 0600: the user data carries the overlay setup key. Written through
+        // `write_private` so no other user on the hypervisor can read it.
+        crate::names::write_private(&format!("{snippet_dir}/{file}"), user_data.as_bytes(), 0o600)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
         // The network, in its own file because cloud-init reads it in
         // `init-local` — before networkd, and before the user data's `bootcmd`.
         // See `network_config`.
         let netfile = crate::names::snippet_network(&spec.id);
-        std::fs::write(format!("{snippet_dir}/{netfile}"), network_config(spec, vmid))
+        crate::names::write_private(&format!("{snippet_dir}/{netfile}"), network_config(spec, vmid).as_bytes(), 0o600)
             .map_err(|e| anyhow::anyhow!("writing cloud-init network config: {e}"))?;
 
         audit::record("instance.create", "core", &spec.id, "starting", Some(&vmid.to_string()));

@@ -393,7 +393,8 @@ impl Client {
 
         // Snippet must exist before the VM references it.
         let file = crate::names::snippet_worker(&spec.id);
-        std::fs::write(format!("{snippet_dir}/{file}"), cloud_init(spec, core_url))
+        // 0600: a worker's user data carries its credentials to Core.
+        crate::names::write_private(&format!("{snippet_dir}/{file}"), cloud_init(spec, core_url).as_bytes(), 0o600)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
         // **Queued and serialized, and every node asked** — the same gate and the

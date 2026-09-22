@@ -154,7 +154,14 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
             pveum user token add onv@pve agent --privsep 1 --output-format json")
             .and_then(|out| {
                 let v: serde_json::Value = serde_json::from_str(&out)?;
-                Ok(v["value"].as_str().unwrap_or_default().to_string())
+                // **An empty secret is a failure, not a value.** It was written
+                // into agent.yaml as "", and the agent then failed every call
+                // to the hypervisor with an authentication error far from here.
+                v["value"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("pveum created a token and printed no secret: {out}"))
             })?
     };
     step("token acl", "pveum acl modify / -token 'onv@pve!agent' -role OnvAgent", a.dry_run)?;
@@ -308,8 +315,10 @@ proxmox:
             u = crate::names::PREFIX,
             var = crate::names::VAR
         ))?;
-        std::fs::write("/etc/onv/agent.yaml", &config)?;
-        sh("chgrp onv /etc/onv/agent.yaml && chmod 0640 /etc/onv/agent.yaml")?;
+        // Created 0640, never wider: `fs::write` then `chmod` left the file
+        // world-readable, with both credentials in it, between the two.
+        crate::names::write_private("/etc/onv/agent.yaml", config.as_bytes(), 0o640)?;
+        sh("chgrp onv /etc/onv/agent.yaml")?;
         sh("install -d -o onv -g onv /var/lib/onv/snippets /var/log/onv")?;
         // **And the audit log inside it.** `main` opened it before this ran,
         // as root, so it was root:root 0644 and the agent (`User=onv`) could
