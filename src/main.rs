@@ -16,6 +16,8 @@ mod console;
 mod worker;
 mod neighbours;
 mod workload;
+#[cfg(test)]
+mod pvemock;
 
 const USAGE: &str = "\
 onv-provider - Omnuv Provider Agent

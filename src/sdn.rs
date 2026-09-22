@@ -231,6 +231,85 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// `ensure_vnet` through the real client: a new segment is created with
+    /// the network's id as its alias, and one whose alias names another
+    /// network is refused without writing anything.
+    #[tokio::test]
+    async fn a_segment_is_created_with_its_owner_and_a_collision_writes_nothing() {
+        use crate::pvemock::{task_ok, Mock};
+        let net = "c4d90fd2-be3d-4225-a4a6-265138a76e49";
+        let other = "c4d90aaa-0000-4000-8000-000000000000";
+        let route = |existing: serde_json::Value| {
+            move |method: &str, path: &str, _b: &str| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/sdn/vnets?pending=1") => (200, existing.clone()),
+                    ("POST", "/cluster/sdn/vnets") | ("PUT", _) => (200, json!("UPID:n1:x")),
+                    ("GET", p) if p.ends_with("/content") => (200, json!([{"vnet": "onvc4d90", "status": "available"}])),
+                    _ => (404, json!(null)),
+                }
+            }
+        };
+
+        let fresh = Mock::start(route(json!([]))).await;
+        fresh.client().ensure_vnet("n1", "onvc4d90", net).await.expect("created");
+        let body = fresh.body_of("POST", "/cluster/sdn/vnets").expect("a vnet was created");
+        assert!(body.contains(&format!("alias={net}")), "the new segment does not name its network: {body}");
+
+        let taken = Mock::start(route(json!([{"vnet": "onvc4d90", "zone": "onv", "alias": other}]))).await;
+        let refused = taken.client().ensure_vnet("n1", "onvc4d90", net).await;
+        assert!(refused.is_err(), "another network's segment was joined");
+        assert!(!taken.calls.lock().unwrap().iter().any(|c| c.method != "GET"),
+                "a refused segment still had something written");
+    }
+
+    /// **Through the real client, against a two-node cluster.** `onvbbb02` is
+    /// used only by a machine on the *other* node and must survive; `onvccc03`
+    /// is used by nothing and must go. Then the other node stops answering,
+    /// and nothing at all may be deleted.
+    #[tokio::test]
+    async fn the_reaper_keeps_a_segment_used_on_another_node() {
+        use crate::pvemock::{task_ok, Mock};
+        fn route(other_node_readable: bool) -> impl Fn(&str, &str, &str) -> (u16, serde_json::Value) {
+            move |method, path, _body| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/sdn/vnets?pending=1") => (200, json!([
+                        {"vnet": "onvaaa01", "zone": "onv"},
+                        {"vnet": "onvbbb02", "zone": "onv"},
+                        {"vnet": "onvccc03", "zone": "onv"}])),
+                    ("GET", "/nodes") => (200, json!([
+                        {"node": "n1", "status": "online"}, {"node": "n2", "status": "online"}])),
+                    ("GET", "/nodes/n1/qemu") => (200, json!([{"vmid": 100}])),
+                    ("GET", "/nodes/n2/qemu") if other_node_readable => (200, json!([{"vmid": 200}])),
+                    ("GET", "/nodes/n2/qemu") => (500, json!(null)),
+                    ("GET", "/nodes/n1/qemu/100/config") => (200, json!({"net1": "virtio=AA,bridge=onvaaa01"})),
+                    ("GET", "/nodes/n2/qemu/200/config") => (200, json!({"net1": "virtio=BB,bridge=onvbbb02"})),
+                    ("DELETE", p) if p.starts_with("/cluster/sdn/vnets/") => (200, json!(null)),
+                    ("PUT", "/cluster/sdn") => (200, json!("UPID:n1:apply")),
+                    _ => (404, json!(null)),
+                }
+            }
+        }
+
+        let mock = Mock::start(route(true)).await;
+        let removed = mock.client().reap_unused_segments("n1").await.expect("reap");
+        assert_eq!(removed, 1, "exactly the unused segment is removed");
+        assert!(mock.called("DELETE", "/cluster/sdn/vnets/onvccc03"));
+        assert!(!mock.called("DELETE", "/cluster/sdn/vnets/onvbbb02"),
+                "a segment in use on another node was removed");
+        assert!(!mock.called("DELETE", "/cluster/sdn/vnets/onvaaa01"));
+
+        let blind = Mock::start(route(false)).await;
+        assert_eq!(blind.client().reap_unused_segments("n1").await.expect("reap"), 0);
+        assert!(!blind.calls.lock().unwrap().iter().any(|c| c.method == "DELETE"),
+                "a node that could not be read still had segments reaped");
+    }
+
     #[test]
     fn a_vms_bridges_are_read_from_every_nic() {
         let cfg = json!({
