@@ -977,68 +977,87 @@ impl Client {
             .await?;
         self.wait_task(node, &upid).await?;
 
-        let config: Vec<(String, String)> = vec![
-            ("cores".into(), spec.vcpus.to_string()),
-            ("memory".into(), spec.memory_mib.to_string()),
-            ("cpu".into(), "host".into()),
-            ("agent".into(), "enabled=1".into()),
-            // **No `ipconfig0`.** Proxmox generates a network config from the
-            // `ipconfigN` keys *only* when `cicustom` does not carry a
-            // `network=` of its own; ours does, and leaving this here would be
-            // a second description of the same interfaces that nothing reads.
-            // A display as well as the serial port: the serial console is
-            // where a Linux machine logs in, the screen is what the buyer
-            // opens to watch it boot or rescue it, and what a Windows machine
-            // uses for everything.
-            ("vga".into(), "std".into()),
-            (
-                "cicustom".into(),
-                format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}"),
-            ),
-            ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
-            (
-                "description".into(),
-                format!("Omnuv instance {}\nManaged by onv-provider. Do not edit.", spec.id),
-            ),
-        ];
-        let mut config = config;
-        // The GPUs the marketplace allocated, by the host's published
-        // mappings: a non-root token may only attach a device the host has
-        // explicitly offered. The template is already q35/UEFI, which PCIe
-        // passthrough needs.
-        for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
-            config.push((
-                format!("hostpci{i}"),
-                format!("mapping={},pcie=1,rombar=0", crate::worker::mapping_name(pci)),
-            ));
-        }
-        // The template's net0 sits on the provider's own bridge. A buyer
-        // machine's goes on the NAT bridge instead: outbound internet, no
-        // presence on the provider's LAN. Proxmox picks the MAC and its IPAM
-        // hands the machine an address on that bridge.
-        config.push((
-            "net0".to_string(),
-            format!("virtio={},bridge={EGRESS_BRIDGE}", egress_mac(&spec.id)),
-        ));
-        // A second interface on the network's own isolated segment, when the
-        // buyer's project has a network. Nothing routes between the two.
-        if let Some(net) = &spec.network {
-            config.push((
-                "net1".to_string(),
-                format!("virtio={},bridge={}", marketplace_mac(&spec.id), marketplace_bridge(net)),
-            ));
-        }
-        self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
+        // **Ours from the moment it exists.** Proxmox's clone takes no tags, so
+        // the machine was untagged until the full config call below, and
+        // anything failing in between left a full disk no sweep recognises;
+        // the next pass, finding nothing tagged, cloned again. So the claim
+        // goes on first, alone, and a failure after the clone undoes the clone.
+        let finished: anyhow::Result<()> = async {
+            self.post_form::<serde_json::Value>(
+                &format!("/nodes/{node}/qemu/{vmid}/config"),
+                &[("tags".to_string(), crate::names::tags(TAG, &spec.id, self.environment.as_deref()))],
+            )
+            .await?;
 
-        self.put_form::<serde_json::Value>(
-            &format!("/nodes/{node}/qemu/{vmid}/resize"),
-            &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{}G", spec.disk_gib))],
-        )
-        .await?;
+            let config: Vec<(String, String)> = vec![
+                ("cores".into(), spec.vcpus.to_string()),
+                ("memory".into(), spec.memory_mib.to_string()),
+                ("cpu".into(), "host".into()),
+                ("agent".into(), "enabled=1".into()),
+                // **No `ipconfig0`.** Proxmox generates a network config from the
+                // `ipconfigN` keys *only* when `cicustom` does not carry a
+                // `network=` of its own; ours does, and leaving this here would be
+                // a second description of the same interfaces that nothing reads.
+                // A display as well as the serial port: the serial console is
+                // where a Linux machine logs in, the screen is what the buyer
+                // opens to watch it boot or rescue it, and what a Windows machine
+                // uses for everything.
+                ("vga".into(), "std".into()),
+                (
+                    "cicustom".into(),
+                    format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}"),
+                ),
+                ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
+                (
+                    "description".into(),
+                    format!("Omnuv instance {}\nManaged by onv-provider. Do not edit.", spec.id),
+                ),
+            ];
+            let mut config = config;
+            // The GPUs the marketplace allocated, by the host's published
+            // mappings: a non-root token may only attach a device the host has
+            // explicitly offered. The template is already q35/UEFI, which PCIe
+            // passthrough needs.
+            for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
+                config.push((
+                    format!("hostpci{i}"),
+                    format!("mapping={},pcie=1,rombar=0", crate::worker::mapping_name(pci)),
+                ));
+            }
+            // The template's net0 sits on the provider's own bridge. A buyer
+            // machine's goes on the NAT bridge instead: outbound internet, no
+            // presence on the provider's LAN. Proxmox picks the MAC and its IPAM
+            // hands the machine an address on that bridge.
+            config.push((
+                "net0".to_string(),
+                format!("virtio={},bridge={EGRESS_BRIDGE}", egress_mac(&spec.id)),
+            ));
+            // A second interface on the network's own isolated segment, when the
+            // buyer's project has a network. Nothing routes between the two.
+            if let Some(net) = &spec.network {
+                config.push((
+                    "net1".to_string(),
+                    format!("virtio={},bridge={}", marketplace_mac(&spec.id), marketplace_bridge(net)),
+                ));
+            }
+            self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
 
-        let upid: String =
-            self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
-        self.wait_task(node, &upid).await?;
+            self.put_form::<serde_json::Value>(
+                &format!("/nodes/{node}/qemu/{vmid}/resize"),
+                &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{}G", spec.disk_gib))],
+            )
+            .await?;
+
+            let upid: String =
+                self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
+            self.wait_task(node, &upid).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = finished {
+            self.abandon_clone(node, vmid, &spec.id).await;
+            return Err(e);
+        }
         audit::record("instance.create", "core", &spec.id, "ok", Some(&vmid.to_string()));
 
         Ok(InstanceStatus {
@@ -1166,6 +1185,28 @@ impl Client {
             restarted += 1;
         }
         Ok(restarted)
+    }
+
+    /// Undoes a clone this create made and could not finish.
+    ///
+    /// By VMID, because the machine may not carry its tag yet. That is safe
+    /// only because this very call created it a moment ago: nothing else can
+    /// be at that id. A failure here is recorded and left; if the tag went on,
+    /// the next pass finds the machine by it and does not clone again.
+    async fn abandon_clone(&self, node: &str, vmid: u32, id: &str) {
+        let _ = self
+            .post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/status/stop"), NO_FORM)
+            .await;
+        let gone: anyhow::Result<()> = async {
+            let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{vmid}")).await?;
+            self.wait_task(node, &upid).await
+        }
+        .await;
+        let outcome = if gone.is_ok() { "rolled back" } else { "rollback failed" };
+        audit::record("instance.create", "core", id, outcome, Some(&vmid.to_string()));
+        if let Err(e) = gone {
+            eprintln!("instance {id}: could not remove clone {vmid} after a failed create: {e}");
+        }
     }
 
     pub async fn delete_instance(
