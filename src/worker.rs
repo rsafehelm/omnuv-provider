@@ -280,15 +280,36 @@ impl Client {
             #[serde(default)]
             status: Option<String>,
         }
+        let tagged = |tags: Option<&str>| {
+            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))
+        };
         let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
-        Ok(vms
-            .into_iter()
-            .find(|v| {
-                v.tags.as_deref().is_some_and(|t| {
-                    t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag)
-                })
-            })
-            .map(|v| (v.node, VmRef { vmid: v.vmid, tags: v.tags, status: v.status })))
+        if let Some(v) = vms.into_iter().find(|v| tagged(v.tags.as_deref())) {
+            return Ok(Some((v.node, VmRef { vmid: v.vmid, tags: v.tags, status: v.status })));
+        }
+
+        // **A miss is confirmed before anyone acts on it (PROVIDER-5).** That
+        // aggregate is cached, and a miss is the dangerous answer: on create it
+        // means "clone another", on delete it means "gone — free the card".
+        // Whether its tags can lag a moment behind a clone depends on how
+        // fresh Proxmox keeps them, which nobody here has measured; so the
+        // absence is asked of every online node's live listing, the same way
+        // `reap_unused_segments` asks. A node that cannot be read means the
+        // absence cannot be concluded, never that nothing is there. An offline
+        // node's guests are still in the aggregate, and nothing is created on
+        // an offline node, so its freshness is not the question.
+        let nodes: Vec<serde_json::Value> = self.get_json("/nodes").await?;
+        for n in nodes.iter().filter(|n| n["status"].as_str() == Some("online")) {
+            let Some(node) = n["node"].as_str() else { continue };
+            let live: Vec<VmRef> = self.get_json(&format!("/nodes/{node}/qemu")).await.map_err(|e| {
+                anyhow::anyhow!("{node} could not be listed, so this machine's absence cannot be concluded: {e}")
+            })?;
+            if let Some(v) = live.into_iter().find(|v| tagged(v.tags.as_deref())) {
+                eprintln!("  the cluster listing missed VM {} on {node}; found live", v.vmid);
+                return Ok(Some((node.to_string(), v)));
+            }
+        }
+        Ok(None)
     }
 
     /// Machines this agent built under the project's old name.
@@ -1119,6 +1140,8 @@ mod a_worker_is_claimed_before_it_can_fail {
             match (method, path) {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                // A node that holds nothing yet, as the live check asks it (PROVIDER-5).
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("321")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
                 ("POST", "/nodes/n1/qemu/321/config") => (200, serde_json::Value::Null),

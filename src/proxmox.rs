@@ -1435,6 +1435,46 @@ mod home_node_tests {
         assert!(dark.client().home_node(None).await.is_err(), "no node online became an empty name");
     }
 
+    /// **PROVIDER-5: a miss in the cached listing is confirmed live.** The
+    /// cluster aggregate does not list a machine that one node holds; it is
+    /// found there rather than taken as absent — which would mean a second
+    /// clone, or a card freed under a running VM. A node that cannot be read
+    /// makes absence unknowable, which is an error, never `None`.
+    #[tokio::test]
+    async fn a_machine_the_cluster_listing_missed_is_found_live_or_not_concluded() {
+        let key = "onv-0a0b0c0d0e0f";
+        let mock = crate::pvemock::Mock::start(move |_, path, _| match path {
+            "/cluster/resources?type=vm" => (200, serde_json::json!([])),
+            "/nodes" => (200, serde_json::json!([
+                {"node": "pve-a", "status": "online"},
+                {"node": "pve-b", "status": "online"},
+                {"node": "pve-c", "status": "offline"},
+            ])),
+            "/nodes/pve-a/qemu" => (200, serde_json::json!([])),
+            "/nodes/pve-b/qemu" => (200, serde_json::json!([
+                {"vmid": 812, "status": "running", "tags": format!("onv-instance;{key}")}
+            ])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let (node, vm) = mock.client().find_tagged_vm_anywhere("onv-instance", key).await
+            .expect("the lookup")
+            .expect("a machine the aggregate missed was taken as absent");
+        assert_eq!((node.as_str(), vm.vmid), ("pve-b", 812));
+        assert!(!mock.called("GET", "/nodes/pve-c/qemu"), "an offline node was asked");
+
+        let blind = crate::pvemock::Mock::start(|_, path, _| match path {
+            "/cluster/resources?type=vm" => (200, serde_json::json!([])),
+            "/nodes" => (200, serde_json::json!([{"node": "pve-a", "status": "online"}])),
+            _ => (500, serde_json::Value::Null),
+        })
+        .await;
+        assert!(
+            blind.client().find_tagged_vm_anywhere("onv-instance", key).await.is_err(),
+            "a node that could not be read was taken as holding nothing"
+        );
+    }
+
     /// And the console, which asked the configured node alone: a machine on
     /// another host is found where it is, and asked about by a real path.
     #[tokio::test]

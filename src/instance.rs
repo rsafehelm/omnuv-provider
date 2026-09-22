@@ -1529,6 +1529,8 @@ mod tests {
             match (method, path) {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                // A node that holds nothing yet, as the live check asks it (PROVIDER-5).
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
                 ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
@@ -1701,6 +1703,8 @@ mod tests {
             match (method, path) {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                // A node that holds nothing yet, as the live check asks it (PROVIDER-5).
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
                 ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
@@ -1747,6 +1751,8 @@ mod tests {
                 }
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                // A node that holds nothing yet, as the live check asks it (PROVIDER-5).
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
                 ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
