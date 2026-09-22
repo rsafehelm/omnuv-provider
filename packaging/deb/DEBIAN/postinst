@@ -31,6 +31,12 @@ case "$1" in
         mkdir -p "$d"
         chown onv:onv "$d"
     done
+    # An audit log left root-owned by an earlier `join` (which opened it as
+    # root) cannot be appended to by the agent; hand it over on upgrade.
+    if [ -f /var/log/onv/audit.log ]; then
+        chown onv:onv /var/log/onv/audit.log
+        chmod 0640 /var/log/onv/audit.log
+    fi
 
     # Enabled, but not started: there is nothing to start until `join` has
     # written a configuration, and a service that restart-loops on a fresh

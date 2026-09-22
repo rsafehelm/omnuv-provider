@@ -311,6 +311,12 @@ proxmox:
         std::fs::write("/etc/onv/agent.yaml", &config)?;
         sh("chgrp onv /etc/onv/agent.yaml && chmod 0640 /etc/onv/agent.yaml")?;
         sh("install -d -o onv -g onv /var/lib/onv/snippets /var/log/onv")?;
+        // **And the audit log inside it.** `main` opened it before this ran,
+        // as root, so it was root:root 0644 and the agent (`User=onv`) could
+        // never append to it: every event went to the journal only, with a
+        // warning nobody reads, on every host joined by hand.
+        sh("touch /var/log/onv/audit.log && chown onv:onv /var/log/onv/audit.log \
+            && chmod 0640 /var/log/onv/audit.log")?;
         // `snippets,import`: the first is how generated cloud-init reaches a
         // machine, the second is where a mirrored image artefact lands before
         // Proxmox imports it. The agent's token may not name an arbitrary path,
