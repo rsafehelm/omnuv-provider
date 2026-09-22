@@ -698,6 +698,35 @@ fn short_tag(worker_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The worker is deleted where it is.** It runs on n2; the agent is on
+    /// n1. The old delete looked only on n1, found nothing, returned Ok and
+    /// left the worker running on its card.
+    #[tokio::test]
+    async fn a_worker_on_another_node_is_stopped_and_deleted_there() {
+        use crate::pvemock::{task_ok, Mock};
+        let id = "2f8a1c0d-dead-beef-0000-000000000000";
+        let tags = format!("{};{}", super::TAG, crate::names::short_tag(id));
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n2", "vmid": 321, "tags": tags, "status": "running"}])),
+                ("POST", "/nodes/n2/qemu/321/status/stop") => (200, serde_json::json!("UPID:n2:stop")),
+                ("DELETE", "/nodes/n2/qemu/321") => (200, serde_json::json!("UPID:n2:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("onv-wdel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        mock.client().delete_inference_worker(id, dir.to_str().unwrap()).await.expect("delete");
+        assert!(mock.called("POST", "/nodes/n2/qemu/321/status/stop"), "the running worker was not stopped");
+        assert!(mock.called("DELETE", "/nodes/n2/qemu/321"), "the worker on another node was not deleted");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::*;
 
     #[test]
