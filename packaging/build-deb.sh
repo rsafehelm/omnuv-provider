@@ -30,7 +30,16 @@ CRATE="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 # `git describe --dirty` appends `-dirty` when the tree is not clean — so a
 # package built from uncommitted work is distinguishable too, rather than
 # silently identical to the commit it came from.
-BUILD="$(cd "$ROOT" && git describe --always --dirty --abbrev=7 2>/dev/null || echo unknown)"
+BUILD="$(cd "$ROOT" && git describe --always --abbrev=7 2>/dev/null || echo unknown)"
+# **Two dirty builds of one commit are two versions.** `--dirty` gave both the
+# same `+g<sha>-dirty`, so the second was never installed (apt decides by
+# version), and Debian reads that `-` as a revision separator. A dirty tree now
+# carries a digest of its uncommitted changes, tracked and untracked, so each
+# distinct working tree has its own version.
+if [ -n "$(cd "$ROOT" && git status --porcelain 2>/dev/null)" ]; then
+    DIRTY="$(cd "$ROOT" && { git diff HEAD; git ls-files --others --exclude-standard -z | xargs -0 -r sha256sum; } | sha256sum | cut -c1-8)"
+    BUILD="${BUILD}.dirty.${DIRTY}"
+fi
 VERSION="${CRATE}+g${BUILD}"
 if [ -n "${1:-}" ] && [ "$1" != "$CRATE" ] && [ "$1" != "$VERSION" ]; then
     echo "Cargo.toml says $CRATE (package $VERSION), not $1." >&2
