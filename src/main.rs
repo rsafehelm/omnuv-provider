@@ -15,6 +15,7 @@ mod tunnel;
 mod console;
 mod worker;
 mod neighbours;
+mod pending;
 mod workload;
 #[cfg(test)]
 mod pvemock;

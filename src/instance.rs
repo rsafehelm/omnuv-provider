@@ -940,6 +940,8 @@ impl Client {
         // address there needs to be unique on one wire, and the hypervisor's
         // own id is what guarantees that. A read, so taking it earlier costs
         // nothing.
+        // Settle what an earlier create left unrecorded before starting another.
+        self.recover_pending(snippet_dir).await;
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
 
         let user_data = match spec.image.first_boot {
@@ -963,6 +965,12 @@ impl Client {
 
         audit::record("instance.create", "core", &spec.id, "starting", Some(&vmid.to_string()));
 
+        // **Written down before it is asked for (PROVIDER-1).** See pending.rs.
+        let journal = crate::pending::dir(snippet_dir);
+        let mut pending =
+            crate::pending::PendingClone { vmid, id: spec.id.clone(), node: node.to_string(), upid: None };
+        crate::pending::write(&journal, &pending)?;
+
         let upid: String = self
             .post_form(
                 &format!("/nodes/{node}/qemu/{template_vmid}/clone"),
@@ -977,7 +985,23 @@ impl Client {
                 ],
             )
             .await?;
-        self.wait_task(node, &upid).await?;
+        pending.upid = Some(upid.clone());
+        crate::pending::write(&journal, &pending)?;
+        // A full clone of a large template can outlast ten minutes, and one
+        // unanswered status read is not an ending. Only Proxmox's own answer
+        // decides: a failed clone is rolled back now; one whose end could not
+        // be seen stays recorded, and a later create settles it.
+        match self.task_end(node, &upid, 1800).await {
+            crate::proxmox::TaskEnd::Ended(Ok(())) => {}
+            crate::proxmox::TaskEnd::Ended(Err(exit)) => {
+                self.abandon_clone(node, vmid, &spec.id).await;
+                crate::pending::remove(&journal, vmid);
+                anyhow::bail!("proxmox task failed: {exit}");
+            }
+            crate::proxmox::TaskEnd::Unknown(why) => {
+                anyhow::bail!("the clone of {vmid} has not been seen to finish ({why}); it stays recorded, and the next create settles it");
+            }
+        }
 
         // **Ours from the moment it exists.** Proxmox's clone takes no tags, so
         // the machine was untagged until the full config call below, and
@@ -1058,8 +1082,10 @@ impl Client {
         .await;
         if let Err(e) = finished {
             self.abandon_clone(node, vmid, &spec.id).await;
+            crate::pending::remove(&journal, vmid);
             return Err(e);
         }
+        crate::pending::remove(&journal, vmid);
         audit::record("instance.create", "core", &spec.id, "ok", Some(&vmid.to_string()));
 
         Ok(InstanceStatus {
@@ -1195,6 +1221,85 @@ impl Client {
     /// only because this very call created it a moment ago: nothing else can
     /// be at that id. A failure here is recorded and left; if the tag went on,
     /// the next pass finds the machine by it and does not clone again.
+    /// **Settle the clones a create never saw finish (PROVIDER-1).** Each
+    /// record is a VMID this agent asked Proxmox to clone into for one
+    /// machine, and whose ending it did not see.
+    ///
+    /// ```text
+    /// the clone is still running          kept, and asked again next time
+    /// no machine at that VMID             the record goes: nothing was made
+    /// ours by its claim, or untagged with   claimed, then removed, then the
+    /// its clone task finished OK           record goes: the create never
+    ///                                     finished, and the next one clones
+    ///                                     afresh
+    /// anything else                        left alone and said: this agent
+    ///                                     cannot prove it made it
+    /// ```
+    ///
+    /// The claim goes on before the removal, so what is removed is a
+    /// claim-tagged machine, as every other removal here is.
+    pub(crate) async fn recover_pending(&self, snippet_dir: &str) {
+        let journal = crate::pending::dir(snippet_dir);
+        for entry in crate::pending::list(&journal) {
+            // Proxmox's record of the clone, when there is one: the only proof
+            // that a machine at this VMID is the one this agent made.
+            let cloned = match &entry.upid {
+                Some(upid) => match self.task_end(&entry.node, upid, 1).await {
+                    crate::proxmox::TaskEnd::Ended(Ok(())) => true,
+                    crate::proxmox::TaskEnd::Ended(Err(_)) => false,
+                    crate::proxmox::TaskEnd::Unknown(_) => continue,
+                },
+                None => false,
+            };
+            #[derive(serde::Deserialize)]
+            struct ClusterVm {
+                vmid: u32,
+                #[serde(default)]
+                tags: Option<String>,
+            }
+            let vms: Vec<ClusterVm> = match self.get_json("/cluster/resources?type=vm").await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("pending clone {}: cannot list machines, kept: {e}", entry.vmid);
+                    continue;
+                }
+            };
+            let Some(vm) = vms.into_iter().find(|v| v.vmid == entry.vmid) else {
+                crate::pending::remove(&journal, entry.vmid);
+                continue;
+            };
+            let tags = vm.tags.unwrap_or_default();
+            let ours = tags.split(';').any(|t| t == TAG) && tags.split(';').any(|t| t == short_tag(&entry.id));
+            // **Never an unclaimed machine this agent cannot prove it made.**
+            // Without a finished clone task, a machine at this VMID may be
+            // anybody's: the request may never have arrived, and the VMID been
+            // given to something else since. It is named, for the operator,
+            // and left.
+            if !ours && !(cloned && tags.trim().is_empty()) {
+                eprintln!(
+                    "pending clone {}: a machine is there (tags: {tags:?}) that this agent cannot prove it made; left for the operator",
+                    entry.vmid
+                );
+                audit::record("instance.create", "core", &entry.id, "unproven clone left", Some(&entry.vmid.to_string()));
+                crate::pending::remove(&journal, entry.vmid);
+                continue;
+            }
+            if !ours
+                && let Err(e) = self
+                    .post_form::<serde_json::Value>(
+                        &format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid),
+                        &[("tags".to_string(), crate::names::tags(TAG, &entry.id, self.environment.as_deref()))],
+                    )
+                    .await
+            {
+                eprintln!("pending clone {}: could not claim it, kept: {e}", entry.vmid);
+                continue;
+            }
+            self.abandon_clone(&entry.node, entry.vmid, &entry.id).await;
+            crate::pending::remove(&journal, entry.vmid);
+        }
+    }
+
     async fn abandon_clone(&self, node: &str, vmid: u32, id: &str) {
         let _ = self
             .post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/status/stop"), NO_FORM)
@@ -1326,7 +1431,8 @@ mod tests {
         let desired: serde_json::Value =
             serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
         let spec: InstanceSpec = serde_json::from_value(desired["instances"][0].clone()).unwrap();
-        let dir = std::env::temp_dir().join(format!("onv-create-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("onv-create-{}", std::process::id()));
+        let dir = root.join("snippets");
         std::fs::create_dir_all(&dir).unwrap();
 
         let result = mock.client().ensure_instance("n1", 9000, "local", dir.to_str().unwrap(), &spec).await;
@@ -1335,7 +1441,137 @@ mod tests {
         let calls = mock.calls.lock().unwrap();
         let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/123/config").expect("configured");
         assert!(calls[first_config].body.starts_with("tags="), "the first write after the clone was not the tag");
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty(), "a rolled-back clone stayed recorded");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn spec() -> InstanceSpec {
+        let desired: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        serde_json::from_value(desired["instances"][0].clone()).unwrap()
+    }
+
+    fn snippets(name: &str) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("onv-{name}-{}", std::process::id()));
+        let dir = root.join("snippets");
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir.to_string_lossy().into_owned())
+    }
+
+    /// PROVIDER-1: a status read that fails a few times is not an ending. The
+    /// clone finished; the create goes on, and nothing is left recorded.
+    #[tokio::test]
+    async fn a_few_failed_status_reads_do_not_end_a_clone() {
+        use crate::pvemock::{task_ok, Mock};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let misses = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = misses.clone();
+        let mock = Mock::start(move |method, path, _| {
+            if path.contains("UPID%3An1%3Aclone") && seen.fetch_add(1, Ordering::SeqCst) < 3 {
+                return (500, serde_json::Value::Null);
+            }
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
+                // Fails later, on purpose, so the test ends at the rollback it
+                // already proves: what matters is that the clone was not ended.
+                ("PUT", "/nodes/n1/qemu/123/resize") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/123") => (200, serde_json::json!("UPID:n1:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("transient");
+        let _ = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
+        assert!(misses.load(Ordering::SeqCst) > 3, "the clone's status was not asked again");
+        let calls = mock.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.path == "/nodes/n1/qemu/123/config" && c.body.starts_with("tags=")),
+            "three failed reads ended the create before the claim went on"
+        );
+        drop(calls);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// PROVIDER-1: a clone whose end could not be seen stays recorded, and is
+    /// neither tagged nor removed then. The next create finds it finished,
+    /// claims it, and removes it before cloning afresh.
+    #[tokio::test]
+    async fn a_clone_never_seen_to_finish_is_claimed_and_removed_by_the_next_create() {
+        use crate::pvemock::{task_ok, Mock};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let answering = std::sync::Arc::new(AtomicBool::new(false));
+        let now = answering.clone();
+        let mock = Mock::start(move |method, path, _| {
+            if path.contains("UPID%3An1%3Aclone") && !now.load(Ordering::SeqCst) {
+                return (500, serde_json::Value::Null);
+            }
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") if now.load(Ordering::SeqCst) => {
+                    (200, serde_json::json!([{"node": "n1", "vmid": 123, "status": "stopped"}]))
+                }
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/123") => (200, serde_json::json!("UPID:n1:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("unseen");
+        let journal = crate::pending::dir(&dir);
+        let first = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
+        assert!(first.is_err());
+        assert!(!mock.called("DELETE", "/nodes/n1/qemu/123"), "a clone of unknown state was removed");
+        assert_eq!(crate::pending::list(&journal).len(), 1, "the clone was not left recorded");
+        assert_eq!(crate::pending::list(&journal)[0].upid.as_deref(), Some("UPID:n1:clone"));
+
+        answering.store(true, Ordering::SeqCst);
+        mock.client().recover_pending(&dir).await;
+        let calls = mock.calls.lock().unwrap();
+        let tag = calls.iter().position(|c| c.path == "/nodes/n1/qemu/123/config" && c.body.starts_with("tags="));
+        let delete = calls.iter().position(|c| c.method == "DELETE" && c.path == "/nodes/n1/qemu/123");
+        assert!(matches!((tag, delete), (Some(t), Some(d)) if t < d), "not claimed before it was removed: {tag:?} {delete:?}");
+        drop(calls);
+        assert!(crate::pending::list(&journal).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// And never an unclaimed machine it cannot prove it made: a record with
+    /// no clone task is a request that may never have arrived, and the VMID
+    /// may be somebody else's machine now.
+    #[tokio::test]
+    async fn an_unproven_machine_at_a_recorded_vmid_is_left_alone() {
+        use crate::pvemock::Mock;
+        let mock = Mock::start(|method, path, _| match (method, path) {
+            ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([{"node": "n1", "vmid": 555}])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let (root, dir) = snippets("unproven");
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None })
+            .unwrap();
+        mock.client().recover_pending(&dir).await;
+        let calls = mock.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.path.starts_with("/nodes/n1/qemu/555")), "an unproven machine was touched: {calls:?}");
+        drop(calls);
+        assert!(crate::pending::list(&journal).is_empty(), "the record was kept, to be reported again forever");
+        std::fs::remove_dir_all(&root).unwrap();
     }
     /// The rename guard has to recognise **every** generation, and getting it
     /// wrong either blocks a healthy host forever or lets the duplicate-machine

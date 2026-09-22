@@ -509,6 +509,41 @@ impl Client {
     /// Proxmox operations are asynchronous tasks. Treating them as fire-and-
     /// forget is exactly what the reconciliation rule forbids, so every
     /// mutation is waited on and its exit status checked.
+    /// How a task ended, told apart from not knowing (PROVIDER-1). `wait_task`
+    /// turns one failed status read into an error indistinguishable from a
+    /// failed task, which is right for a step that can simply be retried and
+    /// wrong for a clone, where "failed" means nothing exists and "could not
+    /// ask" means something may. Transient reads are tolerated here; only
+    /// `Ended` is an answer.
+    pub(crate) async fn task_end(&self, node: &str, upid: &str, polls: u32) -> TaskEnd {
+        let encoded = urlencode(upid);
+        let mut misses = 0;
+        let mut last = String::new();
+        for n in 0..polls {
+            match self.get::<serde_json::Value>(&format!("/nodes/{node}/tasks/{encoded}/status")).await {
+                Ok(v) => {
+                    misses = 0;
+                    if v.get("status").and_then(|s| s.as_str()) == Some("stopped") {
+                        let exit = v.get("exitstatus").and_then(|s| s.as_str()).unwrap_or("unknown");
+                        return TaskEnd::Ended(if exit == "OK" { Ok(()) } else { Err(exit.to_string()) });
+                    }
+                    last = "still running".into();
+                }
+                Err(e) => {
+                    misses += 1;
+                    last = e.to_string();
+                    if misses >= 10 {
+                        break;
+                    }
+                }
+            }
+            if n + 1 < polls {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        TaskEnd::Unknown(format!("proxmox task {upid}: {last}"))
+    }
+
     pub(crate) async fn wait_task(&self, node: &str, upid: &str) -> anyhow::Result<()> {
         let encoded = urlencode(upid);
         for _ in 0..600 {
@@ -1329,4 +1364,13 @@ mod allocation_is_queued_and_serialized {
         assert!(Arc::ptr_eq(&gate, &copy), "the gate was duplicated rather than shared");
         assert_eq!(Arc::strong_count(&gate), 2);
     }
+}
+
+/// See `task_end`.
+#[derive(Debug)]
+pub(crate) enum TaskEnd {
+    /// Proxmox says the task stopped: `Ok` or its exit status.
+    Ended(Result<(), String>),
+    /// Still running, or its status could not be read.
+    Unknown(String),
 }
