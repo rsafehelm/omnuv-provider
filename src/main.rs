@@ -16,6 +16,7 @@ mod console;
 mod worker;
 mod neighbours;
 mod pending;
+mod reboots;
 mod survey;
 mod workload;
 #[cfg(test)]

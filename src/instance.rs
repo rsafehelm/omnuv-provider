@@ -685,6 +685,7 @@ impl Client {
             // The previous code read `/nodes/{node}/qemu`, which is live, and
             // the cluster-wide lookup lost that without replacing it. One extra
             // read per machine per pass buys a status that is true.
+            let mut uptime: Option<u64> = None;
             let vm = match self
                 .get_json::<serde_json::Value>(&format!(
                     "/nodes/{node}/qemu/{}/status/current",
@@ -692,10 +693,13 @@ impl Client {
                 ))
                 .await
             {
-                Ok(live) => crate::worker::VmRef {
-                    status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
-                    ..vm
-                },
+                Ok(live) => {
+                    uptime = live.get("uptime").and_then(|u| u.as_u64());
+                    crate::worker::VmRef {
+                        status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
+                        ..vm
+                    }
+                }
                 // A node that will not answer about one machine is a separate
                 // problem; the converge below will fail in its own words rather
                 // than acting on a guess.
@@ -765,17 +769,48 @@ impl Client {
                 eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
             }
 
-            // One-shot: performed here and echoed back so Core can clear it.
+            // **Once per token (PROVIDER-4).** Performed here and echoed back so
+            // Core can clear it — and journalled before it is asked for, so a
+            // lost report or a failed wait is never a second reboot. See
+            // `reboots` for the two states and why an unseen outcome is settled
+            // by the guest's uptime rather than by asking again.
+            let journal = crate::reboots::dir(snippet_dir);
             let mut rebooted_token = None;
-            if running && spec.intent == Lifecycle::Running
-                && let Some(token) = &spec.reboot_token {
-                    let upid: String = self
-                        .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
-                        .await?;
-                    self.wait_task(node, &upid).await?;
-                    audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
-                    rebooted_token = Some(token.clone());
+            match &spec.reboot_token {
+                // Core has stopped asking, so it has what it needed.
+                None => crate::reboots::remove(&journal, &spec.id),
+                Some(token) if running && spec.intent == Lifecycle::Running => {
+                    match crate::reboots::read(&journal, &spec.id).filter(|r| &r.token == token) {
+                        Some(r) if r.done => rebooted_token = Some(token.clone()),
+                        Some(r) => {
+                            if crate::reboots::happened(&r, uptime, crate::reboots::now()) {
+                                crate::reboots::write(&journal, &spec.id, &crate::reboots::Reboot { done: true, ..r })?;
+                                audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                                rebooted_token = Some(token.clone());
+                            } else {
+                                eprintln!(
+                                    "instance {}: reboot {token} was asked for and not seen to happen; not asking again",
+                                    spec.id
+                                );
+                            }
+                        }
+                        None => {
+                            // No record, no reboot: a request this agent could
+                            // not write down is one it could perform twice.
+                            let asked = crate::reboots::Reboot { token: token.clone(), asked_at: crate::reboots::now(), done: false };
+                            crate::reboots::write(&journal, &spec.id, &asked)?;
+                            let upid: String = self
+                                .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
+                                .await?;
+                            self.wait_task(node, &upid).await?;
+                            crate::reboots::write(&journal, &spec.id, &crate::reboots::Reboot { done: true, ..asked })?;
+                            audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                            rebooted_token = Some(token.clone());
+                        }
+                    }
                 }
+                Some(_) => {}
+            }
 
             // The guest agent answering (any IPv4) is the liveness signal. But
             // the buyer-visible address is the *marketplace* one Core assigned,
@@ -1475,6 +1510,78 @@ mod tests {
         let dir = root.join("snippets");
         std::fs::create_dir_all(&dir).unwrap();
         (root, dir.to_string_lossy().into_owned())
+    }
+
+    /// **PROVIDER-4: one reboot per token.** A running machine with a token
+    /// is rebooted and the token echoed; the next pass, with Core still sending
+    /// the same token because the echo never arrived, echoes it again and does
+    /// **not** reboot. Then the ambiguous case: the reboot was asked for and
+    /// its wait failed. The next pass does not ask again. It echoes only once
+    /// the guest's uptime shows the reboot happened.
+    #[tokio::test]
+    async fn a_reboot_is_performed_once_per_token_however_often_it_is_asked_for() {
+        use crate::pvemock::{task_ok, Mock};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        sp.reboot_token = Some("t-1".into());
+        let key = short_tag(&sp.id);
+        let uptime = Arc::new(AtomicU64::new(86_400));
+        let fail_task = Arc::new(AtomicBool::new(false));
+        let (up, fail) = (uptime.clone(), fail_task.clone());
+        let mock = Mock::start(move |method, path, _| {
+            if path.contains("/tasks/") && path.ends_with("/status") && fail.load(Ordering::SeqCst) {
+                return (200, serde_json::json!({"status": "stopped", "exitstatus": "reboot failed"}));
+            }
+            if let Some(ok) = task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 700, "status": "running", "tags": format!("{TAG};{key}")}
+                ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") => {
+                    (200, serde_json::json!({"status": "running", "uptime": up.load(Ordering::SeqCst)}))
+                }
+                ("POST", "/nodes/n1/qemu/700/status/reboot") => (200, serde_json::json!("UPID:n1:0001:reboot")),
+                ("GET", _) => (200, serde_json::json!({})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let reboots = |m: &Mock| m.calls.lock().unwrap().iter().filter(|c| c.method == "POST" && c.path.ends_with("/status/reboot")).count();
+
+        // Asked, performed, echoed.
+        let (root, dir) = snippets("reboot-once");
+        let first = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("the first pass");
+        assert_eq!(first.rebooted_token.as_deref(), Some("t-1"));
+        assert_eq!(reboots(&mock), 1);
+        // The echo was lost; Core sends the same token again.
+        let again = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("the second pass");
+        assert_eq!(again.rebooted_token.as_deref(), Some("t-1"), "a reboot that happened stopped being reported");
+        assert_eq!(reboots(&mock), 1, "the buyer's machine was rebooted twice for one request");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Asked, and its wait failed: outcome unseen.
+        let (root, dir) = snippets("reboot-unseen");
+        let mut sp2 = sp.clone();
+        sp2.reboot_token = Some("t-2".into());
+        fail_task.store(true, Ordering::SeqCst);
+        assert!(mock.client().ensure_instance("n1", 9000, "local", &dir, &sp2).await.is_err());
+        fail_task.store(false, Ordering::SeqCst);
+        assert_eq!(reboots(&mock), 2);
+        // Up for a day: not seen to have happened. Neither echoed nor asked again.
+        let unseen = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp2).await.expect("a pass");
+        assert_eq!(unseen.rebooted_token, None, "a reboot nobody saw happen was reported as done");
+        assert_eq!(reboots(&mock), 2, "an unseen reboot was asked for again");
+        // Up for a second, less than has passed since the request: it happened.
+        uptime.store(1, Ordering::SeqCst);
+        let seen = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp2).await.expect("a pass");
+        assert_eq!(seen.rebooted_token.as_deref(), Some("t-2"));
+        assert_eq!(reboots(&mock), 2);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// PROVIDER-1: a status read that fails a few times is not an ending. The
