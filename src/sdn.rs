@@ -32,6 +32,22 @@ pub(crate) fn vnet_for(network_id: &str) -> String {
     crate::names::vnet(network_id)
 }
 
+/// The bridges a VM's configuration attaches to, from its `net<N>` keys.
+fn bridges_of(cfg: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(obj) = cfg.as_object() {
+        for (k, v) in obj {
+            if k.starts_with("net")
+                && let Some(s) = v.as_str()
+                && let Some(b) = s.split(',').find_map(|kv| kv.strip_prefix("bridge="))
+            {
+                out.push(b.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// What to do about a network's segment, given the vnet of that name as the
 /// cluster reports it (or none).
 ///
@@ -141,29 +157,32 @@ impl Client {
             return Ok(0);
         }
 
-        // Every bridge any VM on this node references, running or stopped.
-        let vms: Vec<serde_json::Value> = self.get_json(&format!("/nodes/{node}/qemu")).await?;
+        // **Every bridge any VM in the cluster references, running or
+        // stopped.** A vnet is cluster-wide, and this asked only the node the
+        // agent runs on, so on a cluster a segment whose machines all ran on
+        // another node looked unused and was removed from under them. Each
+        // node is asked live, not through `/cluster/resources`, whose cached
+        // view can miss a machine created a moment ago. A node or a VM that
+        // cannot be read stops the reap: unreadable is not unused.
+        let nodes: Vec<serde_json::Value> = self.get_json("/nodes").await?;
         let mut used: std::collections::BTreeSet<String> = Default::default();
-        for vm in &vms {
-            let Some(vmid) = vm["vmid"].as_u64() else { continue };
-            let Ok(cfg) = self
-                .get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"))
-                .await
-            else {
-                // Unreadable is not unused. Skipping the whole reap is the
-                // safe direction: a bridge left behind costs nothing, and one
-                // removed from under a machine costs that machine.
+        for n in &nodes {
+            let Some(name) = n["node"].as_str() else { return Ok(0) };
+            if n["status"].as_str() != Some("online") {
+                return Ok(0);
+            }
+            let Ok(vms) = self.get_json::<Vec<serde_json::Value>>(&format!("/nodes/{name}/qemu")).await else {
                 return Ok(0);
             };
-            if let Some(obj) = cfg.as_object() {
-                for (k, v) in obj {
-                    if k.starts_with("net")
-                        && let Some(s) = v.as_str()
-                        && let Some(b) = s.split(',').find_map(|kv| kv.strip_prefix("bridge="))
-                    {
-                        used.insert(b.to_string());
-                    }
-                }
+            for vm in &vms {
+                let Some(vmid) = vm["vmid"].as_u64() else { continue };
+                let Ok(cfg) = self
+                    .get_json::<serde_json::Value>(&format!("/nodes/{name}/qemu/{vmid}/config"))
+                    .await
+                else {
+                    return Ok(0);
+                };
+                used.extend(bridges_of(&cfg));
             }
         }
 
@@ -211,6 +230,19 @@ impl Client {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_vms_bridges_are_read_from_every_nic() {
+        let cfg = json!({
+            "net0": "virtio=BC:24:11:00:00:01,bridge=onvnat0",
+            "net1": "virtio=BC:24:11:00:00:02,bridge=onvc4d90,firewall=1",
+            "name": "onv-m", "netmask": "not a nic, no bridge",
+        });
+        let mut b = super::bridges_of(&cfg);
+        b.sort();
+        assert_eq!(b, vec!["onvc4d90", "onvnat0"]);
+        assert!(super::bridges_of(&json!({"name": "no nics"})).is_empty());
+    }
 
     #[test]
     fn a_segment_named_like_ours_is_joined_only_when_it_is_ours() {
