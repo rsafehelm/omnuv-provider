@@ -59,6 +59,18 @@ fn description(id: &str, sha256: &str) -> String {
     )
 }
 
+/// Whether a VM's configuration is a template the marketplace built, mirrored
+/// or by `build-template.yml`, in either generation of wording ("Omnuv" or
+/// "Onv" marketplace base image). Loose on the wording for the reason
+/// `destroy-templates.yml` gives; strict on being a template at all.
+pub fn is_marketplace_template(cfg: &serde_json::Value) -> bool {
+    cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1)
+        && cfg
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| d.contains("marketplace base image"))
+}
+
 /// The digest a template says it was imported from, if it says.
 ///
 /// A template without the marker was built locally by `build-template.yml`
@@ -280,6 +292,15 @@ pub async fn import(
             cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1),
             "vmid {vmid} on {node} is a machine, not a template — refusing to import over it"
         );
+        // **A template, and ours.** Being a template was the only check, so an
+        // operator's own template at a vmid the configuration names would have
+        // been destroyed. Ours say so in their description, in the words the
+        // mirror and `build-template.yml` both write, the same test
+        // `destroy-templates.yml` applies before it destroys one.
+        anyhow::ensure!(
+            is_marketplace_template(&cfg),
+            "vmid {vmid} on {node} is a template the marketplace did not build — refusing to import over it"
+        );
         let upid: String = px.delete_task(&format!("/nodes/{node}/qemu/{vmid}?purge=1")).await?;
         px.wait_task(node, &upid).await?;
     }
@@ -346,6 +367,26 @@ pub async fn import(
 
 #[cfg(test)]
 mod tests {
+    use super::is_marketplace_template;
+    use serde_json::json;
+
+    #[test]
+    fn only_a_marketplace_template_is_replaced() {
+        for ours in [
+            "Onv marketplace base image - ubuntu-26.04. Mirrored by the provider agent",
+            "Omnuv marketplace base image - Ubuntu 26.04 cloud-init. Managed by Ansible; do not edit.",
+        ] {
+            assert!(is_marketplace_template(&json!({"template": 1, "description": ours})), "{ours}");
+        }
+        // Negative: an operator's template, a template with no description, and
+        // our wording on something that is not a template.
+        assert!(!is_marketplace_template(&json!({"template": 1, "description": "my golden image"})));
+        assert!(!is_marketplace_template(&json!({"template": 1})));
+        assert!(!is_marketplace_template(
+            &json!({"template": 0, "description": "Onv marketplace base image - x"})
+        ));
+    }
+
     /// A partial for an id still being fetched survives, a partial for any
     /// other id goes with its sidecar, and a finished artefact is never a
     /// candidate whatever its id.
