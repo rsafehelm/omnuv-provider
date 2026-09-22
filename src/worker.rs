@@ -286,10 +286,6 @@ impl Client {
             .collect())
     }
 
-    async fn find_worker_vm(&self, node: &str, worker_id: &str) -> anyhow::Result<Option<VmRef>> {
-        self.find_tagged_vm(node, TAG, &short_tag(worker_id)).await
-    }
-
     /// **No `node` parameter, deliberately.** It took one and, since this path
     /// began choosing its own node under the allocation gate, ignored it — a
     /// signature that accepts a node it will not use is a lie the next caller
@@ -497,9 +493,13 @@ impl Client {
         })
     }
 
+    /// **No `node` parameter**, for the reason `ensure_inference_worker` gives:
+    /// the worker is wherever it is. This looked only on the node it was
+    /// handed and returned `Ok` when it found nothing there, so a worker on
+    /// another node of a cluster kept running, and kept its GPU, while the
+    /// agent reported it deleted and Core freed the card.
     pub async fn delete_inference_worker(
         &self,
-        node: &str,
         worker_id: &str,
         snippet_dir: &str,
     ) -> anyhow::Result<()> {
@@ -528,7 +528,10 @@ impl Client {
             }
         }
 
-        let Some(vm) = self.find_worker_vm(node, worker_id).await? else { return Ok(()) };
+        let Some((node, vm)) = self.find_tagged_vm_anywhere(TAG, &short_tag(worker_id)).await? else {
+            return Ok(());
+        };
+        let node = node.as_str();
         if vm.status.as_deref() == Some("running") {
             let upid: String =
                 self.post_form(&format!("/nodes/{node}/qemu/{}/status/stop", vm.vmid), NO_FORM).await?;

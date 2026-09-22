@@ -983,7 +983,7 @@ async fn reconcile_workers(
     for spec in &desired.inference_workers {
         let result = match spec.intent {
             Lifecycle::Absent => driver
-                .delete_inference_worker(node, &spec.id, &cfg.proxmox.snippet_dir)
+                .delete_inference_worker(&spec.id, &cfg.proxmox.snippet_dir)
                 .await
                 .map(|_| WorkerStatus {
                     id: spec.id.clone(),
