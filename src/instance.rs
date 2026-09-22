@@ -1298,6 +1298,45 @@ pub(crate) fn maintenance_may_touch(lifecycle: Lifecycle, exists: bool, running:
 
 #[cfg(test)]
 mod tests {
+
+    /// **A create that fails after the clone undoes the clone.** Through the
+    /// real client: the resize fails, so the machine this call just cloned
+    /// must be stopped and deleted by its vmid, and its tags must have gone on
+    /// before anything that could fail.
+    #[tokio::test]
+    async fn a_create_that_fails_after_the_clone_removes_the_clone() {
+        use crate::pvemock::{task_ok, Mock};
+        let mock = Mock::start(|method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/123") => (200, serde_json::json!("UPID:n1:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let desired: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        let spec: InstanceSpec = serde_json::from_value(desired["instances"][0].clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!("onv-create-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = mock.client().ensure_instance("n1", 9000, "local", dir.to_str().unwrap(), &spec).await;
+        assert!(result.is_err(), "the resize failed and the create reported success");
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/123"), "the clone was left behind");
+        let calls = mock.calls.lock().unwrap();
+        let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/123/config").expect("configured");
+        assert!(calls[first_config].body.starts_with("tags="), "the first write after the clone was not the tag");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     /// The rename guard has to recognise **every** generation, and getting it
     /// wrong either blocks a healthy host forever or lets the duplicate-machine
     /// accident through. Two now: `omnu-` and `omnuv-`.
