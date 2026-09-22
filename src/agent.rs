@@ -122,9 +122,14 @@ pub enum Refusal {
     /// maintained on instructions from a Core that no longer accepts us; the
     /// heartbeat re-handshakes, and that is where the verdict is final.
     Refused,
-    /// Core no longer speaks this agent's protocol (426), or the handshake
-    /// itself rejected the enrollment token. Nothing this process can do will
-    /// change the answer, so it stops, and says why.
+    /// Core no longer accepts the protocol version agreed at the last
+    /// handshake (426 on an ordinary call). The agent speaks a *range*, so a
+    /// new handshake may find a version both still speak — which is why this
+    /// is not final (PROVIDER-23).
+    Renegotiate,
+    /// The handshake itself refused: 426, no common version at all, or 401,
+    /// the enrollment token rejected. Nothing this process can do will change
+    /// the answer, so it stops, and says why.
     Final,
     /// Any other answer: a request Core considered wrong. Decided nothing.
     Other,
@@ -134,8 +139,8 @@ pub fn refusal(e: &anyhow::Error) -> Refusal {
     match e.downcast_ref::<CoreAnswered>() {
         None => Refusal::Unreachable,
         Some(a) => match a.status {
-            426 => Refusal::Final,
-            401 if a.path == HANDSHAKE => Refusal::Final,
+            401 | 426 if a.path == HANDSHAKE => Refusal::Final,
+            426 => Refusal::Renegotiate,
             401 | 403 => Refusal::Refused,
             429 | 500..=599 => Refusal::Unreachable,
             _ => Refusal::Other,
@@ -596,18 +601,36 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             }
             _ = nudge.notified() => {
                 if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
-                    if refusal(&e) == Refusal::Final {
-                        stop_for_good(&e);
+                    match refusal(&e) {
+                        Refusal::Final => stop_for_good(&e),
+                        Refusal::Renegotiate => {
+                            eprintln!("reconcile (pushed) failed: {e}; re-running handshake");
+                            if let Err(h) = handshake(&core, &driver).await {
+                                if refusal(&h) == Refusal::Final {
+                                    stop_for_good(&h);
+                                }
+                                eprintln!("handshake failed: {h}");
+                            }
+                        }
+                        _ => eprintln!("reconcile (pushed) failed: {e}"),
                     }
-                    eprintln!("reconcile (pushed) failed: {e}");
                 }
             }
             _ = reconcile.tick() => {
                 if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
-                    if refusal(&e) == Refusal::Final {
-                        stop_for_good(&e);
+                    match refusal(&e) {
+                        Refusal::Final => stop_for_good(&e),
+                        Refusal::Renegotiate => {
+                            eprintln!("reconcile failed: {e}; re-running handshake");
+                            if let Err(h) = handshake(&core, &driver).await {
+                                if refusal(&h) == Refusal::Final {
+                                    stop_for_good(&h);
+                                }
+                                eprintln!("handshake failed: {h}");
+                            }
+                        }
+                        _ => eprintln!("reconcile failed: {e}"),
                     }
-                    eprintln!("reconcile failed: {e}");
                 }
             }
             _ = inventory.tick() => {
@@ -633,11 +656,14 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
         loop {
             tick.tick().await;
             match core.post("/provider/v1/heartbeat", None).await {
-                Ok(r) if r.status() == reqwest::StatusCode::UPGRADE_REQUIRED => {
-                    stop_for_good(&CoreAnswered { path: "/provider/v1/heartbeat".into(), status: 426 }.into())
-                }
-                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                    eprintln!("heartbeat rejected; re-running handshake");
+                // **426 is renegotiated, not obeyed (PROVIDER-23).** Core's
+                // floor rose past the version agreed last time; a new
+                // handshake finds the highest version both still speak, and
+                // only a refusal *there* is final.
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || r.status() == reqwest::StatusCode::UPGRADE_REQUIRED =>
+                {
+                    eprintln!("heartbeat refused ({}); re-running handshake", r.status());
                     if let Err(e) = handshake(&core, &driver).await {
                         if refusal(&e) == Refusal::Final {
                             stop_for_good(&e);
@@ -737,7 +763,8 @@ mod handshake_tests {
             (429, "/provider/v1/desired-state", Refusal::Unreachable),
             (401, "/provider/v1/desired-state", Refusal::Refused),
             (403, "/provider/v1/desired-state", Refusal::Refused),
-            (426, "/provider/v1/desired-state", Refusal::Final),
+            (426, "/provider/v1/desired-state", Refusal::Renegotiate),
+            (426, HANDSHAKE, Refusal::Final),
             (404, "/provider/v1/desired-state", Refusal::Other),
             (401, HANDSHAKE, Refusal::Final),
         ] {
