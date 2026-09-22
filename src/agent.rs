@@ -543,6 +543,24 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     })
 }
 
+/// Why a pass's observation does not cover everything it was asked about:
+/// one line per kind that had items the agent could not read or act on.
+fn incompleteness(
+    unobserved_instances: usize,
+    instances: usize,
+    unobserved_workers: usize,
+    workers: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if unobserved_instances > 0 {
+        out.push(format!("{unobserved_instances} of {instances} desired instances could not be observed"));
+    }
+    if unobserved_workers > 0 {
+        out.push(format!("{unobserved_workers} of {workers} desired workers could not be observed"));
+    }
+    out
+}
+
 /// Whether this agent can act on a payload stamped with protocol `v`.
 ///
 /// **A range, the one the handshake negotiates in, not one number.** This
@@ -556,6 +574,14 @@ fn speaks(v: u32) -> bool {
 
 #[cfg(test)]
 mod handshake_tests {
+    #[test]
+    fn an_error_result_makes_the_observation_incomplete() {
+        assert!(super::incompleteness(0, 3, 0, 1).is_empty(), "every item observed");
+        let why = super::incompleteness(1, 3, 0, 1);
+        assert_eq!(why, vec!["1 of 3 desired instances could not be observed".to_string()]);
+        assert_eq!(super::incompleteness(0, 0, 2, 2).len(), 1);
+    }
+
     #[test]
     fn a_payload_in_the_negotiated_range_is_accepted() {
         use super::speaks;
@@ -980,6 +1006,7 @@ async fn reconcile_workers(
     let checks: Vec<omnuv_protocol::SelfCheck> = Vec::new();
 
     let mut statuses = Vec::new();
+    let mut unobserved_workers = 0usize;
     for spec in &desired.inference_workers {
         let result = match spec.intent {
             Lifecycle::Absent => driver
@@ -1012,6 +1039,7 @@ async fn reconcile_workers(
         // A failure on one worker must not stop the others from converging, and
         // must be visible to the operator rather than retried in silence.
         statuses.push(result.unwrap_or_else(|e| {
+            unobserved_workers += 1;
             eprintln!("worker {}: {e}", spec.id);
             WorkerStatus {
                 id: spec.id.clone(),
@@ -1109,6 +1137,7 @@ async fn reconcile_workers(
     }
     // Buyer instances converge on the same pass and by the same rules.
     let mut instances = Vec::new();
+    let mut unobserved_instances = 0usize;
     for spec in &desired.instances {
         let result = match spec.intent {
             Lifecycle::Absent => driver.delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir).await.map(|_| InstanceStatus {
@@ -1135,6 +1164,7 @@ async fn reconcile_workers(
             },
         };
         instances.push(result.unwrap_or_else(|e| {
+            unobserved_instances += 1;
             eprintln!("instance {}: {e}", spec.id);
             let why = e.to_string();
             // Why, and whether trying again could plausibly work. Without this
@@ -1204,21 +1234,17 @@ async fn reconcile_workers(
     // pass. It is false the moment one did not, because a report missing an
     // item it was supposed to cover must not let Core conclude that item is
     // gone.
-    let mut incomplete_because: Vec<String> = Vec::new();
-    if instances.len() != desired.instances.len() {
-        incomplete_because.push(format!(
-            "{} of {} desired instances produced no result",
-            desired.instances.len() - instances.len(),
-            desired.instances.len()
-        ));
-    }
-    if statuses.len() != desired.inference_workers.len() {
-        incomplete_because.push(format!(
-            "{} of {} desired workers produced no result",
-            desired.inference_workers.len() - statuses.len(),
-            desired.inference_workers.len()
-        ));
-    }
+    // **A result is not an observation.** Both loops push one result per
+    // desired item, success or error, so comparing lengths could never find a
+    // gap and `complete` was always true. What must count is the results that
+    // came from an error: the agent could not read or act, so it does not know
+    // that item's state, and its Error is a statement about itself.
+    let incomplete_because = incompleteness(
+        unobserved_instances,
+        desired.instances.len(),
+        unobserved_workers,
+        desired.inference_workers.len(),
+    );
     let observation = omnuv_protocol::Observation {
         generation: *GENERATION,
         sequence: SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
