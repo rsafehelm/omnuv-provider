@@ -42,12 +42,16 @@ STAGE="$OUT/.deb"
 
 echo "onv-provider $VERSION ($ARCH)"
 
+# `--locked`: the committed Cargo.lock is the dependency set, so two builds of
+# one commit link the same crates. It was gitignored, so every build resolved
+# afresh and a package could not be rebuilt as it was.
+#
 # A release build, statically enough linked for any current Debian or Ubuntu:
 # the agent speaks TLS through rustls rather than the system OpenSSL, so the
 # only real link is glibc.
 docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
     -e OMNUV_BUILD="$VERSION" -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
-    -w /w rust:1.98 cargo build --release --quiet
+    -w /w rust:1.98 cargo build --release --locked --quiet
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
@@ -77,7 +81,7 @@ Description: Omnuv Provider Agent
  created locally at enrolment and never leave the machine. While Core is
  unreachable it maintains what is running and decides nothing.
  .
- Enrol a machine with: onv-provider join --token <token>
+ Enrol a machine with: onv-provider join --core <https://your-core> --token <token>
 CTL
 
 docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -ec "
@@ -108,7 +112,7 @@ docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry 
     -e CARGO_TARGET_DIR=/w/target/musl -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
     -w /w rust:1.98-alpine sh -ec "
         apk add --quiet --no-cache musl-dev >/dev/null
-        cargo build --release --quiet --bin onv-workloadd
+        cargo build --release --locked --quiet --bin onv-workloadd
     "
 mkdir -p "$OUT/workloadd"
 install -m 0755 "$ROOT/target/musl/release/onv-workloadd" "$OUT/workloadd/onv-workloadd"
