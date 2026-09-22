@@ -291,6 +291,71 @@ async fn connect(
 
 /// Runs one tunnelled request against the local worker and streams the response
 /// back frame by frame, so token-by-token delivery survives the hop.
+/// Decodes a byte stream to text across chunk boundaries.
+///
+/// Each chunk was decoded alone with `from_utf8_lossy`, so a multi-byte
+/// character that arrived half in one chunk and half in the next became two
+/// replacement characters in the answer a buyer streams: an accented word or
+/// an emoji, broken at random. An incomplete sequence at the end of a chunk is
+/// held back and prefixed to the next; genuinely invalid bytes are still
+/// replaced, as before.
+#[derive(Default)]
+struct Utf8Carry {
+    pending: Vec<u8>,
+}
+
+impl Utf8Carry {
+    /// What is left when the stream ends: an incomplete character that will
+    /// never be completed, replaced rather than dropped.
+    fn finish(&mut self) -> Option<String> {
+        (!self.pending.is_empty()).then(|| String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned())
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> String {
+        self.pending.extend_from_slice(chunk);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let good = e.valid_up_to();
+                    out.push_str(std::str::from_utf8(&self.pending[..good]).unwrap_or_default());
+                    match e.error_len() {
+                        // Incomplete at the end: keep it for the next chunk.
+                        None => {
+                            self.pending.drain(..good);
+                            return out;
+                        }
+                        // Invalid, not incomplete: replace it and go on.
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..good + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The worker paths Core may ask this agent to reach.
+///
+/// **An allowlist, because the path is appended to the endpoint.** It was used
+/// as given, so a path such as `@elsewhere.example/` turned
+/// `http://127.0.0.1:8000` into a URL whose host is somebody else's, and a
+/// Core that was wrong, or not Core, could make this agent dial anything its
+/// host can reach. Core sends `/v1/chat/completions`; the other two are the
+/// OpenAI routes a worker serves beside it.
+const FORWARDABLE: &[&str] = &["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
+
+fn forwardable(path: &str) -> bool {
+    FORWARDABLE.contains(&path)
+}
+
 async fn forward(
     endpoint: &str,
     path: &str,
@@ -298,6 +363,13 @@ async fn forward(
     id: String,
     out: mpsc::Sender<TunnelFrame>,
 ) {
+    if !forwardable(path) {
+        audit::record("tunnel.forward", "core", path, "refused", Some("not a worker path this agent forwards"));
+        let _ = out
+            .send(TunnelFrame::Error { id, message: format!("{path} is not a path this agent forwards") })
+            .await;
+        return;
+    }
     let client = reqwest::Client::new();
     let res = client
         .post(format!("{endpoint}{path}"))
@@ -322,11 +394,14 @@ async fn forward(
 
     let mut bytes = 0usize;
     let mut stream = res.bytes_stream();
+    // A character split across two network chunks is carried to the next one,
+    // not decoded in halves. See `Utf8Carry`.
+    let mut carry = Utf8Carry::default();
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(b) => {
                 bytes += b.len();
-                let data = String::from_utf8_lossy(&b).to_string();
+                let data = carry.push(&b);
                 if out.send(TunnelFrame::Chunk { id: id.clone(), data }).await.is_err() {
                     return;
                 }
@@ -338,6 +413,12 @@ async fn forward(
         }
     }
 
+    if let Some(data) = carry.finish()
+        && out.send(TunnelFrame::Chunk { id: id.clone(), data }).await.is_err()
+    {
+        return;
+    }
+
     // Size and status only: buyer payloads are never written to a provider's
     // disk by this agent.
     audit::record("tunnel.forward", "core", path, "ok", Some(&format!("status={status} bytes={bytes}")));
@@ -346,6 +427,39 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
+    use super::Utf8Carry;
+
+    #[test]
+    fn a_character_split_across_chunks_arrives_whole() {
+        let text = "café 🙂 ok";
+        let bytes = text.as_bytes();
+        // Every split point, including inside the four-byte emoji.
+        for cut in 0..=bytes.len() {
+            let mut c = Utf8Carry::default();
+            let joined = c.push(&bytes[..cut]) + &c.push(&bytes[cut..]);
+            assert_eq!(joined, text, "split at byte {cut}");
+        }
+        // Invalid bytes are still replaced, not held forever.
+        let mut c = Utf8Carry::default();
+        assert_eq!(c.push(b"a\xffb"), "a\u{fffd}b");
+        // A character the stream never finished is replaced at the end.
+        let mut c = Utf8Carry::default();
+        assert_eq!(c.push(&"é".as_bytes()[..1]), "");
+        assert_eq!(c.finish().as_deref(), Some("\u{fffd}"));
+        assert_eq!(c.finish(), None);
+    }
+
+    use super::forwardable;
+
+    #[test]
+    fn only_a_worker_path_is_forwarded() {
+        assert!(forwardable("/v1/chat/completions"));
+        for bad in ["@evil.example/v1/chat/completions", "/v1/chat/completions/../../admin",
+                    "//evil.example/", "/v1/models?x=@y", "", "/metrics", "/v1/chat/completions#x"] {
+            assert!(!forwardable(bad), "{bad} would have been forwarded");
+        }
+    }
+
     use super::url_lite;
 
     #[test]
