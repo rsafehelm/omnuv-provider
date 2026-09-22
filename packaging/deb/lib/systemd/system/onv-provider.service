@@ -1,11 +1,15 @@
 [Unit]
 Description=Omnuv Provider Agent
-Documentation=https://github.com/rsafehelm/onv-provider
+Documentation=https://github.com/rsafehelm/omnuv-provider
 # pve-guests is a Proxmox unit and is simply absent elsewhere, which systemd
 # treats as satisfied. The package must install on a host that is not Proxmox,
 # because the driver layer exists so a second runtime can arrive.
 After=network-online.target pve-guests.service
 Wants=network-online.target
+# Nothing to run until `join` has written a configuration. Without this the
+# unit, enabled at install, started on every boot, failed on the missing file
+# and was restarted every 10 s for as long as nobody joined.
+ConditionPathExists=/etc/onv/agent.yaml
 
 [Service]
 Type=simple

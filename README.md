@@ -51,8 +51,8 @@ contract without the marketplace learning anything about them.
 ## Installing
 
 ```bash
-sudo apt install ./omnuv-provider_<version>_amd64.deb
-sudo omnuv-provider join --token <your enrolment token>
+sudo apt install ./onv-provider_<version>_amd64.deb
+sudo onv-provider join --core <https://your-core> --token <your enrolment token>
 ```
 
 The package installs the binary, a systemd unit and an unprivileged service

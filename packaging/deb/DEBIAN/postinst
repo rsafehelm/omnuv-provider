@@ -27,10 +27,16 @@ case "$1" in
     # it: several gigabytes, written by the agent, referenced as a volume in a
     # storage of content type `import` because the agent's hypervisor token
     # deliberately lacks the privilege to name an arbitrary path.
-    for d in /var/lib/onv /var/log/onv /var/lib/onv/snippets /var/lib/onv/import; do
+    for d in /var/lib/onv /var/lib/onv/snippets /var/lib/onv/import; do
         mkdir -p "$d"
         chown onv:onv "$d"
     done
+    # The log directory is the agent's to write and the `adm` group's to read,
+    # which is what deploy-agent.yml sets. This set onv:onv on every upgrade,
+    # undoing the play, and the play set it back on its next run.
+    mkdir -p /var/log/onv
+    chown onv:adm /var/log/onv
+    chmod 0750 /var/log/onv
     # An audit log left root-owned by an earlier `join` (which opened it as
     # root) cannot be appended to by the agent; hand it over on upgrade.
     if [ -f /var/log/onv/audit.log ]; then
@@ -39,8 +45,8 @@ case "$1" in
     fi
 
     # Enabled, but not started: there is nothing to start until `join` has
-    # written a configuration, and a service that restart-loops on a fresh
-    # install teaches an operator to ignore it.
+    # written a configuration. The unit's ConditionPathExists keeps it from
+    # starting, and restart-looping, before that.
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
         systemctl enable onv-provider.service >/dev/null 2>&1 || true
@@ -49,7 +55,7 @@ case "$1" in
         else
             echo "onv-provider installed. Enrol this machine with:"
             echo
-            echo "    sudo onv-provider join --token <your enrolment token>"
+            echo "    sudo onv-provider join --core <https://your-core> --token <your enrolment token>"
             echo
         fi
     fi
