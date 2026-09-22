@@ -26,6 +26,14 @@ pub struct PendingClone {
     /// Proxmox's task id, once the clone request was answered.
     #[serde(default)]
     pub upid: Option<String>,
+    /// The claim the machine is to carry: an instance's or a worker's. A
+    /// record from before workers were journalled is an instance's.
+    #[serde(default = "instance_claim")]
+    pub claim: String,
+}
+
+fn instance_claim() -> String {
+    crate::names::TAG_INSTANCE.to_string()
 }
 
 pub fn dir(snippet_dir: &str) -> PathBuf {
@@ -75,7 +83,7 @@ mod tests {
     #[test]
     fn an_entry_is_written_read_and_removed() {
         let dir = std::env::temp_dir().join(format!("onv-pending-{}", std::process::id()));
-        let entry = PendingClone { vmid: 9301, id: "i-1".into(), node: "n1".into(), upid: None };
+        let entry = PendingClone { vmid: 9301, id: "i-1".into(), node: "n1".into(), upid: None, claim: instance_claim() };
         write(&dir, &entry).unwrap();
         let with_task = PendingClone { upid: Some("UPID:n1:clone".into()), ..entry.clone() };
         write(&dir, &with_task).unwrap();
@@ -84,5 +92,12 @@ mod tests {
         assert!(list(&dir).is_empty());
         remove(&dir, 9301);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record written before the claim was recorded is an instance's.
+    #[test]
+    fn an_older_record_is_an_instances() {
+        let old: PendingClone = serde_json::from_str(r#"{"vmid":1,"id":"i","node":"n","upid":null}"#).unwrap();
+        assert_eq!(old.claim, crate::names::TAG_INSTANCE);
     }
 }

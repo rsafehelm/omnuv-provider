@@ -447,7 +447,21 @@ impl Client {
         };
         let node = node_owned.as_str();
 
+        // **Journalled, claimed first, and rolled back (PROVIDER-2, 22
+        // September 2026)**, as an instance's create is (PROVIDER-1). This path
+        // had none of the three: an untagged clone was leaked and cloned again
+        // on every pass, and a tagged but half-built one was started as it was.
+        self.recover_pending(snippet_dir).await;
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
+        let journal = crate::pending::dir(snippet_dir);
+        let mut pending = crate::pending::PendingClone {
+            vmid,
+            id: spec.id.clone(),
+            node: node.to_string(),
+            upid: None,
+            claim: TAG.to_string(),
+        };
+        crate::pending::write(&journal, &pending)?;
 
         let upid: String = self
             .post_form(
@@ -467,37 +481,66 @@ impl Client {
                 ],
             )
             .await?;
-        self.wait_task(node, &upid).await?;
-
-        let mut config: Vec<(String, String)> = vec![
-            ("cores".into(), spec.vcpus.to_string()),
-            ("memory".into(), spec.memory_mib.to_string()),
-            ("cpu".into(), "host".into()),
-            // q35 is required for PCIe passthrough.
-            ("machine".into(), "q35".into()),
-            ("agent".into(), "enabled=1".into()),
-            ("ipconfig0".into(), "ip=dhcp".into()),
-            ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
-            ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
-            ("description".into(), format!("Omnuv inference worker {}\nManaged by onv-provider. Do not edit.", spec.id)),
-        ];
-        // Mappings rather than raw addresses: a non-root token may only attach
-        // a device the host has explicitly published.
-        for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
-            config.push((format!("hostpci{i}"), format!("mapping={},pcie=1,rombar=0", mapping_name(pci))));
+        pending.upid = Some(upid.clone());
+        crate::pending::write(&journal, &pending)?;
+        match self.task_end(node, &upid, 1800).await {
+            crate::proxmox::TaskEnd::Ended(Ok(())) => {}
+            crate::proxmox::TaskEnd::Ended(Err(exit)) => {
+                self.abandon_clone(node, vmid, &spec.id, "worker").await;
+                crate::pending::remove(&journal, vmid);
+                anyhow::bail!("proxmox task failed: {exit}");
+            }
+            crate::proxmox::TaskEnd::Unknown(why) => {
+                anyhow::bail!("the clone of {vmid} has not been seen to finish ({why}); it stays recorded, and the next create settles it");
+            }
         }
-        self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
 
-        // The template disk is small; grow it to the allocated size.
-        self.put_form::<serde_json::Value>(
-            &format!("/nodes/{node}/qemu/{vmid}/resize"),
-            &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{}G", spec.disk_gib))],
-        )
-        .await?;
+        // The claim alone, before anything that can fail; everything after it
+        // is undone if it fails.
+        let finished: anyhow::Result<()> = async {
+            self.post_form::<serde_json::Value>(
+                &format!("/nodes/{node}/qemu/{vmid}/config"),
+                &[("tags".to_string(), crate::names::tags(TAG, &spec.id, self.environment.as_deref()))],
+            )
+            .await?;
 
-        let upid: String =
-            self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
-        self.wait_task(node, &upid).await?;
+            let mut config: Vec<(String, String)> = vec![
+                ("cores".into(), spec.vcpus.to_string()),
+                ("memory".into(), spec.memory_mib.to_string()),
+                ("cpu".into(), "host".into()),
+                // q35 is required for PCIe passthrough.
+                ("machine".into(), "q35".into()),
+                ("agent".into(), "enabled=1".into()),
+                ("ipconfig0".into(), "ip=dhcp".into()),
+                ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
+                ("description".into(), format!("Omnuv inference worker {}\nManaged by onv-provider. Do not edit.", spec.id)),
+            ];
+            // Mappings rather than raw addresses: a non-root token may only attach
+            // a device the host has explicitly published.
+            for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
+                config.push((format!("hostpci{i}"), format!("mapping={},pcie=1,rombar=0", mapping_name(pci))));
+            }
+            self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
+
+            // The template disk is small; grow it to the allocated size.
+            self.put_form::<serde_json::Value>(
+                &format!("/nodes/{node}/qemu/{vmid}/resize"),
+                &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{}G", spec.disk_gib))],
+            )
+            .await?;
+
+            let upid: String =
+                self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
+            self.wait_task(node, &upid).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = finished {
+            self.abandon_clone(node, vmid, &spec.id, "worker").await;
+            crate::pending::remove(&journal, vmid);
+            return Err(e);
+        }
+        crate::pending::remove(&journal, vmid);
 
         Ok(WorkerStatus {
             id: spec.id.clone(),
@@ -1026,5 +1069,67 @@ impl Client {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod a_worker_is_claimed_before_it_can_fail {
+    //! PROVIDER-2: a worker's create had no claim-first tag and no rollback,
+    //! so an untagged clone was leaked and cloned again on every pass, and a
+    //! tagged but half-built one was started as it was.
+    use crate::pvemock::{task_ok, Mock};
+    use omnuv_protocol::{InferenceWorkerSpec, Lifecycle};
+
+    fn spec() -> InferenceWorkerSpec {
+        InferenceWorkerSpec {
+            id: "worker_abc".into(),
+            intent: Lifecycle::Running,
+            image: "vllm/vllm-openai:latest".into(),
+            model_repo: "org/model".into(),
+            vllm_args: vec!["--model".into(), "org/model".into()],
+            vcpus: 8,
+            memory_mib: 32768,
+            disk_gib: 120,
+            gpu_local_ids: vec![],
+            port: 8000,
+            budget_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_that_fails_after_the_clone_removes_the_clone() {
+        let mock = Mock::start(|method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("321")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/321/config") => (200, serde_json::Value::Null),
+                ("PUT", "/nodes/n1/qemu/321/resize") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/321/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/321") => (200, serde_json::json!("UPID:n1:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let root = std::env::temp_dir().join(format!("onv-worker-create-{}", std::process::id()));
+        let dir = root.join("snippets");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = mock
+            .client()
+            .ensure_inference_worker(9000, "local", dir.to_str().unwrap(), &spec(), "https://api.example.com")
+            .await;
+        assert!(result.is_err(), "the resize failed and the create reported success");
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/321"), "the half-built worker was left to be started");
+        let calls = mock.calls.lock().unwrap();
+        let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/321/config").expect("configured");
+        assert!(calls[first_config].body.starts_with("tags="), "the first write after the clone was not the claim");
+        drop(calls);
+        assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

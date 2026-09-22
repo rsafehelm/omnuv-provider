@@ -967,8 +967,13 @@ impl Client {
 
         // **Written down before it is asked for (PROVIDER-1).** See pending.rs.
         let journal = crate::pending::dir(snippet_dir);
-        let mut pending =
-            crate::pending::PendingClone { vmid, id: spec.id.clone(), node: node.to_string(), upid: None };
+        let mut pending = crate::pending::PendingClone {
+            vmid,
+            id: spec.id.clone(),
+            node: node.to_string(),
+            upid: None,
+            claim: TAG.to_string(),
+        };
         crate::pending::write(&journal, &pending)?;
 
         let upid: String = self
@@ -994,7 +999,7 @@ impl Client {
         match self.task_end(node, &upid, 1800).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
-                self.abandon_clone(node, vmid, &spec.id).await;
+                self.abandon_clone(node, vmid, &spec.id, "instance").await;
                 crate::pending::remove(&journal, vmid);
                 anyhow::bail!("proxmox task failed: {exit}");
             }
@@ -1081,7 +1086,7 @@ impl Client {
         }
         .await;
         if let Err(e) = finished {
-            self.abandon_clone(node, vmid, &spec.id).await;
+            self.abandon_clone(node, vmid, &spec.id, "instance").await;
             crate::pending::remove(&journal, vmid);
             return Err(e);
         }
@@ -1269,7 +1274,7 @@ impl Client {
                 continue;
             };
             let tags = vm.tags.unwrap_or_default();
-            let ours = tags.split(';').any(|t| t == TAG) && tags.split(';').any(|t| t == short_tag(&entry.id));
+            let ours = tags.split(';').any(|t| t == entry.claim) && tags.split(';').any(|t| t == short_tag(&entry.id));
             // **Never an unclaimed machine this agent cannot prove it made.**
             // Without a finished clone task, a machine at this VMID may be
             // anybody's: the request may never have arrived, and the VMID been
@@ -1288,19 +1293,20 @@ impl Client {
                 && let Err(e) = self
                     .post_form::<serde_json::Value>(
                         &format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid),
-                        &[("tags".to_string(), crate::names::tags(TAG, &entry.id, self.environment.as_deref()))],
+                        &[("tags".to_string(), crate::names::tags(&entry.claim, &entry.id, self.environment.as_deref()))],
                     )
                     .await
             {
                 eprintln!("pending clone {}: could not claim it, kept: {e}", entry.vmid);
                 continue;
             }
-            self.abandon_clone(&entry.node, entry.vmid, &entry.id).await;
+            let event = if entry.claim == crate::names::TAG_WORKER { "worker" } else { "instance" };
+            self.abandon_clone(&entry.node, entry.vmid, &entry.id, event).await;
             crate::pending::remove(&journal, entry.vmid);
         }
     }
 
-    async fn abandon_clone(&self, node: &str, vmid: u32, id: &str) {
+    pub(crate) async fn abandon_clone(&self, node: &str, vmid: u32, id: &str, event: &str) {
         let _ = self
             .post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/status/stop"), NO_FORM)
             .await;
@@ -1310,7 +1316,7 @@ impl Client {
         }
         .await;
         let outcome = if gone.is_ok() { "rolled back" } else { "rollback failed" };
-        audit::record("instance.create", "core", id, outcome, Some(&vmid.to_string()));
+        audit::record(&format!("{event}.create"), "core", id, outcome, Some(&vmid.to_string()));
         if let Err(e) = gone {
             eprintln!("instance {id}: could not remove clone {vmid} after a failed create: {e}");
         }
@@ -1564,7 +1570,7 @@ mod tests {
         .await;
         let (root, dir) = snippets("unproven");
         let journal = crate::pending::dir(&dir);
-        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None })
+        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None, claim: TAG.to_string() })
             .unwrap();
         mock.client().recover_pending(&dir).await;
         let calls = mock.calls.lock().unwrap();
