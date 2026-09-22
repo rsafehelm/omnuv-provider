@@ -427,6 +427,16 @@ impl Client {
         let mut refused: Vec<String> = Vec::new();
         let mut chosen: Option<String> = None;
         for candidate in &candidates {
+            // **Where Core sold the cards, or nowhere (CORE-25).** A PCI
+            // address is unique only per node, so a free slot on another node
+            // is another card, possibly another model, and one the ledger
+            // still shows as available.
+            if let Some(sold) = spec.gpu_node.as_deref()
+                && candidate != sold
+            {
+                refused.push(format!("{candidate}: the cards were sold on {sold}"));
+                continue;
+            }
             match self.worker_node_can_place(candidate, spec).await {
                 Ok(()) => {
                     chosen = Some(candidate.clone());
@@ -808,6 +818,7 @@ mod tests {
             memory_mib: 32768,
             disk_gib: 120,
             gpu_local_ids: vec![],
+            gpu_node: None,
             port: 8000,
         };
         let ci = super::cloud_init(&spec, "https://api.example.com/");
@@ -881,6 +892,7 @@ mod workload_agent_tests {
             memory_mib: 32768,
             disk_gib: 120,
             gpu_local_ids: vec![],
+            gpu_node: None,
             port: 8000,
             budget_secs: None,
         }
@@ -1002,6 +1014,7 @@ mod workload_unit_tests {
                 memory_mib: 32768,
                 disk_gib: 120,
                 gpu_local_ids: vec![],
+                gpu_node: None,
                 port: 8000,
                 budget_secs: None,
             },
@@ -1091,6 +1104,7 @@ mod a_worker_is_claimed_before_it_can_fail {
             memory_mib: 32768,
             disk_gib: 120,
             gpu_local_ids: vec![],
+            gpu_node: None,
             port: 8000,
             budget_secs: None,
         }

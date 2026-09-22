@@ -914,6 +914,16 @@ impl Client {
         let mut refused: Vec<String> = Vec::new();
         let mut chosen: Option<String> = None;
         for candidate in &candidates {
+            // **Where Core sold the cards, or nowhere (CORE-25).** A PCI
+            // address is unique only per node, so a free slot on another node
+            // is another card, possibly another model, and one the ledger
+            // still shows as available.
+            if let Some(sold) = spec.gpu_node.as_deref()
+                && candidate != sold
+            {
+                refused.push(format!("{candidate}: the cards were sold on {sold}"));
+                continue;
+            }
             match self.node_can_place(candidate, spec).await {
                 Ok(()) => {
                     chosen = Some(candidate.clone());
@@ -1888,6 +1898,7 @@ mod tests {
             ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
             console_password_hash: Some("$6$rounds=10000$saltsaltsaltsalt$hashhashhashhash".into()),
             gpu_local_ids: vec![],
+            gpu_node: None,
             reboot_token: None,
             network: Some(NetworkAttachment {
                 network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
@@ -2142,6 +2153,77 @@ echo 'single' "double" `backtick` \$escaped
         // Unknown keys are ignored rather than fatal, so the recipe can add one
         // without an agent that predates it refusing the whole file.
         assert!(parse_stream_credentials("port=47990\nuser=u\npassword=p\n").is_some());
+    }
+}
+
+#[cfg(test)]
+mod the_cards_are_used_where_core_sold_them {
+    //! CORE-25: a PCI address is unique only per node. Told the node, the agent
+    //! places there, even when the same slot is free on the node it would
+    //! have tried first; told a node it cannot use, it refuses.
+    use crate::pvemock::{task_ok, Mock};
+    use omnuv_protocol::InstanceSpec;
+
+    fn two_nodes() -> impl Fn(&str, &str, &str) -> (u16, serde_json::Value) + Send + Sync + 'static {
+        |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([
+                    {"node": "n1", "status": "online"}, {"node": "n2", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") | ("GET", "/nodes/n2/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/mapping/pci") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n2:clone")),
+                ("POST", p) if p.ends_with("/qemu/123/config") => (200, serde_json::Value::Null),
+                // Ends the create at the rollback, once the placement is decided.
+                ("PUT", p) if p.ends_with("/qemu/123/resize") => (500, serde_json::Value::Null),
+                ("POST", p) if p.ends_with("/qemu/123/status/stop") => (200, serde_json::json!("UPID:n2:stop")),
+                ("DELETE", p) if p.ends_with("/qemu/123") => (200, serde_json::json!("UPID:n2:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        }
+    }
+
+    fn spec(node: &str) -> InstanceSpec {
+        let desired: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        let mut spec: InstanceSpec = serde_json::from_value(desired["instances"][0].clone()).unwrap();
+        spec.gpu_local_ids = vec!["0000:01:00.0".into()];
+        spec.gpu_node = Some(node.into());
+        spec
+    }
+
+    fn snippets(name: &str) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("onv-node-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("snippets")).unwrap();
+        let dir = root.join("snippets").to_string_lossy().into_owned();
+        (root, dir)
+    }
+
+    #[tokio::test]
+    async fn the_named_node_is_used_even_when_another_has_the_same_slot_free() {
+        let mock = Mock::start(two_nodes()).await;
+        let (root, dir) = snippets("named");
+        let _ = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec("n2")).await;
+        let calls = mock.calls.lock().unwrap();
+        let clones: Vec<&str> = calls.iter().filter(|c| c.path.ends_with("/clone")).map(|c| c.path.as_str()).collect();
+        assert_eq!(clones, ["/nodes/n2/qemu/9000/clone"], "cloned where the cards were not sold");
+        drop(calls);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_node_it_cannot_use_is_refused_not_substituted() {
+        let mock = Mock::start(two_nodes()).await;
+        let (root, dir) = snippets("absent");
+        let refused = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec("n9")).await;
+        let e = refused.expect_err("placed on another node than the one named");
+        assert!(e.downcast_ref::<super::Unplaceable>().is_some(), "{e:#}");
+        assert!(!mock.calls.lock().unwrap().iter().any(|c| c.path.ends_with("/clone")), "a clone was made anyway");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
