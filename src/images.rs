@@ -71,6 +71,30 @@ pub fn is_marketplace_template(cfg: &serde_json::Value) -> bool {
             .is_some_and(|d| d.contains("marketplace base image"))
 }
 
+/// Whether a guest at this image's vmid is **this import's own unfinished
+/// work** (PROVIDER-9): created with the name and description the mirror gives
+/// this image, never made a template, carrying no claim. The import is five
+/// calls and a template flag is the last of them; a failure anywhere in
+/// between left a guest that `is_marketplace_template` rightly refuses to call
+/// a template, and so every later retry refused with "is a machine, not a
+/// template" — the mirror wedged on its own debris for ever.
+///
+/// Strict on purpose, because the answer licenses a destroy. Anything short of
+/// all four — another image's name, an operator's wording, a claim tag, a
+/// template — is somebody's machine and is left alone. That it is not running
+/// is checked separately, live, by the caller.
+pub fn is_unfinished_import(cfg: &serde_json::Value, id: &str) -> bool {
+    let text = |k: &str| cfg.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let never_a_template = cfg.get("template").and_then(serde_json::Value::as_u64) != Some(1);
+    let our_name = text("name") == format!("{}-{id}", crate::names::PREFIX);
+    let our_words = text("description").starts_with(&format!("Onv marketplace base image - {id}."))
+        && text("description").contains(DIGEST_MARKER);
+    let claimed = text("tags").split(&[';', ','][..]).map(str::trim).any(|t| {
+        [crate::names::TAG_INSTANCE, crate::names::TAG_WORKER, crate::names::TAG_GATEWAY].contains(&t)
+    }) || crate::instance::is_legacy_marketplace_tag(text("tags"));
+    never_a_template && our_name && our_words && !claimed
+}
+
 /// The digest a template says it was imported from, if it says.
 ///
 /// A template without the marker was built locally by `build-template.yml`
@@ -288,8 +312,15 @@ pub async fn import(
     if let Ok(cfg) =
         px.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config")).await
     {
+        // Our own half-built import is cleared like a template of ours. It was
+        // never started, and a live read proves it is not running now.
+        let ours_unfinished = is_unfinished_import(&cfg, id) && {
+            let status: serde_json::Value =
+                px.get_json(&format!("/nodes/{node}/qemu/{vmid}/status/current")).await?;
+            status.get("status").and_then(serde_json::Value::as_str) == Some("stopped")
+        };
         anyhow::ensure!(
-            cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1),
+            ours_unfinished || cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1),
             "vmid {vmid} on {node} is a machine, not a template — refusing to import over it"
         );
         // **A template, and ours.** Being a template was the only check, so an
@@ -298,7 +329,7 @@ pub async fn import(
         // mirror and `build-template.yml` both write, the same test
         // `destroy-templates.yml` applies before it destroys one.
         anyhow::ensure!(
-            is_marketplace_template(&cfg),
+            ours_unfinished || is_marketplace_template(&cfg),
             "vmid {vmid} on {node} is a template the marketplace did not build — refusing to import over it"
         );
         let upid: String = px.delete_task(&format!("/nodes/{node}/qemu/{vmid}?purge=1")).await?;
@@ -367,6 +398,67 @@ pub async fn import(
 
 #[cfg(test)]
 mod tests {
+
+    /// **PROVIDER-9: this import's own debris, and nothing that resembles it.**
+    #[test]
+    fn only_this_imports_unfinished_guest_is_recognised() {
+        let debris = |name: &str, desc: String, template: u64, tags: &str| {
+            serde_json::json!({"name": name, "description": desc, "template": template, "tags": tags})
+        };
+        let ours = super::description("ubuntu-2604", "ab12");
+        assert!(super::is_unfinished_import(&debris("onv-ubuntu-2604", ours.clone(), 0, ""), "ubuntu-2604"));
+        for (why, cfg) in [
+            ("a finished template", debris("onv-ubuntu-2604", ours.clone(), 1, "")),
+            ("another image's", debris("onv-debian-13", super::description("debian-13", "ab12"), 0, "")),
+            ("a different name", debris("my-vm", ours.clone(), 0, "")),
+            ("a buyer's machine", debris("onv-ubuntu-2604", ours.clone(), 0, "onv-instance;onv-0a0b0c0d0e0f")),
+            ("an older claim", debris("onv-ubuntu-2604", ours.clone(), 0, "omnuv-instance")),
+            ("build-template's wording", debris("onv-ubuntu-2604", "Omnuv marketplace base image".into(), 0, "")),
+            ("no description", serde_json::json!({"name": "onv-ubuntu-2604", "template": 0})),
+        ] {
+            assert!(!super::is_unfinished_import(&cfg, "ubuntu-2604"), "{why} was taken for this import's debris");
+        }
+    }
+
+    /// Through `import`: its own stopped debris is cleared and the import goes
+    /// on; the same debris *running* is refused; an operator's machine at the
+    /// vmid is refused. The refusals are asserted by what was never deleted.
+    #[tokio::test]
+    async fn an_import_clears_its_own_debris_and_nothing_else() {
+        use crate::pvemock::{task_ok, Mock};
+        let run = |config: serde_json::Value, status: &'static str| async move {
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(ok) = task_ok(path) {
+                    return ok;
+                }
+                match (method, path) {
+                    ("GET", "/nodes/n1/qemu/9001/config") => (200, config.clone()),
+                    ("GET", "/nodes/n1/qemu/9001/status/current") => (200, serde_json::json!({"status": status})),
+                    ("DELETE", _) => (200, serde_json::json!("UPID:n1:del")),
+                    ("POST", _) => (200, serde_json::json!("UPID:n1:post")),
+                    ("GET", _) | ("PUT", _) => (200, serde_json::json!({})),
+                    _ => (404, serde_json::Value::Null),
+                }
+            })
+            .await;
+            let result = super::import(&mock.client(), "n1", "local-lvm", "local", "ubuntu-2604", 9001, "ab12").await;
+            let deleted = mock.calls.lock().unwrap().iter().any(|c| c.method == "DELETE" && c.path.starts_with("/nodes/n1/qemu/9001"));
+            (result, deleted)
+        };
+        let debris = serde_json::json!({"name": "onv-ubuntu-2604", "template": 0,
+                                        "description": super::description("ubuntu-2604", "old")});
+
+        let (result, deleted) = run(debris.clone(), "stopped").await;
+        assert!(result.is_ok(), "its own debris wedged the import: {result:?}");
+        assert!(deleted, "the debris was not cleared");
+
+        let (result, deleted) = run(debris, "running").await;
+        assert!(result.is_err() && !deleted, "a running guest was destroyed for an import");
+
+        let operators = serde_json::json!({"name": "db-1", "template": 0, "description": "production database"});
+        let (result, deleted) = run(operators, "stopped").await;
+        assert!(result.is_err() && !deleted, "an operator's machine was destroyed for an import");
+    }
     use super::is_marketplace_template;
     use serde_json::json;
 
