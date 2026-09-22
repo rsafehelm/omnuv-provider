@@ -470,7 +470,6 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         // tunnel only ever sees the runtime-neutral opener.
         let consoles: Arc<dyn crate::console::ConsoleOpener> = Arc::new(crate::console::DriverConsoles {
             driver: driver.clone(),
-            node: cfg.proxmox.node.clone().unwrap_or_default(),
         });
         tokio::spawn(async move {
             let resolve: crate::tunnel::ResolveWorker = Arc::new(move |worker_id: &str| {
@@ -516,9 +515,18 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         let wanted = mirror_wanted.clone();
         let kick = mirror_kick.clone();
         tokio::spawn(async move {
-            let node = cfg.proxmox.node.clone().unwrap_or_default();
             loop {
                 kick.notified().await;
+                // Resolved each time rather than once: with no node configured
+                // it is the first node online now, which may not be the one
+                // that was online when the agent started (PROVIDER-7).
+                let node = match driver.home_node(cfg.proxmox.node.as_deref()).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("image mirror: no node to mirror onto: {e}");
+                        continue;
+                    }
+                };
                 let catalogue = wanted.lock().map(|w| w.clone()).unwrap_or_default();
                 if catalogue.is_empty() {
                     continue;
@@ -1004,7 +1012,12 @@ async fn reconcile_workers(
     mirror_wanted: &Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>>,
     mirror_kick: &Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
-    let node = cfg.proxmox.node.as_deref().unwrap_or_default();
+    // **A node, never an empty name (PROVIDER-7).** Unset used to become `""`,
+    // and every node-scoped call below built `/nodes//…` and failed. Unset means
+    // the whole cluster for placement; for the work that needs one node, it is
+    // the first online node, resolved each pass.
+    let node_owned = driver.home_node(cfg.proxmox.node.as_deref()).await?;
+    let node = node_owned.as_str();
 
     // Refuse rather than guess. Machines built before the project was renamed
     // carry tags this agent no longer recognises, and to it they look like

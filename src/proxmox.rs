@@ -663,6 +663,17 @@ impl Client {
     /// Offline nodes are excluded here rather than discovered at placement: a
     /// node that is down is not a candidate, and finding that out from a failed
     /// clone is three minutes and one misleading error later.
+    /// The one node node-scoped work runs on: the configured node, or, when
+    /// none is configured, the first online node of the cluster in name order.
+    /// Never an empty string, which is what `unwrap_or_default` gave every
+    /// caller and what built `/nodes//qemu` (PROVIDER-7).
+    pub(crate) async fn home_node(&self, configured: Option<&str>) -> anyhow::Result<String> {
+        match configured.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => Ok(n.to_string()),
+            None => Ok(self.placement_nodes().await?.remove(0)),
+        }
+    }
+
     pub(crate) async fn placement_nodes(&self) -> anyhow::Result<Vec<String>> {
         let entries: Vec<NodeEntry> = self.get("/nodes").await?;
         let mut nodes: Vec<String> = entries
@@ -1392,4 +1403,64 @@ pub(crate) enum TaskEnd {
     Ended(Result<(), String>),
     /// Still running, or its status could not be read.
     Unknown(String),
+}
+
+#[cfg(test)]
+mod home_node_tests {
+    /// **PROVIDER-7: a node, never an empty name.** Configured is obeyed
+    /// without asking; blank is unset; unset is the first online node by name;
+    /// and a cluster with nothing online is an error, not `""`.
+    #[tokio::test]
+    async fn node_scoped_work_gets_a_real_node() {
+        let mock = crate::pvemock::Mock::start(|_, path, _| match path {
+            "/nodes" => (200, serde_json::json!([
+                {"node": "pve-c", "status": "online"},
+                {"node": "pve-a", "status": "offline"},
+                {"node": "pve-b", "status": "online"},
+            ])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let client = mock.client();
+        assert_eq!(client.home_node(Some("pve-z")).await.unwrap(), "pve-z");
+        assert!(!mock.called("GET", "/nodes"), "a configured node was second-guessed");
+        assert_eq!(client.home_node(None).await.unwrap(), "pve-b", "not the first *online* node by name");
+        assert_eq!(client.home_node(Some("  ")).await.unwrap(), "pve-b", "a blank node was taken as a name");
+
+        let dark = crate::pvemock::Mock::start(|_, path, _| match path {
+            "/nodes" => (200, serde_json::json!([{"node": "pve-a", "status": "offline"}])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        assert!(dark.client().home_node(None).await.is_err(), "no node online became an empty name");
+    }
+
+    /// And the console, which asked the configured node alone: a machine on
+    /// another host is found where it is, and asked about by a real path.
+    #[tokio::test]
+    async fn a_console_finds_its_machine_on_any_node() {
+        let key = crate::instance::short_tag("7e7e7e7e-0000-4000-8000-000000000001");
+        let mock = crate::pvemock::Mock::start(move |_, path, _| match path {
+            "/cluster/resources?type=vm" => (200, serde_json::json!([
+                {"node": "pve-b", "vmid": 701, "status": "running", "tags": format!("onv-instance;{key}")}
+            ])),
+            "/nodes/pve-b/qemu/701/status/current" => (200, serde_json::json!({"status": "stopped"})),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let e = match mock
+            .client()
+            .open_console("7e7e7e7e-0000-4000-8000-000000000001", omnuv_protocol::ConsoleKind::Serial)
+            .await
+        {
+            Ok(_) => panic!("a stopped machine opened a console"),
+            Err(e) => e.to_string(),
+        };
+        // Stopped, read live from its own node — though the cluster listing
+        // said running — which is only possible if it was found there.
+        assert!(e.contains("not running"), "{e}");
+        assert!(mock.called("GET", "/nodes/pve-b/qemu/701/status/current"));
+        let calls = mock.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.path.starts_with("/nodes//")), "an empty node name reached a path: {calls:?}");
+    }
 }

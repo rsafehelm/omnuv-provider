@@ -77,17 +77,25 @@ struct VncProxy {
 impl Client {
     pub async fn open_console(
         &self,
-        node: &str,
         instance_id: &str,
         kind: ConsoleKind,
     ) -> anyhow::Result<ConsoleStream> {
-        let Some(vm) = self
-            .find_tagged_vm(node, crate::instance::TAG, &crate::instance::short_tag(instance_id))
+        // **Wherever the machine is (PROVIDER-7).** This asked the configured
+        // node alone, so with no node configured — which documents itself as
+        // "the whole cluster" — every console asked `/nodes//qemu` and failed,
+        // and on a cluster a machine on any other host had no console at all.
+        let Some((node, vm)) = self
+            .find_tagged_vm_anywhere(crate::instance::TAG, &crate::instance::short_tag(instance_id))
             .await?
         else {
             anyhow::bail!("no such machine on this provider");
         };
-        if vm.status.as_deref() != Some("running") {
+        let node = node.as_str();
+        // Live, from the node: the cluster-wide listing lags by seconds, and a
+        // console refused for a machine that has just started reads as broken.
+        let status: serde_json::Value =
+            self.get_json(&format!("/nodes/{node}/qemu/{}/status/current", vm.vmid)).await?;
+        if status.get("status").and_then(|s| s.as_str()) != Some("running") {
             anyhow::bail!("the machine is not running");
         }
 
@@ -241,7 +249,6 @@ impl Client {
 /// The driver's consoles, handed to the tunnel as the runtime-neutral opener.
 pub struct DriverConsoles {
     pub driver: Arc<Client>,
-    pub node: String,
 }
 
 impl ConsoleOpener for DriverConsoles {
@@ -250,7 +257,7 @@ impl ConsoleOpener for DriverConsoles {
         instance_id: &'a str,
         kind: ConsoleKind,
     ) -> BoxFuture<'a, anyhow::Result<ConsoleStream>> {
-        Box::pin(self.driver.open_console(&self.node, instance_id, kind))
+        Box::pin(self.driver.open_console(instance_id, kind))
     }
 }
 
