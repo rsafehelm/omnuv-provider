@@ -62,6 +62,39 @@ struct Core {
     token: omnuv_protocol::Redacted,
 }
 
+/// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
+/// removed everything on the host — including the configuration holding the
+/// only token that could say so — and never asked Core, which kept the
+/// provider row and a valid token hash for a provider that had gone.
+///
+/// What Core answers decides what leave may do next:
+///
+/// ```text
+/// 2xx   Core removed the provider; the host may be cleaned
+/// 401   Core no longer knows this token; there is nothing left to tell it
+/// 409   Core says the provider still holds something: drain it first
+/// else  could not tell: the caller keeps the token so it can try again
+/// ```
+pub async fn leave_core(url: &str, token: &omnuv_protocol::Redacted, reason: &str) -> anyhow::Result<CoreLeft> {
+    let core = Core::new(url, token)?;
+    let r = core.post("/provider/v1/leave", Some(serde_json::json!({ "reason": reason }))).await?;
+    let status = r.status();
+    let body = r.text().await.unwrap_or_default();
+    match status.as_u16() {
+        200..=299 => Ok(CoreLeft::Removed(body)),
+        401 => Ok(CoreLeft::AlreadyForgotten),
+        409 => anyhow::bail!("Core refused: {body}"),
+        _ => Err(CoreAnswered { path: "/provider/v1/leave".into(), status: status.as_u16() }.into()),
+    }
+}
+
+/// How Core took a provider's leaving.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CoreLeft {
+    Removed(String),
+    AlreadyForgotten,
+}
+
 /// Core answered, and the answer was not a success. Typed so a caller can
 /// tell *Core is unwell* from *Core refuses this agent*, which used to be the
 /// same string and therefore the same behaviour (PROVIDER-6).
@@ -651,6 +684,41 @@ fn speaks(v: u32) -> bool {
 
 #[cfg(test)]
 mod handshake_tests {
+
+    /// **PROVIDER-16: what Core answers decides whether leave may go on.**
+    /// Real exchanges: the request is a POST to the leave route carrying the
+    /// operator's reason; removed and already-forgotten let leave continue; a
+    /// refusal carries Core's own sentence; anything else is "could not tell",
+    /// which keeps the token.
+    #[tokio::test]
+    async fn leaving_asks_core_first_and_reads_its_answer() {
+        // SAFETY: as in the test above — set once, to the same value.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ask = |status: u16, body: serde_json::Value| async move {
+            let mock = crate::pvemock::Mock::start(move |_, _, _| (status, body.clone())).await;
+            let token = omnuv_protocol::Redacted::from("t".to_string());
+            let said = leave_core(&format!("{}/api2/json", mock.base), &token, "going").await;
+            let calls = mock.calls.lock().unwrap().clone();
+            (said, calls)
+        };
+
+        let (said, calls) = ask(200, serde_json::json!({"archived": 3})).await;
+        assert!(matches!(said, Ok(CoreLeft::Removed(_))), "{said:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].method.as_str(), calls[0].path.as_str()), ("POST", "/provider/v1/leave"));
+        assert!(calls[0].body.contains("\"reason\":\"going\""), "the reason was not sent: {}", calls[0].body);
+
+        let (said, _) = ask(401, serde_json::Value::Null).await;
+        assert_eq!(said.unwrap(), CoreLeft::AlreadyForgotten);
+
+        let (said, _) = ask(409, serde_json::json!("this provider still holds 1 machine(s)")).await;
+        let e = said.expect_err("a refusal").to_string();
+        assert!(e.contains("still holds 1 machine"), "Core's own sentence was lost: {e}");
+
+        let (said, _) = ask(503, serde_json::Value::Null).await;
+        assert!(said.is_err(), "an unwell Core was taken as having been told");
+    }
     /// **PROVIDER-6: an outage is not a verdict.** Each answer, as `get_json`
     /// actually returns it from a real HTTP exchange, classified — and a
     /// connection nobody accepts, which is the one real outage. Only the

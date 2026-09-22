@@ -27,7 +27,7 @@ onv-provider - Omnuv Provider Agent
 
 USAGE:
     onv-provider join  --core <url> --token <token> [options]
-    onv-provider leave [--dry-run]
+    onv-provider leave [--dry-run] [--without-core] [--config PATH]
     onv-provider agent [--config /etc/onv/agent.yaml]
     onv-provider discover --provider <id> [--config <path>]
 
@@ -100,7 +100,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if command == "leave" {
-        return join::leave(std::env::args().any(|a| a == "--dry-run"));
+        let args: Vec<String> = std::env::args().collect();
+        let config = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
+        return join::leave(
+            args.iter().any(|a| a == "--dry-run"),
+            args.iter().any(|a| a == "--without-core"),
+            &config,
+        )
+        .await;
     }
 
     if command == "agent" {

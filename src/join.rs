@@ -401,6 +401,16 @@ WantedBy=multi-user.target
 /// easily as they joined, without asking us.
 /// The machines a pool listing names, as `vmid`s. Pools are how the
 /// marketplace marks its own machines on a host.
+/// The pool ids in `pvesh get /pools`.
+fn pool_ids(listing: &serde_json::Value) -> Vec<String> {
+    listing
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["poolid"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn machines_in(pool: &serde_json::Value) -> Vec<u64> {
     pool["members"]
         .as_array()
@@ -424,20 +434,30 @@ fn marketplace_vnets(vnets: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-pub fn leave(dry_run: bool) -> anyhow::Result<()> {
+pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::Result<()> {
     println!("onv-provider leave{}", if dry_run { " (dry run)" } else { "" });
 
     // **Refused while the marketplace still has a machine here.** What leave
     // removes below includes the network every buyer machine is attached to;
     // removing it from under a running machine would cut that machine off.
     // Nothing is changed before this check.
+    //
+    // **And refused when the question could not be asked (PROVIDER-25).** Each
+    // pool used to be read with `if let Ok(..)`, so a failed query — the API
+    // down, a permission missing — counted as an empty pool and leave went on
+    // to remove the network under whatever was there. The pools are listed
+    // first, which only succeeds if the API answers; a pool absent from that
+    // list is genuinely empty, and one present that cannot be read stops leave.
+    let listed = sh("pvesh get /pools --output-format json")
+        .and_then(|out| Ok(serde_json::from_str::<serde_json::Value>(&out)?))
+        .map_err(|e| anyhow::anyhow!("could not list this host's pools, so whether the marketplace still has machines here is unknown; nothing was changed: {e}"))?;
+    let existing = pool_ids(&listed);
     let mut remaining = Vec::new();
-    for pool in [GATEWAY_POOL, BUYER_POOL] {
-        if let Ok(out) = sh(&format!("pvesh get /pools/{pool} --output-format json 2>/dev/null"))
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&out)
-        {
-            remaining.extend(machines_in(&v));
-        }
+    for pool in [GATEWAY_POOL, BUYER_POOL].into_iter().filter(|p| existing.iter().any(|e| e == p)) {
+        let v: serde_json::Value = sh(&format!("pvesh get /pools/{pool} --output-format json"))
+            .and_then(|out| Ok(serde_json::from_str(&out)?))
+            .map_err(|e| anyhow::anyhow!("pool {pool} exists and could not be read; nothing was changed: {e}"))?;
+        remaining.extend(machines_in(&v));
     }
     anyhow::ensure!(
         remaining.is_empty(),
@@ -445,6 +465,27 @@ pub fn leave(dry_run: bool) -> anyhow::Result<()> {
          marketplace from the provider console first, so they are removed through it, \
          then run leave again."
     );
+
+    // **Core first, while the token that can tell it still exists
+    // (PROVIDER-16).** Everything below removes that token.
+    match crate::config::load_agent(config) {
+        Ok(cfg) if dry_run => println!("  tell Core\n    POST {}/provider/v1/leave", cfg.core.url),
+        Ok(cfg) => match crate::agent::leave_core(&cfg.core.url, &cfg.core.token, "the provider's operator ran onv-provider leave").await {
+            Ok(crate::agent::CoreLeft::Removed(said)) => println!("  Core removed this provider: {said}"),
+            Ok(crate::agent::CoreLeft::AlreadyForgotten) => println!("  Core no longer knows this provider's token; nothing to tell it"),
+            Err(e) if without_core => eprintln!("  could not tell Core ({e}); going on because --without-core was given. Core still lists this provider and accepts its token."),
+            Err(e) => anyhow::bail!(
+                "could not tell Core this provider is leaving: {e}. Nothing was removed, so the \
+                 token that can tell it is still here — run leave again once Core answers, or \
+                 pass --without-core to leave Core listing a provider that has gone."
+            ),
+        },
+        Err(e) if without_core => eprintln!("  no agent configuration at {config} ({e}); Core was not told"),
+        Err(e) => anyhow::bail!(
+            "no agent configuration at {config}, so Core cannot be told this provider is leaving: \
+             {e}. Pass --without-core to leave anyway."
+        ),
+    }
 
     for (label, cmd) in [
         ("stop service", "systemctl disable --now onv-provider 2>/dev/null || true"),
@@ -524,6 +565,15 @@ pub fn leave(dry_run: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The pools that exist, from `pvesh get /pools` — and nothing from a
+    /// listing that is not one.
+    #[test]
+    fn the_pools_that_exist_are_read_from_the_listing() {
+        let listing = serde_json::json!([{"poolid": "onv"}, {"poolid": "backups", "comment": "x"}]);
+        assert_eq!(super::pool_ids(&listing), ["onv", "backups"]);
+        assert!(super::pool_ids(&serde_json::json!({"poolid": "onv"})).is_empty());
+    }
 
     #[test]
     fn leave_finds_the_marketplaces_machines_and_segments() {
