@@ -26,11 +26,15 @@ VM.GuestAgent.Audit,Mapping.Audit,Mapping.Use,SDN.Audit,SDN.Use";
 pub(crate) const GATEWAY_POOL: &str = crate::names::POOL;
 const BUYER_POOL: &str = crate::names::POOL_BUYERS;
 /// The marketplace's own SDN zone, and the buyer egress bridge beside it.
-/// Eight characters is the Proxmox limit for a vnet name, which is why the
-/// bridge is `onat0` rather than something readable.
+/// Eight characters is the Proxmox limit for a vnet name, and `onvnat0` is
+/// seven.
 const SDN_ZONE: &str = crate::names::SDN_ZONE;
 const EGRESS_ZONE: &str = crate::names::SDN_ZONE_NAT;
-const EGRESS_VNET: &str = "onat0";
+// **The name buyer machines attach to** (`instance::EGRESS_BRIDGE`, which is
+// `names::NAT_VNET`). This said `onat0` after the agent moved to `onvnat0`, so a
+// host joined by hand got a NAT bridge no machine used, and the first buyer
+// machine failed with "bridge 'onvnat0' does not exist".
+const EGRESS_VNET: &str = crate::names::NAT_VNET;
 const EGRESS_SUBNET: &str = "10.201.0.0/24";
 const EGRESS_GATEWAY: &str = "10.201.0.1";
 const EGRESS_DHCP: &str = "start-address=10.201.0.100,end-address=10.201.0.250";
@@ -475,7 +479,9 @@ mod tests {
     #[test]
     fn the_egress_script_waits_for_the_interface() {
         let s = egress_script();
-        assert!(s.contains("/sys/class/net/onat0"), "never checks the interface exists");
+        assert!(s.contains("/sys/class/net/onvnat0"), "never checks the interface exists");
+        // The bridge join builds is the one a buyer machine attaches to.
+        assert_eq!(EGRESS_VNET, crate::instance::EGRESS_BRIDGE);
         assert!(s.contains("sleep 1"), "does not wait");
         assert!(s.contains("--snat 1"), "no NAT, so a machine has no way out");
         assert!(s.contains("--isolate-ports 1"), "tenants would see each other on the bridge");
