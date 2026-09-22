@@ -62,6 +62,63 @@ struct Core {
     token: omnuv_protocol::Redacted,
 }
 
+/// Core answered, and the answer was not a success. Typed so a caller can
+/// tell *Core is unwell* from *Core refuses this agent*, which used to be the
+/// same string and therefore the same behaviour (PROVIDER-6).
+#[derive(Debug)]
+pub struct CoreAnswered {
+    pub path: String,
+    pub status: u16,
+}
+
+impl std::fmt::Display for CoreAnswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} answered {}", self.path, self.status)
+    }
+}
+
+impl std::error::Error for CoreAnswered {}
+
+/// What a failed call to Core means for this agent.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Core could not be reached, or answered 5xx or 429: unwell, not a verdict.
+    /// The copy in hand may be maintained, and nothing is decided.
+    Unreachable,
+    /// Core refused this agent's credential on an ordinary call. Nothing is
+    /// maintained on instructions from a Core that no longer accepts us; the
+    /// heartbeat re-handshakes, and that is where the verdict is final.
+    Refused,
+    /// Core no longer speaks this agent's protocol (426), or the handshake
+    /// itself rejected the enrollment token. Nothing this process can do will
+    /// change the answer, so it stops, and says why.
+    Final,
+    /// Any other answer: a request Core considered wrong. Decided nothing.
+    Other,
+}
+
+pub fn refusal(e: &anyhow::Error) -> Refusal {
+    match e.downcast_ref::<CoreAnswered>() {
+        None => Refusal::Unreachable,
+        Some(a) => match a.status {
+            426 => Refusal::Final,
+            401 if a.path == HANDSHAKE => Refusal::Final,
+            401 | 403 => Refusal::Refused,
+            429 | 500..=599 => Refusal::Unreachable,
+            _ => Refusal::Other,
+        },
+    }
+}
+
+const HANDSHAKE: &str = "/provider/v1/handshake";
+
+/// The one way this daemon ends on purpose: Core has said, finally, that it
+/// will not work with this agent. Code 3, beside `main`'s 2 for configuration.
+pub fn stop_for_good(e: &anyhow::Error) -> ! {
+    eprintln!("stopping: {e:#}. Core will not accept this agent as it is; upgrade or re-enrol it.");
+    std::process::exit(3)
+}
+
 impl Core {
     /// The agent's own transport to Omnuv Core.
     ///
@@ -103,7 +160,7 @@ impl Core {
             .send()
             .await?;
         if !res.status().is_success() {
-            anyhow::bail!("GET {path}: {}", res.status());
+            return Err(CoreAnswered { path: path.to_string(), status: res.status().as_u16() }.into());
         }
         Ok(res.json().await?)
     }
@@ -498,11 +555,17 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             }
             _ = nudge.notified() => {
                 if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
+                    if refusal(&e) == Refusal::Final {
+                        stop_for_good(&e);
+                    }
                     eprintln!("reconcile (pushed) failed: {e}");
                 }
             }
             _ = reconcile.tick() => {
                 if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
+                    if refusal(&e) == Refusal::Final {
+                        stop_for_good(&e);
+                    }
                     eprintln!("reconcile failed: {e}");
                 }
             }
@@ -529,9 +592,15 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
         loop {
             tick.tick().await;
             match core.post("/provider/v1/heartbeat", None).await {
+                Ok(r) if r.status() == reqwest::StatusCode::UPGRADE_REQUIRED => {
+                    stop_for_good(&CoreAnswered { path: "/provider/v1/heartbeat".into(), status: 426 }.into())
+                }
                 Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
                     eprintln!("heartbeat rejected; re-running handshake");
                     if let Err(e) = handshake(&core, &driver).await {
+                        if refusal(&e) == Refusal::Final {
+                            stop_for_good(&e);
+                        }
                         eprintln!("heartbeat handshake failed: {e}");
                     }
                 }
@@ -574,6 +643,41 @@ fn speaks(v: u32) -> bool {
 
 #[cfg(test)]
 mod handshake_tests {
+    /// **PROVIDER-6: an outage is not a verdict.** Each answer, as `get_json`
+    /// actually returns it from a real HTTP exchange, classified — and a
+    /// connection nobody accepts, which is the one real outage. Only the
+    /// outage lets the agent maintain on its stale copy; only the two final
+    /// answers stop it.
+    #[tokio::test]
+    async fn only_an_outage_is_maintained_through_and_only_a_final_answer_stops() {
+        // SAFETY: set once, before any client is built, and only ever to the
+        // same value; no test here asserts plaintext is refused.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        // What `main` does at startup, for the same reason the mock's client does.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = omnuv_protocol::Redacted::from("t".to_string());
+        for (status, path, want) in [
+            (503u16, "/provider/v1/desired-state", Refusal::Unreachable),
+            (429, "/provider/v1/desired-state", Refusal::Unreachable),
+            (401, "/provider/v1/desired-state", Refusal::Refused),
+            (403, "/provider/v1/desired-state", Refusal::Refused),
+            (426, "/provider/v1/desired-state", Refusal::Final),
+            (404, "/provider/v1/desired-state", Refusal::Other),
+            (401, HANDSHAKE, Refusal::Final),
+        ] {
+            let mock = crate::pvemock::Mock::start(move |_, _, _| (status, serde_json::Value::Null)).await;
+            // The mock serves under /api2/json; Core's paths are asked of its root.
+            let core = Core::new(&format!("{}/api2/json", mock.base), &token).expect("a client");
+            let e = core.get_json::<serde_json::Value>(path).await.expect_err("a refusal");
+            assert_eq!(refusal(&e), want, "{status} on {path}: {e}");
+        }
+        // Nothing listening: the one genuine outage.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let core = Core::new(&format!("http://{closed}"), &token).expect("a client");
+        let e = core.get_json::<serde_json::Value>("/provider/v1/desired-state").await.expect_err("refused");
+        assert_eq!(refusal(&e), Refusal::Unreachable, "{e}");
+    }
+
     #[test]
     fn an_error_result_makes_the_observation_incomplete() {
         assert!(super::incompleteness(0, 3, 0, 1).is_empty(), "every item observed");
@@ -705,7 +809,7 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
     // Core may simply not be up yet at boot; keep trying with a bounded backoff.
     let mut delay = 2u64;
     loop {
-        match core.post("/provider/v1/handshake", Some(body.clone())).await {
+        match core.post(HANDSHAKE, Some(body.clone())).await {
             Ok(r) if r.status().is_success() => {
                 let v: serde_json::Value = r.json().await?;
                 let secs = v.get("heartbeat_interval_secs").and_then(|x| x.as_u64()).unwrap_or(30);
@@ -721,8 +825,13 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
                 let status = r.status();
                 let detail = r.text().await.unwrap_or_default();
                 eprintln!("handshake rejected ({status}): {detail}");
-                if status == reqwest::StatusCode::UNAUTHORIZED {
-                    anyhow::bail!("enrollment token rejected; re-enrol this provider");
+                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::UPGRADE_REQUIRED {
+                    return Err(anyhow::Error::from(CoreAnswered { path: HANDSHAKE.into(), status: status.as_u16() })
+                        .context(if status == reqwest::StatusCode::UNAUTHORIZED {
+                            "enrollment token rejected; re-enrol this provider"
+                        } else {
+                            "Core requires a newer protocol than this agent speaks"
+                        }));
                 }
             }
             Err(e) => eprintln!("handshake failed: {e}"),
@@ -922,6 +1031,14 @@ async fn reconcile_workers(
         match core.get_json(&format!("/provider/v1/desired-state?known={known}")).await {
             Ok(d) => d,
             Err(e) => {
+                // **Only an outage is maintained through (PROVIDER-6).** Every
+                // failure used to read as "Core unreachable", so an agent Core
+                // had refused — revoked, removed, or too old — went on starting
+                // machines from its last copy indefinitely, on instructions
+                // from a Core that no longer accepted it.
+                if refusal(&e) != Refusal::Unreachable {
+                    return Err(e.context("Core refused the desired-state request; nothing was maintained"));
+                }
                 // Core is unreachable. Maintain, do not decide: the copy in
                 // hand is stale, so nothing is created and nothing is
                 // destroyed, but a machine that was meant to be running and
