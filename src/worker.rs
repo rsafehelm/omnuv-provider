@@ -55,6 +55,21 @@ pub(crate) fn mapping_name(pci: &str) -> String {
 /// cloud-init that brings up the NVIDIA stack and serves the model.
 /// The HF cache lives on the VM disk; a shared per-node cache is a later
 /// optimisation, not something to fake now.
+/// The digest of the Workload Agent built beside this agent, compiled in by
+/// `packaging/build-deb.sh`. **Anchored here, not at Core**: Core serves the
+/// binary and a worker runs it as root, so the check is against the package
+/// the provider installed, and Core only carries bytes. A plain `cargo build`
+/// has none, and a worker it builds downloads without a check.
+const WORKLOADD_SHA256: Option<&str> = option_env!("OMNUV_WORKLOADD_SHA256");
+
+/// The shell fragment that refuses a download that is not that binary.
+fn workloadd_check(sha256: Option<&str>) -> String {
+    match sha256.filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())) {
+        Some(sha) => format!(" && echo '{sha}  /usr/local/bin/onv-workloadd.new' | sha256sum -c --quiet -"),
+        None => String::new(),
+    }
+}
+
 fn cloud_init(spec: &InferenceWorkerSpec, core_url: &str) -> String {
     // One argument per line, base64-encoded into the bootcmd.
     //
@@ -121,7 +136,7 @@ write_files:
       # reboot rather than only at first boot. cloud-init's runcmd runs once per
       # *instance*, so a machine built before this existed would never acquire
       # it — and "rebuild every worker" is not a convergence story.
-      ExecStartPre=/bin/sh -c 'test -x /usr/local/bin/onv-workloadd || (curl -fsSL -o /usr/local/bin/onv-workloadd.new {core_url}/downloads/onv-workloadd && chmod 0755 /usr/local/bin/onv-workloadd.new && mv /usr/local/bin/onv-workloadd.new /usr/local/bin/onv-workloadd)'
+      ExecStartPre=/bin/sh -c 'test -x /usr/local/bin/onv-workloadd || (curl -fsSL -o /usr/local/bin/onv-workloadd.new {core_url}/downloads/onv-workloadd{verify} && chmod 0755 /usr/local/bin/onv-workloadd.new && mv /usr/local/bin/onv-workloadd.new /usr/local/bin/onv-workloadd)'
       Environment=OMNUV_WORKLOAD_ID={worker_id}
       Environment=OMNUV_VLLM_URL=http://127.0.0.1:{port}
       Environment=OMNUV_CACHE_DIR=/opt/onv/hf
@@ -129,11 +144,17 @@ write_files:
       Restart=always
       RestartSec=10s
       # It writes one file and opens no socket, so it is confined rather than
-      # trusted: no new privileges, a private tmp, and the only writable path
-      # is the one it reports through.
+      # trusted: no new privileges, a private tmp, the whole filesystem
+      # read-only, and the only writable path the one it reports through. It
+      # stays root to read the GPU, which is why the rest has to be true: the
+      # comment said this before ProtectSystem made it so, when every path was
+      # writable and RuntimeDirectory still named /run/omnuv.
       NoNewPrivileges=yes
       PrivateTmp=yes
-      RuntimeDirectory=omnuv
+      ProtectSystem=strict
+      ProtectHome=yes
+      RuntimeDirectory=onv
+      RuntimeDirectoryPreserve=yes
       ReadWritePaths=/run/onv
 
       [Install]
@@ -168,7 +189,7 @@ runcmd:
   # glibc is older than the one it was built against. Failure to fetch it is not
   # fatal: it reports, it does not serve, and a worker that cannot describe
   # itself is still a worker that answers requests.
-  - [ bash, -c, "curl -fsSL -o /usr/local/bin/onv-workloadd {core_url}/downloads/onv-workloadd && chmod 0755 /usr/local/bin/onv-workloadd || echo 'onv-workloadd unavailable; continuing without telemetry'" ]
+  - [ bash, -c, "curl -fsSL -o /usr/local/bin/onv-workloadd.new {core_url}/downloads/onv-workloadd{verify} && chmod 0755 /usr/local/bin/onv-workloadd.new && mv /usr/local/bin/onv-workloadd.new /usr/local/bin/onv-workloadd || echo 'onv-workloadd unavailable or not the one this agent was built with; continuing without telemetry'" ]
   - [ bash, -c, "command -v /usr/local/bin/onv-workloadd && systemctl enable --now onv-workloadd.service || true" ]
   - [ bash, -c, "curl -fsSL https://get.docker.com | sh" ]
   - [ bash, -c, "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg" ]
@@ -190,6 +211,7 @@ runcmd:
         port = spec.port,
         worker_id = spec.id,
         core_url = core_url.trim_end_matches('/'),
+        verify = workloadd_check(WORKLOADD_SHA256),
         args_b64 = args_b64,
         image_b64 = base64::engine::general_purpose::STANDARD.encode(&spec.image),
     )
@@ -833,6 +855,23 @@ mod workload_agent_tests {
         // telemetry to a machine that does not exist.
         assert!(ci.contains("OMNUV_WORKLOAD_ID=worker_abc"));
         assert!(ci.contains("OMNUV_VLLM_URL=http://127.0.0.1:8000"));
+    }
+
+    /// The download is checked against the digest this agent was built
+    /// with, in both places it can happen, and a malformed digest is no check
+    /// rather than a broken shell line.
+    #[test]
+    fn the_workload_agent_download_is_checked_against_the_packaged_digest() {
+        let sha = "ab".repeat(32);
+        let check = super::workloadd_check(Some(&sha));
+        assert_eq!(check, format!(" && echo '{sha}  /usr/local/bin/onv-workloadd.new' | sha256sum -c --quiet -"));
+        assert_eq!(super::workloadd_check(None), "");
+        assert_eq!(super::workloadd_check(Some("not-a-digest")), "");
+        // The check sits between the download and the install, in both paths.
+        let ci = super::cloud_init(&spec(), "https://api.omnuv.com");
+        for l in ci.lines().filter(|l| l.contains("/downloads/onv-workloadd")) {
+            assert!(l.contains("onv-workloadd.new"), "a path installs without staging: {l}");
+        }
     }
 
     /// A worker that cannot fetch the reporter must still become a worker.

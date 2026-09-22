@@ -51,6 +51,30 @@ STAGE="$OUT/.deb"
 
 echo "onv-provider $VERSION ($ARCH)"
 
+# **The Workload Agent, built by the same command.** Nothing built it before,
+# so `platform.yml` found no binary, skipped the copy, and every worker booted
+# without telemetry from 12 September on. Static, on musl: it runs inside guest
+# images whose glibc may be older than this toolchain's, where a dynamic build
+# fails at exec with nothing useful in the log. Alpine's toolchain targets musl
+# natively, so there is no cross target to install.
+docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
+    -e CARGO_TARGET_DIR=/w/target/musl -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
+    -w /w rust:1.98-alpine sh -ec "
+        apk add --quiet --no-cache musl-dev >/dev/null
+        cargo build --release --locked --quiet --bin onv-workloadd
+    "
+mkdir -p "$OUT/workloadd"
+install -m 0755 "$ROOT/target/musl/release/onv-workloadd" "$OUT/workloadd/onv-workloadd"
+# Refuse a dynamic binary here rather than let a guest discover it.
+if file "$OUT/workloadd/onv-workloadd" | grep -q 'dynamically linked'; then
+    echo "onv-workloadd is dynamically linked; it must be static" >&2
+    exit 1
+fi
+
+# Built first, so the agent can carry its digest: a worker checks the binary
+# Core serves against the one this package was built with (worker.rs).
+WORKLOADD_SHA256="$(sha256sum "$OUT/workloadd/onv-workloadd" | cut -d' ' -f1)"
+
 # `--locked`: the committed Cargo.lock is the dependency set, so two builds of
 # one commit link the same crates. It was gitignored, so every build resolved
 # afresh and a package could not be rebuilt as it was.
@@ -59,7 +83,8 @@ echo "onv-provider $VERSION ($ARCH)"
 # the agent speaks TLS through rustls rather than the system OpenSSL, so the
 # only real link is glibc.
 docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
-    -e OMNUV_BUILD="$VERSION" -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
+    -e OMNUV_BUILD="$VERSION" -e OMNUV_WORKLOADD_SHA256="$WORKLOADD_SHA256" \
+    -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
     -w /w rust:1.98 cargo build --release --locked --quiet
 
 rm -rf "$STAGE"
@@ -110,26 +135,6 @@ cp "$OUT/onv-provider_${VERSION}_${ARCH}.deb" "$OUT/onv-provider_current_${ARCH}
 # version hard-coded in the play would be the same two-definitions mistake in a
 # new place.
 printf '%s\n' "$VERSION" > "$OUT/onv-provider_current.version"
-
-# **The Workload Agent, built by the same command.** Nothing built it before,
-# so `platform.yml` found no binary, skipped the copy, and every worker booted
-# without telemetry from 12 September on. Static, on musl: it runs inside guest
-# images whose glibc may be older than this toolchain's, where a dynamic build
-# fails at exec with nothing useful in the log. Alpine's toolchain targets musl
-# natively, so there is no cross target to install.
-docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
-    -e CARGO_TARGET_DIR=/w/target/musl -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
-    -w /w rust:1.98-alpine sh -ec "
-        apk add --quiet --no-cache musl-dev >/dev/null
-        cargo build --release --locked --quiet --bin onv-workloadd
-    "
-mkdir -p "$OUT/workloadd"
-install -m 0755 "$ROOT/target/musl/release/onv-workloadd" "$OUT/workloadd/onv-workloadd"
-# Refuse a dynamic binary here rather than let a guest discover it.
-if file "$OUT/workloadd/onv-workloadd" | grep -q 'dynamically linked'; then
-    echo "onv-workloadd is dynamically linked; it must be static" >&2
-    exit 1
-fi
 
 echo "  $(basename "$OUT")/onv-provider_${VERSION}_${ARCH}.deb"
 echo "  $(basename "$OUT")/workloadd/onv-workloadd"
