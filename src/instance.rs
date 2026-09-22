@@ -672,7 +672,13 @@ impl Client {
         // caller's `node` is where a *new* machine would go; an existing one is
         // wherever it already is, and asking only the caller's node made a
         // machine on `nuc3` look like one that had never been created.
-        if let Some((node, vm)) = self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await? {
+        // Not even looked at: nothing is known about this machine, so nothing
+        // is claimed about it (PROVIDER-26). See `NotLookedAt`.
+        if let Some((node, vm)) = self
+            .find_tagged_vm_anywhere(TAG, &short_tag(&spec.id))
+            .await
+            .map_err(|e| anyhow::Error::from(NotLookedAt(format!("{e:#}"))))?
+        {
             let node = node.as_str();
             // **`/cluster/resources` answers *where*; the node answers *what
             // state*.** That aggregate is cached and lags by seconds, so a
@@ -706,182 +712,202 @@ impl Client {
                 Err(_) => vm,
             };
             let mut running = vm.status.as_deref() == Some("running");
+            // **What was seen is what is reported (PROVIDER-26).** Everything
+            // below acts on a machine whose state was just read. A failure in
+            // it — a re-plug, a cloud-init refresh, an API call that did not
+            // answer — is the agent's, not the machine's, and used to be sent as
+            // ERROR, which Core accepts from RUNNING: one blip turned every
+            // healthy machine red. It is now reported as the state that was
+            // seen, with the failure as its message.
+            let seen = if running { InstanceState::Running } else { InstanceState::Stopped };
+            let (seen_vmid, seen_node) = (vm.vmid, node.to_string());
+            let converged: anyhow::Result<InstanceStatus> = async {
 
-            // The machine's place on its network's segment. A machine built
-            // before the segment existed sits on another bridge; Proxmox
-            // re-plugs a running machine's interface live, and the guest's
-            // own configuration does not change.
-            if let Some(net) = &spec.network
-                && spec.intent != Lifecycle::Absent
-            {
-                self.ensure_segment(node, vm.vmid, net).await?;
-            }
-
-            // And its way out. A machine built before the egress bridge was
-            // renamed still names the old one, which the teardown sweep is
-            // about to remove — so it is re-pointed here rather than left to
-            // lose its internet quietly. Proxmox re-plugs a running machine's
-            // interface live and the guest's own configuration does not change,
-            // exactly as for the segment above.
-            if spec.intent != Lifecycle::Absent {
-                self.ensure_egress(node, vm.vmid).await?;
-            }
-
-            // Converge toward the requested lifecycle rather than merely
-            // reporting what is there.
-            match spec.intent {
-                Lifecycle::Running if !running => {
-                    let upid: String = self
-                        .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
-                        .await?;
-                    self.wait_task(node, &upid).await?;
-                    audit::record("instance.start", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
-                    running = true;
+                // The machine's place on its network's segment. A machine built
+                // before the segment existed sits on another bridge; Proxmox
+                // re-plugs a running machine's interface live, and the guest's
+                // own configuration does not change.
+                if let Some(net) = &spec.network
+                    && spec.intent != Lifecycle::Absent
+                {
+                    self.ensure_segment(node, vm.vmid, net).await?;
                 }
-                Lifecycle::Stopped if running => {
-                    let upid: String = self
-                        .post_form(&format!("/nodes/{node}/qemu/{}/status/shutdown", vm.vmid), NO_FORM)
-                        .await?;
-                    self.wait_task(node, &upid).await?;
-                    audit::record("instance.stop", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
-                    running = false;
+
+                // And its way out. A machine built before the egress bridge was
+                // renamed still names the old one, which the teardown sweep is
+                // about to remove — so it is re-pointed here rather than left to
+                // lose its internet quietly. Proxmox re-plugs a running machine's
+                // interface live and the guest's own configuration does not change,
+                // exactly as for the segment above.
+                if spec.intent != Lifecycle::Absent {
+                    self.ensure_egress(node, vm.vmid).await?;
                 }
-                _ => {}
-            }
 
-            // The generated cloud-init, brought up to date so a generator
-            // change reaches a machine that already exists. The drive is
-            // refreshed and nothing more: this is the buyer's machine, and
-            // rebooting it to apply a marketplace change is not ours to
-            // decide. It takes effect at their next boot — including the one
-            // they may ask for on the line below.
-            if spec.intent != Lifecycle::Absent
-                && let Err(e) = self
-                    .sync_cloud_init(
-                        node,
-                        vm.vmid,
-                        snippet_dir,
-                        &crate::names::snippet_instance(&spec.id),
-                        &cloud_init(spec, self.apt_mirror.as_deref(), vm.vmid),
-                    )
-                    .await
-            {
-                eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
-            }
+                // Converge toward the requested lifecycle rather than merely
+                // reporting what is there.
+                match spec.intent {
+                    Lifecycle::Running if !running => {
+                        let upid: String = self
+                            .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
+                            .await?;
+                        self.wait_task(node, &upid).await?;
+                        audit::record("instance.start", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                        running = true;
+                    }
+                    Lifecycle::Stopped if running => {
+                        let upid: String = self
+                            .post_form(&format!("/nodes/{node}/qemu/{}/status/shutdown", vm.vmid), NO_FORM)
+                            .await?;
+                        self.wait_task(node, &upid).await?;
+                        audit::record("instance.stop", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                        running = false;
+                    }
+                    _ => {}
+                }
 
-            // **Once per token (PROVIDER-4).** Performed here and echoed back so
-            // Core can clear it — and journalled before it is asked for, so a
-            // lost report or a failed wait is never a second reboot. See
-            // `reboots` for the two states and why an unseen outcome is settled
-            // by the guest's uptime rather than by asking again.
-            let journal = crate::reboots::dir(snippet_dir);
-            let mut rebooted_token = None;
-            match &spec.reboot_token {
-                // Core has stopped asking, so it has what it needed.
-                None => crate::reboots::remove(&journal, &spec.id),
-                Some(token) if running && spec.intent == Lifecycle::Running => {
-                    match crate::reboots::read(&journal, &spec.id).filter(|r| &r.token == token) {
-                        Some(r) if r.done => rebooted_token = Some(token.clone()),
-                        Some(r) => {
-                            if crate::reboots::happened(&r, uptime, crate::reboots::now()) {
-                                crate::reboots::write(&journal, &spec.id, &crate::reboots::Reboot { done: true, ..r })?;
+                // The generated cloud-init, brought up to date so a generator
+                // change reaches a machine that already exists. The drive is
+                // refreshed and nothing more: this is the buyer's machine, and
+                // rebooting it to apply a marketplace change is not ours to
+                // decide. It takes effect at their next boot — including the one
+                // they may ask for on the line below.
+                if spec.intent != Lifecycle::Absent
+                    && let Err(e) = self
+                        .sync_cloud_init(
+                            node,
+                            vm.vmid,
+                            snippet_dir,
+                            &crate::names::snippet_instance(&spec.id),
+                            &cloud_init(spec, self.apt_mirror.as_deref(), vm.vmid),
+                        )
+                        .await
+                {
+                    eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
+                }
+
+                // **Once per token (PROVIDER-4).** Performed here and echoed back so
+                // Core can clear it — and journalled before it is asked for, so a
+                // lost report or a failed wait is never a second reboot. See
+                // `reboots` for the two states and why an unseen outcome is settled
+                // by the guest's uptime rather than by asking again.
+                let journal = crate::reboots::dir(snippet_dir);
+                let mut rebooted_token = None;
+                match &spec.reboot_token {
+                    // Core has stopped asking, so it has what it needed.
+                    None => crate::reboots::remove(&journal, &spec.id),
+                    Some(token) if running && spec.intent == Lifecycle::Running => {
+                        match crate::reboots::read(&journal, &spec.id).filter(|r| &r.token == token) {
+                            Some(r) if r.done => rebooted_token = Some(token.clone()),
+                            Some(r) => {
+                                if crate::reboots::happened(&r, uptime, crate::reboots::now()) {
+                                    crate::reboots::write(&journal, &spec.id, &crate::reboots::Reboot { done: true, ..r })?;
+                                    audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                                    rebooted_token = Some(token.clone());
+                                } else {
+                                    eprintln!(
+                                        "instance {}: reboot {token} was asked for and not seen to happen; not asking again",
+                                        spec.id
+                                    );
+                                }
+                            }
+                            None => {
+                                // No record, no reboot: a request this agent could
+                                // not write down is one it could perform twice.
+                                let asked = crate::reboots::Reboot { token: token.clone(), asked_at: crate::reboots::now(), done: false };
+                                crate::reboots::write(&journal, &spec.id, &asked)?;
+                                let upid: String = self
+                                    .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
+                                    .await?;
+                                self.wait_task(node, &upid).await?;
+                                crate::reboots::write(&journal, &spec.id, &crate::reboots::Reboot { done: true, ..asked })?;
                                 audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
                                 rebooted_token = Some(token.clone());
-                            } else {
-                                eprintln!(
-                                    "instance {}: reboot {token} was asked for and not seen to happen; not asking again",
-                                    spec.id
-                                );
                             }
                         }
-                        None => {
-                            // No record, no reboot: a request this agent could
-                            // not write down is one it could perform twice.
-                            let asked = crate::reboots::Reboot { token: token.clone(), asked_at: crate::reboots::now(), done: false };
-                            crate::reboots::write(&journal, &spec.id, &asked)?;
-                            let upid: String = self
-                                .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
-                                .await?;
-                            self.wait_task(node, &upid).await?;
-                            crate::reboots::write(&journal, &spec.id, &crate::reboots::Reboot { done: true, ..asked })?;
-                            audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
-                            rebooted_token = Some(token.clone());
-                        }
                     }
+                    Some(_) => {}
                 }
-                Some(_) => {}
-            }
 
-            // The guest agent answering (any IPv4) is the liveness signal. But
-            // the buyer-visible address is the *marketplace* one Core assigned,
-            // not whatever the guest reports on its provider-local NIC — that
-            // would leak the provider's network and show the wrong IP. Fall back
-            // to the guest address only when the instance has no project network.
-            let guest_ip = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
-            // **The segment address is the driver's now (protocol 5)**, so it
-            // is derived here rather than read off the spec. Reported only once
-            // the guest agent answers: before that the machine may be anywhere
-            // in its boot and claiming an address it might not hold would be a
-            // belief presented as an observation.
-            let private_ip = spec
-                .network
-                .as_ref()
-                .map(|_| crate::names::segment_address(vm.vmid))
-                .filter(|_| guest_ip.is_some())
-                .or_else(|| guest_ip.clone());
-            return Ok(InstanceStatus {
-                id: spec.id.clone(),
-                rebooted_token,
-                state: match (running, guest_ip.is_some()) {
-                    (true, true) => InstanceState::Running,
-                    (true, false) => InstanceState::Provisioning,
-                    (false, _) => InstanceState::Stopped,
-                },
-                retryable: None,
-                // The protocol asks for this in its own words: *"'Waiting'
-                // without 'for what' is not information."* We were sending
-                // exactly that.
-                //
-                // The two cases below are distinguishable right here and were
-                // being collapsed into one word. On 11 September a machine sat
-                // in `Provisioning` for 9m14s of a 10m budget — booted,
-                // networked, installing the guest agent over apt — and looked
-                // identical to one that had just been asked for. Core has the
-                // column, the console renders it; nothing was putting anything
-                // in it.
-                waiting_on: match (running, guest_ip.is_some()) {
-                    (true, false) => Some("first boot to finish".to_string()),
-                    (false, _) if spec.intent == Lifecycle::Running => {
-                        Some("the machine to start".to_string())
-                    }
-                    _ => None,
-                },
-                local_id: Some(vm.vmid.to_string()),
-                node: Some(node.to_string()),
-                // Kept: an older Core reads only this, and the console still
-                // shows the marketplace address rather than whichever NIC the
-                // host happened to resolve first.
-                private_ip: private_ip.clone(),
-                adapters: self
-                    .observed_adapters(
-                        node,
-                        vm.vmid,
-                        private_ip.as_deref(),
-                        spec.network.as_ref().map(|n| n.mac.as_str()),
-                    )
-                    .await,
-                diagnostics: Some(
-                    self.diagnose(node, vm.vmid, running && guest_ip.is_some(), Some(guest_ip.is_some()))
+                // The guest agent answering (any IPv4) is the liveness signal. But
+                // the buyer-visible address is the *marketplace* one Core assigned,
+                // not whatever the guest reports on its provider-local NIC — that
+                // would leak the provider's network and show the wrong IP. Fall back
+                // to the guest address only when the instance has no project network.
+                let guest_ip = if running { self.guest_ipv4(node, vm.vmid).await } else { None };
+                // **The segment address is the driver's now (protocol 5)**, so it
+                // is derived here rather than read off the spec. Reported only once
+                // the guest agent answers: before that the machine may be anywhere
+                // in its boot and claiming an address it might not hold would be a
+                // belief presented as an observation.
+                let private_ip = spec
+                    .network
+                    .as_ref()
+                    .map(|_| crate::names::segment_address(vm.vmid))
+                    .filter(|_| guest_ip.is_some())
+                    .or_else(|| guest_ip.clone());
+                return Ok(InstanceStatus {
+                    id: spec.id.clone(),
+                    rebooted_token,
+                    state: match (running, guest_ip.is_some()) {
+                        (true, true) => InstanceState::Running,
+                        (true, false) => InstanceState::Provisioning,
+                        (false, _) => InstanceState::Stopped,
+                    },
+                    retryable: None,
+                    // The protocol asks for this in its own words: *"'Waiting'
+                    // without 'for what' is not information."* We were sending
+                    // exactly that.
+                    //
+                    // The two cases below are distinguishable right here and were
+                    // being collapsed into one word. On 11 September a machine sat
+                    // in `Provisioning` for 9m14s of a 10m budget — booted,
+                    // networked, installing the guest agent over apt — and looked
+                    // identical to one that had just been asked for. Core has the
+                    // column, the console renders it; nothing was putting anything
+                    // in it.
+                    waiting_on: match (running, guest_ip.is_some()) {
+                        (true, false) => Some("first boot to finish".to_string()),
+                        (false, _) if spec.intent == Lifecycle::Running => {
+                            Some("the machine to start".to_string())
+                        }
+                        _ => None,
+                    },
+                    local_id: Some(vm.vmid.to_string()),
+                    node: Some(node.to_string()),
+                    // Kept: an older Core reads only this, and the console still
+                    // shows the marketplace address rather than whichever NIC the
+                    // host happened to resolve first.
+                    private_ip: private_ip.clone(),
+                    adapters: self
+                        .observed_adapters(
+                            node,
+                            vm.vmid,
+                            private_ip.as_deref(),
+                            spec.network.as_ref().map(|n| n.mac.as_str()),
+                        )
                         .await,
-                ),
-                message: None,
-                // Only asked for a machine that was given a recipe, and only
-                // while it is up: there is nothing to ask otherwise.
-                recipe_progress: if running && spec.recipe.is_some() {
-                    self.recipe_progress(node, vm.vmid).await
-                } else {
-                    None
-                },
+                    diagnostics: Some(
+                        self.diagnose(node, vm.vmid, running && guest_ip.is_some(), Some(guest_ip.is_some()))
+                            .await,
+                    ),
+                    message: None,
+                    // Only asked for a machine that was given a recipe, and only
+                    // while it is up: there is nothing to ask otherwise.
+                    recipe_progress: if running && spec.recipe.is_some() {
+                        self.recipe_progress(node, vm.vmid).await
+                    } else {
+                        None
+                    },
+                });
+            }
+            .await;
+            return converged.map_err(|e| {
+                anyhow::Error::from(SeenThenFailed {
+                    state: seen,
+                    local_id: seen_vmid.to_string(),
+                    node: seen_node,
+                    cause: format!("{e:#}"),
+                })
             });
         }
 
@@ -1444,6 +1470,37 @@ pub(crate) fn is_legacy_marketplace_tag(tags: &str) -> bool {
     tags.split(&[';', ','][..]).map(str::trim).any(|t| LEGACY.contains(&t))
 }
 
+/// A machine was seen, and a step after the sighting failed (PROVIDER-26).
+/// Carries what was seen, so the report says that rather than ERROR.
+#[derive(Debug)]
+pub struct SeenThenFailed {
+    pub state: InstanceState,
+    pub local_id: String,
+    pub node: String,
+    pub cause: String,
+}
+
+impl std::fmt::Display for SeenThenFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.cause)
+    }
+}
+
+impl std::error::Error for SeenThenFailed {}
+
+/// The machine could not even be looked for (PROVIDER-26). Nothing about it
+/// was observed, so the report says nothing about it rather than ERROR.
+#[derive(Debug)]
+pub struct NotLookedAt(pub String);
+
+impl std::fmt::Display for NotLookedAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not look for this machine: {}", self.0)
+    }
+}
+
+impl std::error::Error for NotLookedAt {}
+
 /// The whole of what maintenance is allowed to do, as one rule.
 ///
 /// While Core is unreachable the desired state in hand is stale, so the only
@@ -1510,6 +1567,48 @@ mod tests {
         let dir = root.join("snippets");
         std::fs::create_dir_all(&dir).unwrap();
         (root, dir.to_string_lossy().into_owned())
+    }
+
+    /// **PROVIDER-26: a failure is not an observation.** A running machine
+    /// whose reboot request fails is reported as *seen running*, with the
+    /// failure as its message — never as the machine being in ERROR. A cluster
+    /// that cannot be listed yields *not looked at*, which the report leaves
+    /// out rather than claiming anything.
+    #[tokio::test]
+    async fn an_agent_failure_is_not_reported_as_the_machines_error() {
+        use crate::pvemock::{task_ok, Mock};
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        sp.reboot_token = Some("t-fails".into());
+        let key = short_tag(&sp.id);
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(ok) = task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 700, "status": "running", "tags": format!("{TAG};{key}")}
+                ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 9000})),
+                ("POST", "/nodes/n1/qemu/700/status/reboot") => (500, serde_json::json!(null)),
+                ("GET", _) => (200, serde_json::json!({})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("seen-then-failed");
+        let e = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect_err("the reboot failed");
+        let seen = e.downcast_ref::<SeenThenFailed>().unwrap_or_else(|| panic!("reported as a plain failure: {e:#}"));
+        assert_eq!(seen.state, InstanceState::Running, "a running machine was reported as something else");
+        assert_eq!((seen.local_id.as_str(), seen.node.as_str()), ("700", "n1"));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let blind = Mock::start(|_, _, _| (503, serde_json::Value::Null)).await;
+        let (root, dir) = snippets("not-looked-at");
+        let e = blind.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect_err("nothing answered");
+        assert!(e.downcast_ref::<NotLookedAt>().is_some(), "a machine nobody could look for was reported: {e:#}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// **PROVIDER-4: one reboot per token.** A running machine with a token

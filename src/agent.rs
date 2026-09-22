@@ -1397,6 +1397,38 @@ async fn reconcile_workers(
                 None => Err(anyhow::anyhow!("image {} is not offered by this provider", spec.image.id)),
             },
         };
+        // **What was seen, what was not, and what failed (PROVIDER-26).**
+        let result = match result {
+            Err(e) if e.downcast_ref::<crate::instance::NotLookedAt>().is_some() => {
+                // Nothing observed, so nothing reported: the item is left out,
+                // and `complete` goes false, which is what stops Core reading
+                // its absence as anything.
+                unobserved_instances += 1;
+                eprintln!("instance {}: {e}", spec.id);
+                continue;
+            }
+            Err(e) => match e.downcast::<crate::instance::SeenThenFailed>() {
+                Ok(seen) => {
+                    eprintln!("instance {}: seen {:?}, then: {}", spec.id, seen.state, seen.cause);
+                    Ok(InstanceStatus {
+                        id: spec.id.clone(),
+                        rebooted_token: None,
+                        state: seen.state,
+                        retryable: Some(true),
+                        waiting_on: None,
+                        local_id: Some(seen.local_id),
+                        node: Some(seen.node),
+                        private_ip: None,
+                        adapters: Vec::new(),
+                        diagnostics: None,
+                        message: Some(seen.cause.chars().take(400).collect()),
+                        recipe_progress: None,
+                    })
+                }
+                Err(e) => Err(e),
+            },
+            ok => ok,
+        };
         instances.push(result.unwrap_or_else(|e| {
             unobserved_instances += 1;
             eprintln!("instance {}: {e}", spec.id);
