@@ -668,8 +668,8 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "omnuv-protocol"
-version = "0.1.13"
-source = "git+https://github.com/rsafehelm/omnuv-protocol?tag=v0.18.0#8b7000b4a66c97605f6c1e46c090b89f68f6a96c"
+version = "0.1.14"
+source = "git+https://github.com/rsafehelm/omnuv-protocol?tag=v0.19.0#1e06d2abee8c1c6d162c33829918574960839d67"
 dependencies = [
  "serde",
 ]

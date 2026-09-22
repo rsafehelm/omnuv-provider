@@ -822,6 +822,7 @@ impl Client {
                     _ => None,
                 },
                 local_id: Some(vm.vmid.to_string()),
+                node: Some(node.to_string()),
                 // Kept: an older Core reads only this, and the console still
                 // shows the marketplace address rather than whichever NIC the
                 // host happened to resolve first.
@@ -857,6 +858,7 @@ impl Client {
                 retryable: None,
                 waiting_on: None,
                 local_id: None,
+                node: None,
                 private_ip: None,
                 adapters: Vec::new(),
                 diagnostics: None,
@@ -1110,6 +1112,7 @@ impl Client {
             retryable: None,
             waiting_on: None,
             local_id: Some(vmid.to_string()),
+            node: Some(node.to_string()),
             private_ip: None,
             adapters: Vec::new(),
             diagnostics: None,

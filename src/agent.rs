@@ -1155,6 +1155,7 @@ async fn reconcile_workers(
                 retryable: None,
                 waiting_on: None,
                 local_id: None,
+                node: None,
                 private_ip: None,
                 adapters: Vec::new(),
                 diagnostics: None,
@@ -1217,6 +1218,7 @@ async fn reconcile_workers(
                     unplaceable.map(|u| u.waiting_on.to_string())
                 },
                 local_id: None,
+                node: None,
                 private_ip: None,
                 adapters: Vec::new(),
                 diagnostics: None,
