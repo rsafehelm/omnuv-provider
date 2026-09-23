@@ -43,7 +43,10 @@ JOIN OPTIONS:
 
 `join` runs on your own machine and dials Omnuv outward. Omnuv never connects to
 you: no inbound rule, no port forward, no SSH access, no public address. The
-Proxmox token it creates is restricted and stays on this host.
+Proxmox token it creates stays on this host. It cannot change the host itself
+(no Sys.Modify, no Permissions.Modify), but its VM privileges are granted on
+the whole cluster, so the agent's own code is what keeps it to the machines
+the marketplace built. Scoping them to the marketplace's pools is queued.
 
 The agent is the real path: it runs on the provider host, keeps runtime
 credentials local, and reports inventory and heartbeats to Core. `discover` is
