@@ -1103,7 +1103,7 @@ impl Client {
         // unanswered status read is not an ending. Only Proxmox's own answer
         // decides: a failed clone is rolled back now; one whose end could not
         // be seen stays recorded, and a later create settles it.
-        match self.task_end(node, &upid, 1800).await {
+        match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs)).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 self.abandon_clone(node, vmid, &spec.id, "instance").await;
@@ -1872,6 +1872,45 @@ mod tests {
         );
         drop(calls);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **PROVIDER-18: a clone waits as long as Core will, and no longer.**
+    /// The clone never finishes; with two seconds of budget left the create
+    /// stops waiting in about two, says the clone has not been seen to
+    /// finish, and leaves it journalled for the next create — it does not
+    /// sit out thirty minutes for a machine Core has given up on.
+    #[tokio::test]
+    async fn a_clone_is_waited_on_for_cores_budget_and_no_longer() {
+        use crate::pvemock::Mock;
+        let mock = Mock::start(move |method, path, _| {
+            if path.contains("UPID%3An1%3Aclone") {
+                return (200, serde_json::json!({"status": "running"}));
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("budget");
+        let mut sp = spec();
+        sp.budget_secs = Some(2);
+        let client = mock.client();
+        let e = tokio::time::timeout(std::time::Duration::from_secs(10), client.ensure_instance("n1", 9000, "local", &dir, &sp))
+            .await
+            .expect("still waiting after ten seconds on a two-second budget")
+            .expect_err("an unfinished clone");
+        assert!(format!("{e:#}").contains("has not been seen to finish"), "{e:#}");
+        let journal = crate::pending::dir(&dir);
+        assert!(std::fs::read_dir(&journal).map(|d| d.count() > 0).unwrap_or(false), "the unfinished clone was not left journalled");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(crate::proxmox::Client::clone_polls(None), 1800);
+        assert_eq!(crate::proxmox::Client::clone_polls(Some(0)), 1, "no budget left still looks once");
+        assert_eq!(crate::proxmox::Client::clone_polls(Some(86_400)), 1800);
     }
 
     /// PROVIDER-1: a clone whose end could not be seen stays recorded, and is

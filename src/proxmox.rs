@@ -533,6 +533,16 @@ impl Client {
     /// wrong for a clone, where "failed" means nothing exists and "could not
     /// ask" means something may. Transient reads are tolerated here; only
     /// `Ended` is an answer.
+    /// How many one-second polls a create may spend on its clone: Core's
+    /// remaining budget when it sent one, never more than thirty minutes and
+    /// never none (PROVIDER-18). The budget was sent and never read, so a
+    /// clone Core had already given up on held the reconcile loop for the full
+    /// thirty. Running out is not failure: the clone stays journalled and the
+    /// next create settles it.
+    pub(crate) fn clone_polls(budget_secs: Option<u64>) -> u32 {
+        budget_secs.map_or(1800, |b| b.clamp(1, 1800) as u32)
+    }
+
     pub(crate) async fn task_end(&self, node: &str, upid: &str, polls: u32) -> TaskEnd {
         let encoded = urlencode(upid);
         let mut misses = 0;

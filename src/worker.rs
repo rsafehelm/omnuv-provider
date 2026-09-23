@@ -514,7 +514,7 @@ impl Client {
             .await?;
         pending.upid = Some(upid.clone());
         crate::pending::write(&journal, &pending)?;
-        match self.task_end(node, &upid, 1800).await {
+        match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs)).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 self.abandon_clone(node, vmid, &spec.id, "worker").await;
