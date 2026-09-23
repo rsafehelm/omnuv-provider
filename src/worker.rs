@@ -390,6 +390,37 @@ impl Client {
                 running = false;
             }
 
+            // **Its first-boot configuration, brought up to date (PROVIDER-31).**
+            // Only the power state was converged, so a catalogue change — the
+            // model's `vllm_args`, its `extra_args` — never reached a worker
+            // that already existed. The snippet is refreshed as a machine's is;
+            // and because a worker is the marketplace's own, a change is applied
+            // by rebooting it: Proxmox derives cloud-init's instance-id from the
+            // user data, so the next boot runs first boot again with the new
+            // arguments. A buyer's machine is never rebooted for this.
+            if spec.intent == Lifecycle::Running {
+                match self
+                    .sync_cloud_init(
+                        node,
+                        vm.vmid,
+                        snippet_dir,
+                        &crate::names::snippet_worker(&spec.id),
+                        &cloud_init(spec, core_url),
+                    )
+                    .await
+                {
+                    Ok(true) if running => {
+                        let upid: String = self
+                            .post_form(&format!("/nodes/{node}/qemu/{}/status/reboot", vm.vmid), NO_FORM)
+                            .await?;
+                        self.wait_task(node, &upid).await?;
+                        crate::audit::record("worker.reconfigure", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("worker {}: cloud-init not refreshed: {e}", spec.id),
+                }
+            }
+
             let endpoint = if running { self.worker_endpoint(node, vm.vmid, spec.port).await } else { None };
             // From inside the machine, through the hypervisor. Adds detail to
             // the state below; never decides it. A machine with no Workload
@@ -1204,5 +1235,76 @@ mod a_dead_reporter_is_not_believed {
         client.workload.forget("w1");
         uptime.store(160, Ordering::SeqCst);
         assert!(read().await.is_some(), "a forgotten worker's history still counted");
+    }
+}
+
+#[cfg(test)]
+mod a_worker_takes_its_new_configuration {
+    //! PROVIDER-31: an existing worker was only started and stopped.
+    use super::{TAG, cloud_init};
+    use crate::names::short_tag;
+    use crate::pvemock::{task_ok, Mock};
+    use omnuv_protocol::{InferenceWorkerSpec, Lifecycle};
+
+    fn spec(args: &[&str]) -> InferenceWorkerSpec {
+        InferenceWorkerSpec {
+            id: "worker_abc".into(),
+            intent: Lifecycle::Running,
+            image: "vllm/vllm-openai:latest".into(),
+            model_repo: "org/model".into(),
+            vllm_args: args.iter().map(|a| a.to_string()).collect(),
+            vcpus: 8,
+            memory_mib: 32768,
+            disk_gib: 120,
+            gpu_local_ids: vec![],
+            gpu_node: None,
+            port: 8000,
+            budget_secs: None,
+        }
+    }
+
+    /// **A catalogue change reaches a running worker, once.** The snippet on
+    /// disk is last week's; the pass rewrites it and reboots the worker to
+    /// apply it. The next pass, with nothing new, reboots nothing. A new
+    /// argument does it again.
+    #[tokio::test]
+    async fn a_changed_configuration_is_written_and_applied_once() {
+        let key = short_tag("worker_abc");
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 801, "status": "running", "tags": format!("{TAG};{key}")}])),
+                ("GET", "/nodes/n1/qemu/801/status/current") => (200, serde_json::json!({"status": "running"})),
+                ("PUT", "/nodes/n1/qemu/801/cloudinit") => (200, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/801/status/reboot") => (200, serde_json::json!("UPID:n1:reboot")),
+                _ => (500, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let root = std::env::temp_dir().join(format!("onv-worker-reconf-{}", std::process::id()));
+        let dir = root.join("snippets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().to_string();
+        let file = dir.join(crate::names::snippet_worker("worker_abc"));
+        std::fs::write(&file, "#cloud-config\n# last week's\n").unwrap();
+        let reboots = |m: &Mock| m.calls.lock().unwrap().iter().filter(|c| c.path.ends_with("/status/reboot")).count();
+        let client = mock.client();
+
+        client.ensure_inference_worker(9000, "local", &d, &spec(&["--model", "org/model"]), "https://core").await.expect("a pass");
+        assert_eq!(reboots(&mock), 1, "a changed configuration was not applied");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), cloud_init(&spec(&["--model", "org/model"]), "https://core"));
+
+        client.ensure_inference_worker(9000, "local", &d, &spec(&["--model", "org/model"]), "https://core").await.expect("a pass");
+        assert_eq!(reboots(&mock), 1, "a worker with nothing new was rebooted");
+
+        client
+            .ensure_inference_worker(9000, "local", &d, &spec(&["--model", "org/model", "--max-model-len", "8192"]), "https://core")
+            .await
+            .expect("a pass");
+        assert_eq!(reboots(&mock), 2, "a new argument never reached the worker");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
