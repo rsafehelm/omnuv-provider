@@ -203,6 +203,16 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         // exactly what the marketplace must never be able to do. Scoped to the
         // pool of machines the marketplace built, never the host.
         ("OnvRecipeStatus", "VM.GuestAgent.FileRead", BUYER_POOL),
+        // Sets a buyer's console password when they reset it (BUYER-18).
+        // `set-user-password` needs `Unrestricted`, which is also `exec`: root
+        // inside the guest. The operator granted it on 23 September 2026, on
+        // the buyer pool only, because the agent could already get the same by
+        // rewriting a machine's cloud-init and rebooting it — Proxmox derives
+        // the instance-id from the user-data, so cloud-init would run it again
+        // as root. What this adds is doing it without a reboot, which is a
+        // difference in visibility, not in power. The agent calls
+        // `set-user-password` and nothing else with it.
+        ("OnvConsolePassword", "VM.GuestAgent.Unrestricted", BUYER_POOL),
     ] {
         step(
             &format!("role {role}"),
@@ -525,7 +535,7 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
     // every vnet and subnet in them (the old `onat0` bridge included).
     step(
         "remove pool and SDN roles",
-        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus; do pveum role delete $r 2>/dev/null || true; done",
+        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus OnvConsolePassword; do pveum role delete $r 2>/dev/null || true; done",
         dry_run,
     )?;
     let vnets = if dry_run {

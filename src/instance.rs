@@ -320,7 +320,9 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     // else: reading a known file needs `VM.GuestAgent.FileRead`, while asking
     // the guest to run `cloud-init status` would need
     // `VM.GuestAgent.Unrestricted` — arbitrary command execution inside a
-    // buyer's machine, which the marketplace must never be able to do.
+    // buyer's machine. The agent holds that on the buyer pool for one call,
+    // `set-user-password` (BUYER-18), and uses it for nothing else: a status
+    // read is never a reason to run something in the buyer's guest.
     let script = format!(
         "set -e\n\
          mkdir -p /etc/onv\n\
@@ -845,9 +847,40 @@ impl Client {
                     .map(|_| crate::names::segment_address(vm.vmid))
                     .filter(|_| guest_ip.is_some())
                     .or_else(|| guest_ip.clone());
+
+                // **The console password, as a destination (BUYER-18).** A newer
+                // generation is set through the guest agent, only once the guest
+                // agent answers, and written down so the next pass does not ask
+                // again. Setting the same hash twice is harmless, so a failure
+                // here is said and retried next pass, and never fails the rest.
+                let passwords = crate::passwords::dir(snippet_dir);
+                let mut password_generation = crate::passwords::applied(&passwords, &spec.id);
+                if let Some(hash) = &spec.console_password_hash
+                    && spec.console_password_generation > password_generation
+                    && guest_ip.is_some()
+                {
+                    match self.set_console_password(node, vm.vmid, &spec.image.default_user, hash).await {
+                        Ok(()) => {
+                            crate::passwords::record(&passwords, &spec.id, spec.console_password_generation)?;
+                            password_generation = spec.console_password_generation;
+                            audit::record(
+                                "instance.console_password",
+                                "core",
+                                &spec.id,
+                                "ok",
+                                Some(&format!("generation {password_generation}")),
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "instance {}: console password generation {} not set yet: {e:#}",
+                            spec.id, spec.console_password_generation
+                        ),
+                    }
+                }
                 return Ok(InstanceStatus {
                     id: spec.id.clone(),
                     rebooted_token,
+                    console_password_generation: spec.console_password_hash.as_ref().map(|_| password_generation),
                     state: match (running, guest_ip.is_some()) {
                         (true, true) => InstanceState::Running,
                         (true, false) => InstanceState::Provisioning,
@@ -920,6 +953,7 @@ impl Client {
                 waiting_on: None,
                 local_id: None,
                 node: None,
+                console_password_generation: None,
                 private_ip: None,
                 adapters: Vec::new(),
                 diagnostics: None,
@@ -1165,6 +1199,20 @@ impl Client {
         }
         crate::pending::remove(&journal, vmid);
         audit::record("instance.create", "core", &spec.id, "ok", Some(&vmid.to_string()));
+        // The first-boot password is the generation this spec carried. Written
+        // down so a reset asked for while the machine was being built is not
+        // taken for one already applied, and best-effort: a lost record reads
+        // as 0 and costs one repeated, harmless set.
+        if spec.console_password_hash.is_some()
+            && spec.console_password_generation > 0
+            && let Err(e) = crate::passwords::record(
+                &crate::passwords::dir(snippet_dir),
+                &spec.id,
+                spec.console_password_generation,
+            )
+        {
+            eprintln!("instance {}: console password generation not written down: {e}", spec.id);
+        }
 
         Ok(InstanceStatus {
             id: spec.id.clone(),
@@ -1174,6 +1222,8 @@ impl Client {
             waiting_on: None,
             local_id: Some(vmid.to_string()),
             node: Some(node.to_string()),
+            // Not until first boot has set it, which the running path reports.
+            console_password_generation: None,
             private_ip: None,
             adapters: Vec::new(),
             diagnostics: None,
@@ -1190,9 +1240,10 @@ impl Client {
     /// itself. Two known paths and nothing else. Reading a known file needs
     /// `VM.GuestAgent.FileRead`; asking the guest to run `cloud-init status`
     /// instead would need `VM.GuestAgent.Unrestricted`, which is arbitrary
-    /// command execution inside a machine the buyer owns. The marketplace must
-    /// never be able to do that, so it does not ask for it — and a second path
-    /// of the same kind does not widen it by anything.
+    /// command execution inside a machine the buyer owns. The agent holds that
+    /// only for `set-user-password` (BUYER-18) and never runs anything in a
+    /// buyer's guest to read it — and a second path of the same kind does not
+    /// widen what is read by anything.
     ///
     /// Best-effort by construction: a guest with no agent, a machine still
     /// installing, or an image that never wrote the file all return None, and
@@ -1422,6 +1473,11 @@ impl Client {
                 eprintln!("instance {id}: cloud-init snippet not removed: {e}");
             }
         }
+        // And the two journals beside them, which nothing else ever removes: a
+        // reboot record lived until Core stopped sending the token, and a
+        // deleted machine's never stops (BUYER-18 found the class).
+        crate::reboots::remove(&crate::reboots::dir(snippet_dir), id);
+        crate::passwords::remove(&crate::passwords::dir(snippet_dir), id);
 
         // **Cluster-wide, for the same reason `ensure_instance` is.** A delete
         // that looks on one node reports a machine on another as already gone —
@@ -1682,6 +1738,95 @@ mod tests {
         let seen = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp2).await.expect("a pass");
         assert_eq!(seen.rebooted_token.as_deref(), Some("t-2"));
         assert_eq!(reboots(&mock), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **BUYER-18: a console password is a destination.** A newer generation is
+    /// set once through the guest agent, as a hash, for the image's user; the
+    /// same generation sent again asks nothing; nothing is asked before the
+    /// guest agent answers; and a machine whose image manages its own password
+    /// reports none rather than a number.
+    #[tokio::test]
+    async fn a_console_password_generation_is_set_once_and_only_when_the_guest_can_take_it() {
+        use crate::pvemock::{task_ok, Mock};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        sp.console_password_generation = 1;
+        sp.console_password_hash = Some("$6$rounds=10000$saltsaltsaltsalt$hashhashhashhash".into());
+        let key = short_tag(&sp.id);
+        let answering = Arc::new(AtomicBool::new(false));
+        let ga = answering.clone();
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(ok) = task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 700, "status": "running", "tags": format!("{TAG};{key}")}
+                ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 60})),
+                ("GET", "/nodes/n1/qemu/700/agent/network-get-interfaces") if ga.load(Ordering::SeqCst) => {
+                    (200, serde_json::json!({"result": [{"name": "eth0", "ip-addresses": [
+                        {"ip-address": "192.0.2.7", "ip-address-type": "ipv4"}]}]}))
+                }
+                ("GET", "/nodes/n1/qemu/700/agent/network-get-interfaces") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/700/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/700") => (200, serde_json::json!("UPID:n1:del")),
+                ("GET", _) => (200, serde_json::json!({})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let sets = |m: &Mock| {
+            m.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.method == "POST" && c.path.ends_with("/agent/set-user-password"))
+                .map(|c| c.body.clone())
+                .collect::<Vec<_>>()
+        };
+        let (root, dir) = snippets("console-password");
+
+        // The guest agent is not up yet: nothing asked, first boot's reported.
+        let early = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+        assert!(sets(&mock).is_empty(), "a password was sent to a guest that could not take it");
+        assert_eq!(early.console_password_generation, Some(0));
+
+        // It answers: set once, as a hash, for the image's user.
+        answering.store(true, Ordering::SeqCst);
+        let first = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+        assert_eq!(first.console_password_generation, Some(1));
+        let bodies = sets(&mock);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("crypted=1"), "sent as plaintext: {}", bodies[0]);
+        assert!(bodies[0].contains(&format!("username={}", sp.image.default_user)), "{}", bodies[0]);
+
+        // The thousandth identical send changes nothing.
+        let again = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+        assert_eq!(again.console_password_generation, Some(1));
+        assert_eq!(sets(&mock).len(), 1, "the same generation was set twice");
+
+        // A newer one is set.
+        sp.console_password_generation = 2;
+        mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+        assert_eq!(sets(&mock).len(), 2);
+
+        // Deleted: the record goes with the machine.
+        let journal = crate::passwords::dir(&dir);
+        assert_eq!(crate::passwords::applied(&journal, &sp.id), 2);
+        mock.client().delete_instance("n1", &sp.id, &dir).await.expect("the delete");
+        assert_eq!(crate::passwords::applied(&journal, &sp.id), 0, "a deleted machine's record was left behind");
+
+        // An image that manages its own password: no number, and no call.
+        let mut own = sp.clone();
+        own.console_password_hash = None;
+        let none = mock.client().ensure_instance("n1", 9000, "local", &dir, &own).await.expect("a pass");
+        assert_eq!(none.console_password_generation, None);
+        assert_eq!(sets(&mock).len(), 2);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2112,6 +2257,7 @@ mod tests {
             disk_gib: 40,
             ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
             console_password_hash: Some("$6$rounds=10000$saltsaltsaltsalt$hashhashhashhash".into()),
+            console_password_generation: 0,
             gpu_local_ids: vec![],
             gpu_node: None,
             reboot_token: None,

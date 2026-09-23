@@ -429,6 +429,20 @@ impl Client {
         self.send_form(reqwest::Method::PUT, path, form).await
     }
 
+    /// Sets a user's password inside a running guest from its crypt(3) hash,
+    /// through qemu-guest-agent. Needs `VM.GuestAgent.Unrestricted`, which
+    /// `deploy-agent.yml` grants on the buyer pool only (verified at source:
+    /// `PVE::API2::Qemu::Agent`, `set-user-password`, PVE 9.2). The hash is
+    /// the only thing sent and it is never logged.
+    pub(crate) async fn set_console_password(&self, node: &str, vmid: u32, user: &str, hash: &str) -> anyhow::Result<()> {
+        self.post_form::<Option<serde_json::Value>>(
+            &format!("/nodes/{node}/qemu/{vmid}/agent/set-user-password"),
+            &[("username", user.to_string()), ("password", hash.to_string()), ("crypted", "1".to_string())],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Brings a VM's cloud-init drive up to date with its snippet on disk.
     ///
     /// The snippet is read when the drive is regenerated, not when the file
