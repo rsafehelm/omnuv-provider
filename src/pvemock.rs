@@ -30,7 +30,26 @@ pub struct Mock {
 impl Mock {
     /// `route(method, path, body)` answers every call. Task status for any
     /// UPID is answered as finished and OK unless the route says otherwise.
+    ///
+    /// Two facts every create asks (PROVIDER-30) are answered here, before
+    /// the route: the agent runs on `n1`, and its snippet storage is shared,
+    /// so a test about placement is not also a test about first-boot files.
+    /// A test about those uses `start_raw`.
     pub async fn start(route: impl Fn(&str, &str, &str) -> (u16, serde_json::Value) + Send + Sync + 'static) -> Mock {
+        Self::start_raw(move |method, path, body| {
+            if method == "GET" && path == "/cluster/status" {
+                return (200, serde_json::json!([{"type": "node", "name": "n1", "local": 1, "online": 1}]));
+            }
+            if method == "GET" && path.starts_with("/nodes/") && path.ends_with("/storage/onv-snippets/status") {
+                return (200, serde_json::json!({"shared": 1, "type": "dir", "active": 1}));
+            }
+            route(method, path, body)
+        })
+        .await
+    }
+
+    /// `start` without the two answers it supplies.
+    pub async fn start_raw(route: impl Fn(&str, &str, &str) -> (u16, serde_json::Value) + Send + Sync + 'static) -> Mock {
         let route: Arc<Route> = Arc::new(route);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));

@@ -1007,7 +1007,7 @@ impl Client {
         // and anything that places in between makes that false.
         let _allocating = self.alloc.clone().lock_owned().await;
 
-        let candidates = self.placement_nodes().await?;
+        let candidates = self.create_nodes().await?;
         let mut refused: Vec<String> = Vec::new();
         let mut chosen: Option<String> = None;
         for candidate in &candidates {

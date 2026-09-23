@@ -130,6 +130,10 @@ pub(crate) struct PciClaims {
     pub(crate) complete: bool,
 }
 
+/// Where the agent writes machines' cloud-init. Created by `deploy-agent.yml`
+/// and `join` as a `dir` storage at `/var/lib/onv`.
+pub(crate) const SNIPPET_STORAGE: &str = "onv-snippets";
+
 pub struct Client {
     http: reqwest::Client,
     /// The pinned TLS configuration, shared with the console websocket.
@@ -722,6 +726,44 @@ impl Client {
             self.node.as_deref().map(|n| format!(" (restricted to {n})")).unwrap_or_default()
         );
         Ok(nodes)
+    }
+
+    /// The nodes a new machine may be built on: the placement nodes, and
+    /// **only this agent's own node while first-boot files cannot reach the
+    /// others (PROVIDER-30).** The agent writes a machine's cloud-init into
+    /// `onv-snippets` on the host it runs on; a `dir` storage that is not
+    /// shared exists only there, so a machine built on another node referred
+    /// to files that node does not have — and Proxmox's API cannot upload a
+    /// snippet to it. Both facts are asked of the API: whether the storage is
+    /// shared, and which node answered (`/cluster/status` marks it `local`).
+    /// Either unreadable refuses rather than guesses.
+    pub(crate) async fn create_nodes(&self) -> anyhow::Result<Vec<String>> {
+        let nodes = self.placement_nodes().await?;
+        let status: Vec<serde_json::Value> = self
+            .get("/cluster/status")
+            .await
+            .map_err(|e| anyhow::anyhow!("which node this agent runs on could not be read: {e}"))?;
+        let local = status
+            .iter()
+            .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("node")
+                && e.get("local").and_then(|v| v.as_u64()) == Some(1))
+            .and_then(|e| e.get("name").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("the cluster status names no local node"))?;
+        let storage: serde_json::Value = self
+            .get(&format!("/nodes/{local}/storage/{SNIPPET_STORAGE}/status"))
+            .await
+            .map_err(|e| anyhow::anyhow!("whether {SNIPPET_STORAGE} is shared could not be read: {e}"))?;
+        if storage.get("shared").and_then(|v| v.as_u64()) == Some(1) {
+            return Ok(nodes);
+        }
+        let here: Vec<String> = nodes.into_iter().filter(|n| *n == local).collect();
+        anyhow::ensure!(
+            !here.is_empty(),
+            "this agent runs on {local}, which is not a placement node, and {SNIPPET_STORAGE} is not shared, \
+             so no node can be given a machine's first-boot files"
+        );
+        Ok(here)
     }
 
     /// Every guest on every placement node, with its tags — what the CORE-38
@@ -1563,5 +1605,47 @@ mod a_refreshed_snippet_is_private {
         assert!(mock.client().sync_cloud_init("n1", 700, &d, "wide.yaml", "#cloud-config\nb: 2\n").await.unwrap());
         assert_eq!(mode("wide.yaml"), 0o600, "a wider snippet was rewritten and left wide");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod first_boot_files_reach_the_node {
+    use crate::pvemock::Mock;
+
+    fn cluster(local: &'static str, shared: Option<u64>) -> impl Fn(&str, &str, &str) -> (u16, serde_json::Value) + Send + Sync + 'static {
+        move |_, path, _| match path {
+            "/nodes" => (200, serde_json::json!([
+                {"node": "n1", "status": "online"}, {"node": "n2", "status": "online"}])),
+            "/cluster/status" => (200, serde_json::json!([
+                {"type": "cluster", "name": "c"},
+                {"type": "node", "name": "n1", "local": u64::from(local == "n1")},
+                {"type": "node", "name": "n2", "local": u64::from(local == "n2")},
+                {"type": "node", "name": "n3", "local": u64::from(local == "n3")}])),
+            p if p.ends_with("/storage/onv-snippets/status") => match shared {
+                Some(s) => (200, serde_json::json!({"shared": s})),
+                None => (500, serde_json::Value::Null),
+            },
+            _ => (404, serde_json::Value::Null),
+        }
+    }
+
+    /// **PROVIDER-30.** Unshared snippets: only the node this agent runs on,
+    /// even when it is not first by name. Shared: every node. And each
+    /// question that cannot be answered refuses rather than guesses.
+    #[tokio::test]
+    async fn a_machine_is_built_only_where_its_first_boot_files_are() {
+        let only_here = Mock::start_raw(cluster("n2", Some(0))).await;
+        assert_eq!(only_here.client().create_nodes().await.unwrap(), ["n2"], "built where its snippet is not");
+
+        let everywhere = Mock::start_raw(cluster("n1", Some(1))).await;
+        assert_eq!(everywhere.client().create_nodes().await.unwrap(), ["n1", "n2"]);
+
+        let unknown = Mock::start_raw(cluster("n1", None)).await;
+        let e = unknown.client().create_nodes().await.expect_err("an unread storage was taken as shared");
+        assert!(format!("{e:#}").contains("could not be read"), "{e:#}");
+
+        let elsewhere = Mock::start_raw(cluster("n3", Some(0))).await;
+        let e = elsewhere.client().create_nodes().await.expect_err("placed on a node the agent does not run on");
+        assert!(format!("{e:#}").contains("not a placement node"), "{e:#}");
     }
 }

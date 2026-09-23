@@ -444,7 +444,7 @@ impl Client {
         // same walk as `ensure_instance`, because this path attaches a card and
         // had neither. Held from the feasibility check until the machine exists.
         let _allocating = self.alloc.clone().lock_owned().await;
-        let candidates = self.placement_nodes().await?;
+        let candidates = self.create_nodes().await?;
         let mut refused: Vec<String> = Vec::new();
         let mut chosen: Option<String> = None;
         for candidate in &candidates {
