@@ -478,7 +478,12 @@ impl Client {
         if std::fs::read_to_string(&path).is_ok_and(|current| current == desired) {
             return Ok(false);
         }
-        std::fs::write(&path, desired).map_err(|e| anyhow::anyhow!("writing {path}: {e}"))?;
+        // **0600, like every other snippet writer (PROVIDER-21).** This was
+        // the one plain `fs::write`, so a snippet recreated here got the
+        // process umask — 0644 — while it carries the machine's overlay setup
+        // key and console password hash.
+        crate::names::write_private(&path, desired.as_bytes(), 0o600)
+            .map_err(|e| anyhow::anyhow!("writing {path}: {e}"))?;
         self.regenerate_cloudinit(node, vmid).await?;
         Ok(true)
     }
@@ -1530,5 +1535,33 @@ mod home_node_tests {
         assert!(mock.called("GET", "/nodes/pve-b/qemu/701/status/current"));
         let calls = mock.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.path.starts_with("/nodes//")), "an empty node name reached a path: {calls:?}");
+    }
+}
+
+#[cfg(test)]
+mod a_refreshed_snippet_is_private {
+    /// **PROVIDER-21.** A snippet recreated by the refresh is 0600, and one
+    /// left wider by an earlier version is tightened on its next rewrite.
+    #[tokio::test]
+    async fn the_refresh_writes_0600_and_tightens_a_wider_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mock = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
+            ("PUT", "/nodes/n1/qemu/700/cloudinit") => (200, serde_json::Value::Null),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("onv-snippet-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().to_string();
+        let mode = |f: &str| std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
+
+        assert!(mock.client().sync_cloud_init("n1", 700, &d, "fresh.yaml", "#cloud-config\na: 1\n").await.unwrap());
+        assert_eq!(mode("fresh.yaml"), 0o600, "a recreated snippet is readable by others");
+
+        std::fs::write(dir.join("wide.yaml"), "old").unwrap();
+        std::fs::set_permissions(dir.join("wide.yaml"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(mock.client().sync_cloud_init("n1", 700, &d, "wide.yaml", "#cloud-config\nb: 2\n").await.unwrap());
+        assert_eq!(mode("wide.yaml"), 0o600, "a wider snippet was rewritten and left wide");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -41,6 +41,12 @@ ReadWritePaths=/var/lib/onv /var/log/onv
 #
 # The bootstrap owns the path; this only needs to be allowed to write to it.
 StateDirectory=onv
+# Nothing the agent creates is readable by other users (PROVIDER-21):
+# snippets carry setup keys and password hashes, and are written 0600
+# explicitly; this is the default for anything that is not. Group-readable
+# on purpose, because /var/log/onv is onv:adm so an operator can read the
+# audit log without being root.
+UMask=0027
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
