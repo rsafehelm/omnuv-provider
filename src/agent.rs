@@ -418,29 +418,64 @@ async fn startup_checks(
     driver: &Arc<crate::proxmox::Client>,
     core: &Core,
 ) -> Vec<String> {
-    let mut out = Vec::new();
-
-    // The runtime this agent exists to drive.
-    out.push(match driver.get_json::<serde_json::Value>("/version").await {
-        Ok(v) => format!(
-            "selfcheck: proxmox api reachable (pve {})",
-            v.get("version").and_then(|x| x.as_str()).unwrap_or("?")
-        ),
-        Err(e) => format!("SELFCHECK FAILED: proxmox api unreachable: {e}"),
-    });
-
+    let mut out: Vec<String> = runtime_checks(cfg, driver).await.iter().map(check_line).collect();
     // Core, over TLS. Not the overlay — by design nothing here may depend on
     // it, and this check exists partly to keep that honest.
-    out.push(core_check(core, &cfg.core.url).await);
-
-    // Plaintext to Core is never a shortcut that survives into a deployment.
-    if cfg.core.url.starts_with("http://") {
-        out.push(format!(
-            "SELFCHECK FAILED: core url {} is plaintext; every control-plane hop must be TLS",
-            cfg.core.url
-        ));
-    }
+    out.insert(1, core_check(core, &cfg.core.url).await);
     out
+}
+
+/// **What this agent can say about its own footing, on every report
+/// (PROVIDER-24).** These were printed at start and never sent: every report
+/// carried the survey's checks and nothing about whether the runtime answered
+/// or Core was spoken to in plaintext. They are re-run each pass rather than
+/// sent once, because Core expires a check nobody refreshes, and a runtime
+/// that was down at start and is up now must stop saying so. Core being
+/// reachable needs no check here: a report that arrives is that.
+async fn runtime_checks(cfg: &AgentConfig, driver: &crate::proxmox::Client) -> Vec<omnuv_protocol::SelfCheck> {
+    use omnuv_protocol::{CheckKind, CheckResult, SelfCheck};
+    let runtime = match driver.get_json::<serde_json::Value>("/version").await {
+        Ok(v) => SelfCheck {
+            name: "runtime.api".into(),
+            kind: CheckKind::Connectivity,
+            result: CheckResult::Pass,
+            detail: Some(format!(
+                "proxmox api reachable (pve {})",
+                v.get("version").and_then(|x| x.as_str()).unwrap_or("?")
+            )),
+            subject: None,
+        },
+        Err(e) => SelfCheck {
+            name: "runtime.api".into(),
+            kind: CheckKind::Connectivity,
+            result: CheckResult::Fail,
+            detail: Some(format!("proxmox api unreachable: {e}")),
+            subject: None,
+        },
+    };
+    // Plaintext to Core is never a shortcut that survives into a deployment.
+    let plaintext = cfg.core.url.starts_with("http://");
+    let tls = SelfCheck {
+        name: "core.tls".into(),
+        kind: CheckKind::Presence,
+        result: if plaintext { CheckResult::Fail } else { CheckResult::Pass },
+        detail: Some(if plaintext {
+            format!("core url {} is plaintext; every control-plane hop must be TLS", cfg.core.url)
+        } else {
+            format!("core url {} is TLS", cfg.core.url)
+        }),
+        subject: None,
+    };
+    vec![runtime, tls]
+}
+
+/// A check as the start-up log prints it.
+fn check_line(c: &omnuv_protocol::SelfCheck) -> String {
+    let detail = c.detail.as_deref().unwrap_or("");
+    match c.result {
+        omnuv_protocol::CheckResult::Pass => format!("selfcheck: {detail}"),
+        _ => format!("SELFCHECK FAILED: {detail}"),
+    }
 }
 
 /// **Whether Core accepts this agent, not merely whether something answers
@@ -498,8 +533,10 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     //
     // An agent that starts, finds its runtime unreachable, and simply retries
     // is an agent whose first useful signal is a buyer's endpoint failing an
-    // hour later. These print at start and are reported on the first pass, so a
-    // misconfiguration is visible where it happened.
+    // hour later. These print at start, and the ones that can change are
+    // re-run and reported on every pass (see `runtime_checks`), so a
+    // misconfiguration is visible where it happened and stops being said
+    // once it is fixed.
     for line in startup_checks(&cfg, &driver, &core).await {
         println!("{line}");
     }
@@ -822,6 +859,37 @@ mod handshake_tests {
         async fn inventory(&self, _: &DesiredState) -> anyhow::Result<omnuv_protocol::InventoryReport> {
             anyhow::bail!("heartbeat must not wait for runtime inventory")
         }
+    }
+
+    /// **PROVIDER-24: the checks a report carries.** The runtime answering
+    /// and not answering, and a Core URL in plaintext and not: each is a
+    /// named check with its result, so Core can show it and see it change.
+    #[tokio::test]
+    async fn every_report_says_whether_the_runtime_answers_and_core_is_tls() {
+        use omnuv_protocol::CheckResult;
+        let config = |url: &str| -> crate::config::AgentConfig {
+            serde_yaml_ng::from_str(&format!(
+                "core:\n  url: {url}\n  token: t\nproxmox:\n  apiUrl: https://127.0.0.1:8006\n  tokenId: onv@pve!agent\n  tokenSecret: s\n"
+            ))
+            .expect("config")
+        };
+        let up = crate::pvemock::Mock::start(|_, path, _| match path {
+            "/version" => (200, serde_json::json!({"version": "9.2.20"})),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let down = crate::pvemock::Mock::start(|_, _, _| (500, serde_json::Value::Null)).await;
+        let find = |checks: &[omnuv_protocol::SelfCheck], name: &str| {
+            checks.iter().find(|c| c.name == name).map(|c| c.result).unwrap_or_else(|| panic!("no {name} in {checks:?}"))
+        };
+
+        let good = runtime_checks(&config("https://api.test.omnuv.com"), &up.client()).await;
+        assert_eq!(find(&good, "runtime.api"), CheckResult::Pass);
+        assert_eq!(find(&good, "core.tls"), CheckResult::Pass);
+
+        let bad = runtime_checks(&config("http://api.test.omnuv.com"), &down.client()).await;
+        assert_eq!(find(&bad, "runtime.api"), CheckResult::Fail, "an unreachable runtime was reported as working");
+        assert_eq!(find(&bad, "core.tls"), CheckResult::Fail, "a plaintext Core url passed");
     }
 
     /// **PROVIDER-12: the self-check is Core accepting this token.** A 204
@@ -1285,7 +1353,8 @@ async fn reconcile_workers(
     // under our claim and says which of those Core did not ask about. It
     // reports and decides nothing — see `survey`.
     let surveyed = driver.guests().await.map_err(|e| e.to_string());
-    let checks: Vec<omnuv_protocol::SelfCheck> = crate::survey::checks(surveyed.as_deref().map_err(|e| e.clone()), &desired);
+    let mut checks: Vec<omnuv_protocol::SelfCheck> = crate::survey::checks(surveyed.as_deref().map_err(|e| e.clone()), &desired);
+    checks.extend(runtime_checks(cfg, driver).await);
     for c in checks.iter().filter(|c| c.name == "guest.unclaimed") {
         eprintln!("  warning: {}", c.detail.as_deref().unwrap_or("a claimed guest Core did not ask about"));
     }
