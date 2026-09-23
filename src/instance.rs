@@ -962,6 +962,37 @@ impl Client {
             });
         }
 
+        // **A machine that was built is not built again.** Core marks a
+        // machine `built` once it has seen it exist; not finding it now means
+        // it was removed out of band or lost with its disk. Cloning again from
+        // the image put a blank machine where the buyer's was and said nothing
+        // — the operator's decision of 23 September 2026 is to report it lost
+        // and let the buyer choose. The miss is already confirmed live, not
+        // read off a stale listing (PROVIDER-5). One-shot: retrying cannot
+        // bring a disk back.
+        if spec.built {
+            audit::record("instance.lost", "agent", &spec.id, "error", Some("no machine found for one that was built"));
+            return Ok(InstanceStatus {
+                id: spec.id.clone(),
+                rebooted_token: None,
+                state: InstanceState::Error,
+                retryable: Some(false),
+                waiting_on: None,
+                local_id: None,
+                node: None,
+                console_password_generation: None,
+                private_ip: None,
+                adapters: Vec::new(),
+                diagnostics: None,
+                message: Some(
+                    "this machine is no longer on its provider and was not rebuilt, since a rebuild would be a blank disk; \
+                     delete it, and create a new one if you want one"
+                        .into(),
+                ),
+                recipe_progress: None,
+            });
+        }
+
         // **A card that is not free is refused before anything is built, and
         // every node is asked.**
         //
@@ -1939,6 +1970,49 @@ mod tests {
         assert!(mock.called("POST", "/nodes/n2/qemu/702/status/start"));
     }
 
+    /// **A machine that was built is not built again.** No VM carries its
+    /// tag. Marked built by Core, it is reported lost — an error that will
+    /// not go away by retrying — and nothing is cloned. Not marked built, the
+    /// same spec is created, as it always was.
+    #[tokio::test]
+    async fn a_built_machine_that_vanished_is_reported_lost_and_not_cloned() {
+        use crate::pvemock::{task_ok, Mock};
+        for built in [true, false] {
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                    ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                    ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                    ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                    ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                    ("POST", p) if p.ends_with("/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                    ("GET", _) => (200, serde_json::json!([])),
+                    _ => (200, serde_json::Value::Null),
+                }
+            })
+            .await;
+            let (root, dir) = snippets("vanished");
+            let mut sp = spec();
+            sp.network = None;
+            sp.intent = Lifecycle::Running;
+            sp.built = built;
+            let status = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+            let cloned = mock.calls.lock().unwrap().iter().any(|c| c.path.ends_with("/clone"));
+            if built {
+                assert!(!cloned, "a machine that was built was cloned again, blank");
+                assert_eq!(status.state, InstanceState::Error);
+                assert_eq!(status.retryable, Some(false), "a lost machine was offered as worth retrying");
+                assert!(status.message.as_deref().unwrap_or("").contains("no longer on its provider"));
+            } else {
+                assert!(cloned, "a machine never built was not built");
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
     /// **PROVIDER-27: a machine meant to be stopped is built stopped.** The
     /// create runs to the end for both destinations; only Running starts it,
     /// and Stopped is reported as what it is.
@@ -2405,6 +2479,7 @@ mod tests {
             ssh_keys: vec!["ssh-ed25519 AAAA test".into()],
             console_password_hash: Some("$6$rounds=10000$saltsaltsaltsalt$hashhashhashhash".into()),
             console_password_generation: 0,
+            built: false,
             gpu_local_ids: vec![],
             gpu_node: None,
             reboot_token: None,
