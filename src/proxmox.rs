@@ -171,6 +171,9 @@ pub struct Client {
     /// a provider, which is the intended cost — a provider builds machines one
     /// at a time and the alternative is selling hardware twice.
     pub(crate) alloc: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// What each worker's Workload Agent last reported, held across passes so
+    /// a reporter that has stopped advancing is noticed (PROVIDER-15).
+    pub(crate) workload: crate::workload::Store,
     /// Whether this provider has opted in to disclosing what its host has
     /// already given its own guests. See `config::ProxmoxRuntime::showall`.
     showall: bool,
@@ -371,6 +374,7 @@ impl Client {
             apt_mirror,
             environment: None,
             alloc: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            workload: crate::workload::Store::new(),
             showall,
             images: Default::default(),
         })

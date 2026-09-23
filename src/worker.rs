@@ -624,6 +624,8 @@ impl Client {
                 eprintln!("worker {worker_id}: cloud-init snippet not removed: {e}");
             }
         }
+        // And what its Workload Agent last said, which is keyed by the same id.
+        self.workload.forget(worker_id);
 
         let Some((node, vm)) = self.find_tagged_vm_anywhere(TAG, &short_tag(worker_id)).await? else {
             return Ok(());
@@ -662,7 +664,12 @@ impl Client {
             ))
             .await
             .ok()?;
-        crate::workload::parse_report(&read.content)
+        // **Believed only while it moves (PROVIDER-15).** A Workload Agent
+        // that died leaves a well-formed file behind, and it was reported as
+        // current on every pass — Core stamped it seen *now*, and frozen
+        // numbers read as a healthy idle worker. The store drops a report
+        // whose uptime has stopped advancing, so it arrives as unknown.
+        self.workload.observe(crate::workload::parse_report(&read.content)?)
     }
 
     /// True when the worker's OpenAI-compatible server answers. Deliberately
@@ -1156,5 +1163,46 @@ mod a_worker_is_claimed_before_it_can_fail {
         drop(calls);
         assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod a_dead_reporter_is_not_believed {
+    //! PROVIDER-15: the staleness store existed, tested, and was never asked.
+    use crate::pvemock::Mock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// **Through the read the agent actually makes.** The same file, four
+    /// times: believed until its uptime has not moved for three reads, then
+    /// reported as unknown. It moves again and is believed again. And a
+    /// deleted worker's history goes with it.
+    #[tokio::test]
+    async fn a_report_whose_uptime_stopped_arrives_as_unknown() {
+        let uptime = Arc::new(AtomicU64::new(100));
+        let up = uptime.clone();
+        let mock = Mock::start(move |_, path, _| {
+            if path.starts_with("/nodes/n1/qemu/700/agent/file-read") {
+                let report = serde_json::json!({
+                    "workload_id": "w1", "uptime_s": up.load(Ordering::SeqCst), "health": "serving",
+                    "model": null, "gpus": [], "serving": null, "observed": []
+                });
+                return (200, serde_json::json!({ "content": report.to_string() }));
+            }
+            (404, serde_json::Value::Null)
+        })
+        .await;
+        let client = mock.client();
+        let read = || client.workload_telemetry("n1", 700);
+        assert!(read().await.is_some(), "the first report was not believed");
+        assert!(read().await.is_some());
+        assert!(read().await.is_some());
+        assert!(read().await.is_none(), "a report whose uptime stopped was still believed");
+        uptime.store(160, Ordering::SeqCst);
+        assert!(read().await.is_some(), "a reporter that moved again was not believed");
+
+        client.workload.forget("w1");
+        uptime.store(160, Ordering::SeqCst);
+        assert!(read().await.is_some(), "a forgotten worker's history still counted");
     }
 }
