@@ -431,13 +431,7 @@ async fn startup_checks(
 
     // Core, over TLS. Not the overlay — by design nothing here may depend on
     // it, and this check exists partly to keep that honest.
-    out.push(match core.post("/provider/v1/ping", None).await {
-        Ok(r) if r.status().as_u16() < 500 => {
-            format!("selfcheck: core reachable over tls at {}", cfg.core.url)
-        }
-        Ok(r) => format!("SELFCHECK FAILED: core answered {} at {}", r.status(), cfg.core.url),
-        Err(e) => format!("SELFCHECK FAILED: core unreachable at {}: {e}", cfg.core.url),
-    });
+    out.push(core_check(core, &cfg.core.url).await);
 
     // Plaintext to Core is never a shortcut that survives into a deployment.
     if cfg.core.url.starts_with("http://") {
@@ -447,6 +441,24 @@ async fn startup_checks(
         ));
     }
     out
+}
+
+/// **Whether Core accepts this agent, not merely whether something answers
+/// (PROVIDER-12).** This asked `/provider/v1/ping`, a route Core does not
+/// have, and passed anything under 500 — so Core's 404, which comes before
+/// any token is read, passed with a revoked token, and so did any HTTPS
+/// server at all. The heartbeat is the smallest call Core authenticates: a
+/// 2xx is Core accepting this token, a 401 or 403 is Core refusing it, and
+/// anything else is not an answer from Core about this agent.
+async fn core_check(core: &Core, url: &str) -> String {
+    match core.post("/provider/v1/heartbeat", None).await {
+        Ok(r) if r.status().is_success() => format!("selfcheck: core reachable over tls at {url}, and accepts this agent"),
+        Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
+            format!("SELFCHECK FAILED: core at {url} refused this agent's token ({})", r.status())
+        }
+        Ok(r) => format!("SELFCHECK FAILED: {url} answered {} to an authenticated heartbeat", r.status()),
+        Err(e) => format!("SELFCHECK FAILED: core unreachable at {url}: {e}"),
+    }
 }
 
 pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
@@ -809,6 +821,46 @@ mod handshake_tests {
 
         async fn inventory(&self, _: &DesiredState) -> anyhow::Result<omnuv_protocol::InventoryReport> {
             anyhow::bail!("heartbeat must not wait for runtime inventory")
+        }
+    }
+
+    /// **PROVIDER-12: the self-check is Core accepting this token.** A 204
+    /// passes; a 401 says the token was refused; a 404 — a server that does
+    /// not know the route, which is what every answer to the old ping was —
+    /// fails. And the request is the authenticated heartbeat.
+    #[tokio::test]
+    async fn the_self_check_passes_only_when_core_accepts_the_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (status, verdict) in [
+            ("204 No Content", "accepts this agent"),
+            ("401 Unauthorized", "refused this agent's token"),
+            ("404 Not Found", "SELFCHECK FAILED"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8_lossy(&request).into_owned()
+            });
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into() };
+            let said = core_check(&core, &base).await;
+            let request = server.await.unwrap();
+            assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
+            assert!(request.to_lowercase().contains("authorization: bearer fixture"), "the check sent no token");
+            assert!(said.contains(verdict), "{status}: {said}");
+            if status.starts_with("404") {
+                assert!(!said.contains("reachable"), "a server without the route passed: {said}");
+            }
         }
     }
 
