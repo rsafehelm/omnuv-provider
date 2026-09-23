@@ -1186,9 +1186,15 @@ impl Client {
             )
             .await?;
 
-            let upid: String =
-                self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
-            self.wait_task(node, &upid).await?;
+            // **Started only if it is meant to be running (PROVIDER-27).** A
+            // machine whose destination is Stopped was built and then started —
+            // its card attached, its first boot run — and shut down on the
+            // next pass. Stopped is a machine that exists and is not running.
+            if spec.intent == Lifecycle::Running {
+                let upid: String =
+                    self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
+                self.wait_task(node, &upid).await?;
+            }
             Ok(())
         }
         .await;
@@ -1217,7 +1223,7 @@ impl Client {
         Ok(InstanceStatus {
             id: spec.id.clone(),
             rebooted_token: None,
-            state: InstanceState::Provisioning,
+            state: if spec.intent == Lifecycle::Running { InstanceState::Provisioning } else { InstanceState::Stopped },
             retryable: None,
             waiting_on: None,
             local_id: Some(vmid.to_string()),
@@ -1872,6 +1878,49 @@ mod tests {
         );
         drop(calls);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **PROVIDER-27: a machine meant to be stopped is built stopped.** The
+    /// create runs to the end for both destinations; only Running starts it,
+    /// and Stopped is reported as what it is.
+    #[tokio::test]
+    async fn a_machine_meant_to_be_stopped_is_built_and_not_started() {
+        use crate::pvemock::{task_ok, Mock};
+        for intent in [Lifecycle::Stopped, Lifecycle::Running] {
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                    ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                    ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                    ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                    ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                    ("POST", p) if p.ends_with("/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                    ("GET", _) => (200, serde_json::json!([])),
+                    _ => (200, serde_json::Value::Null),
+                }
+            })
+            .await;
+            let (root, dir) = snippets("built-stopped");
+            let mut sp = spec();
+            sp.network = None;
+            sp.intent = intent;
+            let status = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("the create");
+            let started = mock.calls.lock().unwrap().iter().any(|c| c.method == "POST" && c.path.ends_with("/status/start"));
+            match intent {
+                Lifecycle::Stopped => {
+                    assert!(!started, "a machine meant to be stopped was started");
+                    assert_eq!(status.state, InstanceState::Stopped);
+                }
+                _ => {
+                    assert!(started, "a machine meant to run was not started");
+                    assert_eq!(status.state, InstanceState::Provisioning);
+                }
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// **PROVIDER-18: a clone waits as long as Core will, and no longer.**
