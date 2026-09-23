@@ -26,6 +26,22 @@ use crate::console::{ConsoleInput, ConsoleOpener};
 /// knows where that is.
 pub type ResolveWorker = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// Records a request's task so a Cancel can end it, and forgets every task
+/// that has already finished (PROVIDER-14). The map was cleaned only on Cancel,
+/// and Core sends Cancel only for what it abandons, so every completed request
+/// stayed for the life of the tunnel. Pruning here rather than having a task
+/// remove itself: a task can finish before it is inserted, and would then be
+/// left behind for good.
+async fn track(
+    inflight: &Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    key: String,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut map = inflight.lock().await;
+    map.retain(|_, h| !h.is_finished());
+    map.insert(key, handle);
+}
+
 pub async fn run(
     core_url: &str,
     token: &omnuv_protocol::Redacted,
@@ -210,7 +226,7 @@ async fn connect(
                 let handle = tokio::spawn(async move {
                     forward(&endpoint, &path, body, id, tx).await;
                 });
-                inflight.lock().await.insert(key, handle);
+                track(&inflight, key, handle).await;
             }
             TunnelFrame::ConsoleOpen { id, instance_id, kind } => {
                 // Recorded before anything is opened: a console is a
@@ -248,7 +264,7 @@ async fn connect(
                     table.lock().await.remove(&id);
                     let _ = tx.send(TunnelFrame::End { id }).await;
                 });
-                inflight.lock().await.insert(key, handle);
+                track(&inflight, key, handle).await;
             }
             TunnelFrame::ConsoleData { id, data } => {
                 use base64::Engine as _;
@@ -497,5 +513,31 @@ mod tests {
             serde_json::to_string(&frame).expect("a frame must serialize"),
             r#"{"t":"console_credential","id":"c-1","password":"vnc-secret-9f2a"}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod inflight_is_bounded {
+    use super::*;
+
+    /// **PROVIDER-14: the map holds what is running, not what ever ran.** A
+    /// thousand requests that finished leave one entry — the one just added
+    /// — and a request still running is kept, so a Cancel can still end it.
+    #[tokio::test]
+    async fn finished_requests_are_forgotten_and_running_ones_kept() {
+        let inflight: Mutex<HashMap<String, tokio::task::JoinHandle<()>>> = Mutex::new(HashMap::new());
+        let running = tokio::spawn(std::future::pending::<()>());
+        track(&inflight, "running".into(), running).await;
+        for i in 0..1000 {
+            let done = tokio::spawn(async {});
+            while !done.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            track(&inflight, format!("r{i}"), done).await;
+        }
+        let map = inflight.lock().await;
+        assert!(map.contains_key("running"), "a running request was forgotten");
+        assert!(map.len() <= 2, "{} entries for one running request", map.len());
+        map.get("running").unwrap().abort();
     }
 }
