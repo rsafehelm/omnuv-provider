@@ -1280,7 +1280,7 @@ async fn reconcile_workers(
                 if specs.is_empty() {
                     return Err(e);
                 }
-                match driver.maintain(node, &specs).await {
+                match driver.maintain(&specs).await {
                     Ok(0) => {}
                     Ok(n) => println!("core unreachable; maintained {n} machine(s), decided nothing"),
                     Err(me) => eprintln!("core unreachable and maintenance failed: {me}"),

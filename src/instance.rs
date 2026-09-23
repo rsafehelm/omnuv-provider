@@ -1326,7 +1326,7 @@ impl Client {
     /// instruction: a machine that was meant to be running, that already
     /// exists here, and that has stopped, is started again. A Core outage must
     /// not freeze a provider, and a stale instruction must not do damage.
-    pub async fn maintain(&self, node: &str, specs: &[InstanceSpec]) -> anyhow::Result<usize> {
+    pub async fn maintain(&self, specs: &[InstanceSpec]) -> anyhow::Result<usize> {
         let mut restarted = 0;
         for spec in specs {
             if !maintenance_may_touch(spec.intent, true, false) {
@@ -1334,19 +1334,44 @@ impl Client {
             }
             // Never create: absence is exactly the case where the stale
             // instruction might be wrong.
-            let Some(vm) = self.find_tagged_vm(node, TAG, &short_tag(&spec.id)).await? else {
-                continue;
+            //
+            // **Cluster-wide, and one machine at a time (PROVIDER-32).** This
+            // looked only on the configured node, so a machine on another node
+            // of the cluster was never restarted; and its `?` on the lookup, the
+            // start and the wait ended the loop at the first failure, leaving
+            // every machine after it down. A lookup that fails is said and
+            // skipped — never read as "absent", which would be the same as
+            // creating on a guess — and the pass goes on.
+            let found = match self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("maintain {}: could not look for it, left as it is: {e:#}", spec.id);
+                    continue;
+                }
             };
+            let (at, vm) = found;
             let running = vm.status.as_deref() == Some("running");
             if !maintenance_may_touch(spec.intent, true, running) {
                 continue;
             }
-            let upid: String = self
-                .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
-                .await?;
-            self.wait_task(node, &upid).await?;
-            audit::record("instance.maintain", "agent", &spec.id, "restarted", Some(&vm.vmid.to_string()));
-            restarted += 1;
+            let started: anyhow::Result<()> = async {
+                let upid: String = self
+                    .post_form(&format!("/nodes/{at}/qemu/{}/status/start", vm.vmid), NO_FORM)
+                    .await?;
+                self.wait_task(&at, &upid).await
+            }
+            .await;
+            match started {
+                Ok(()) => {
+                    audit::record("instance.maintain", "agent", &spec.id, "restarted", Some(&vm.vmid.to_string()));
+                    restarted += 1;
+                }
+                Err(e) => {
+                    audit::record("instance.maintain", "agent", &spec.id, "error", Some(&format!("{e:#}")));
+                    eprintln!("maintain {}: not restarted: {e:#}", spec.id);
+                }
+            }
         }
         Ok(restarted)
     }
@@ -1878,6 +1903,40 @@ mod tests {
         );
         drop(calls);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **PROVIDER-32: maintenance finds a machine on any node, and one that
+    /// will not start does not stop the rest.** Core is unreachable; two
+    /// machines should be running. The first, on n1, refuses to start; the
+    /// second is on n2, where a one-node lookup never looked. It is started.
+    #[tokio::test]
+    async fn maintenance_reaches_every_node_and_survives_one_failure() {
+        use crate::pvemock::{task_ok, Mock};
+        let mut first = spec();
+        first.id = "11111111-1111-4111-8111-111111111111".into();
+        first.intent = Lifecycle::Running;
+        let mut second = first.clone();
+        second.id = "22222222-2222-4222-8222-222222222222".into();
+        let (a, b) = (short_tag(&first.id), short_tag(&second.id));
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 701, "status": "stopped", "tags": format!("{TAG};{a}")},
+                    {"node": "n2", "vmid": 702, "status": "stopped", "tags": format!("{TAG};{b}")}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([{"vmid": 701, "status": "stopped", "tags": format!("{TAG};{a}")}])),
+                ("GET", "/nodes/n2/qemu") => (200, serde_json::json!([{"vmid": 702, "status": "stopped", "tags": format!("{TAG};{b}")}])),
+                ("POST", "/nodes/n1/qemu/701/status/start") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n2/qemu/702/status/start") => (200, serde_json::json!("UPID:n2:start")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let restarted = mock.client().maintain(&[first, second]).await.expect("maintenance");
+        assert_eq!(restarted, 1, "the machine on the other node was not restarted after the first failed");
+        assert!(mock.called("POST", "/nodes/n2/qemu/702/status/start"));
     }
 
     /// **PROVIDER-27: a machine meant to be stopped is built stopped.** The

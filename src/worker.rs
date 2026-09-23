@@ -238,27 +238,13 @@ fn loading_detail(t: Option<&omnuv_protocol::WorkloadReport>) -> Option<String> 
 }
 
 impl Client {
-    /// Finds a VM this agent created, by kind tag plus marketplace id tag.
-    /// Two tags, not one: a VM must match both to be touched, so nothing the
-    /// marketplace did not create is ever acted on.
-    pub(crate) async fn find_tagged_vm(
-        &self,
-        node: &str,
-        kind: &str,
-        id_tag: &str,
-    ) -> anyhow::Result<Option<VmRef>> {
-        let vms: Vec<VmRef> = self.get_json(&format!("/nodes/{node}/qemu")).await?;
-        Ok(vms.into_iter().find(|v| {
-            v.tags.as_deref().is_some_and(|t| {
-                t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag)
-            })
-        }))
-    }
-
     /// The same machine, looked for across **every node of the cluster**.
     ///
-    /// **A provider is not a node.** `find_tagged_vm` above asks one node, and
-    /// that is what the whole agent used: a machine this agent built on `nuc3`
+    /// Finds a VM this agent created, by kind tag plus marketplace id tag —
+    /// both, so nothing the marketplace did not create is ever acted on.
+    ///
+    /// **A provider is not a node.** A lookup that asked one node was what the
+    /// whole agent used (the last caller, `maintain`, went in PROVIDER-32): a machine this agent built on `nuc3`
     /// was invisible to a reconcile pointed at `nuc0`, so it looked like a
     /// machine that had never been created — and converging would have built a
     /// *second* copy while the first kept its card attached. That is the
