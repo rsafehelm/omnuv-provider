@@ -2536,6 +2536,10 @@ mod the_cards_are_used_where_core_sold_them {
                     {"node": "n1", "status": "online"}, {"node": "n2", "status": "online"}])),
                 ("GET", "/nodes/n1/qemu") | ("GET", "/nodes/n2/qemu") => (200, serde_json::json!([])),
                 ("GET", "/cluster/mapping/pci") => (200, serde_json::json!([])),
+                // Both nodes have a card in the same slot: a PCI address is
+                // unique only per node.
+                ("GET", "/nodes/n1/hardware/pci") | ("GET", "/nodes/n2/hardware/pci") => (200, serde_json::json!([
+                    {"id": "0000:01:00.0", "class": "0x030000", "vendor": "0x10de"}])),
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n2:clone")),
                 ("POST", p) if p.ends_with("/qemu/123/config") => (200, serde_json::Value::Null),
@@ -2574,6 +2578,37 @@ mod the_cards_are_used_where_core_sold_them {
         assert_eq!(clones, ["/nodes/n2/qemu/9000/clone"], "cloned where the cards were not sold");
         drop(calls);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **PROVIDER-8: the card must be on the node at all.** The named node's
+    /// listing has no such slot — a stale inventory — and then cannot be
+    /// read: both refuse before anything is cloned, rather than failing at
+    /// attach with a clone already built.
+    #[tokio::test]
+    async fn a_card_the_node_does_not_have_is_refused_before_a_clone() {
+        for (answer, said) in [
+            ((200, serde_json::json!([])), "is not on this node"),
+            ((500, serde_json::Value::Null), "could not be listed"),
+        ] {
+            let base = two_nodes();
+            let answer = answer.clone();
+            let mock = Mock::start(move |method, path, body| {
+                if method == "GET" && path == "/nodes/n2/hardware/pci" {
+                    return answer.clone();
+                }
+                base(method, path, body)
+            })
+            .await;
+            let (root, dir) = snippets("not-here");
+            let e = mock
+                .client()
+                .ensure_instance("n1", 9000, "local", &dir, &spec("n2"))
+                .await
+                .expect_err("placed a card the node does not have");
+            assert!(format!("{e:#}").contains(said), "{e:#}");
+            assert!(!mock.calls.lock().unwrap().iter().any(|c| c.path.ends_with("/clone")), "a clone was made anyway");
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2689,6 +2724,12 @@ impl crate::proxmox::Client {
         if spec.gpu_local_ids.is_empty() {
             return Ok(());
         }
+        self.cards_can_be_placed(node, &spec.gpu_local_ids).await
+    }
+
+    /// Whether every card named can go on this node: present on it, and free
+    /// of any other guest. One check for machines and workers alike.
+    pub(crate) async fn cards_can_be_placed(&self, node: &str, gpu_local_ids: &[String]) -> anyhow::Result<()> {
         let claims = self.claimed_pci(node, None).await;
         // **An incomplete view refuses rather than proceeds.** "I could not read
         // every guest" and "every card is free" must never be the same answer —
@@ -2697,8 +2738,21 @@ impl crate::proxmox::Client {
             claims.complete,
             "its guest inventory could not be read in full, so no card here can be proven free"
         );
-        for want in &spec.gpu_local_ids {
+        // **The card has to be here at all (PROVIDER-8).** `may_offer` says
+        // whether a slot is free of other guests, and a slot this node does not
+        // have is free of everything — so a stale inventory, or a Core too old
+        // to name the node, placed here and failed only at attach, after the
+        // clone was built. Asked of the node itself, and an unreadable answer
+        // refuses: could not look is not present.
+        let present: Vec<crate::proxmox::PciEntry> = self
+            .get_json(&format!("/nodes/{node}/hardware/pci"))
+            .await
+            .map_err(|e| anyhow::anyhow!("its PCI devices could not be listed, so no card here can be proven present: {e}"))?;
+        let present: std::collections::HashSet<String> =
+            present.iter().map(|d| crate::proxmox::pci_slot(&d.id)).collect();
+        for want in gpu_local_ids {
             let slot = crate::proxmox::pci_slot(want);
+            anyhow::ensure!(present.contains(&slot), "GPU {want} is not on this node");
             anyhow::ensure!(
                 claims.may_offer(&slot),
                 "GPU {want} is already assigned to another guest here"

@@ -1090,19 +1090,7 @@ impl Client {
         if spec.gpu_local_ids.is_empty() {
             return Ok(());
         }
-        let claims = self.claimed_pci(node, None).await;
-        anyhow::ensure!(
-            claims.complete,
-            "its guest inventory could not be read in full, so no card here can be proven free"
-        );
-        for want in &spec.gpu_local_ids {
-            let slot = crate::proxmox::pci_slot(want);
-            anyhow::ensure!(
-                claims.may_offer(&slot),
-                "GPU {want} is already assigned to another guest here"
-            );
-        }
-        Ok(())
+        self.cards_can_be_placed(node, &spec.gpu_local_ids).await
     }
 }
 

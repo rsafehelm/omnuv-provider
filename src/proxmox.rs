@@ -77,8 +77,8 @@ struct StorageEntry {
 }
 
 #[derive(Deserialize)]
-struct PciEntry {
-    id: String,
+pub(crate) struct PciEntry {
+    pub(crate) id: String,
     class: Option<String>,
     vendor: Option<String>,
     vendor_name: Option<String>,
