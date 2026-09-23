@@ -621,8 +621,8 @@ impl Client {
     ///
     /// The segment itself is ensured by `ensure_instance`, before this — see
     /// the comment there for why it cannot live in here.
-    async fn ensure_segment(&self, node: &str, vmid: u32, net: &NetworkAttachment) -> anyhow::Result<()> {
-        let bridge = marketplace_bridge(net);
+    async fn ensure_segment(&self, node: &str, vmid: u32, net: &NetworkAttachment, bridge: &str) -> anyhow::Result<()> {
+        let bridge = bridge.to_string();
         let cfg: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await?;
         let current = cfg.get("net1").and_then(|v| v.as_str()).unwrap_or_default();
         if current.split(',').any(|kv| kv == format!("bridge={bridge}")) {
@@ -664,11 +664,13 @@ impl Client {
         // Idempotent and cheap: `ensure_vnet` returns immediately when the vnet
         // is defined and applied, so every machine after the first on a given
         // provider pays one API read.
-        if let Some(net) = &spec.network
-            && spec.intent != Lifecycle::Absent
-        {
-            self.ensure_vnet(node, &marketplace_bridge(net), &net.network_id).await?;
-        }
+        // The vnet this network actually has here, which is not always the
+        // name `marketplace_bridge` computes: see `ensure_vnet`.
+        let segment_bridge = match &spec.network {
+            Some(net) if spec.intent != Lifecycle::Absent => Some(self.ensure_vnet(node, &net.network_id).await?),
+            Some(net) => Some(marketplace_bridge(net)),
+            None => None,
+        };
 
         // **Cluster-wide, or a machine on another node is built twice.** The
         // caller's `node` is where a *new* machine would go; an existing one is
@@ -732,7 +734,7 @@ impl Client {
                 if let Some(net) = &spec.network
                     && spec.intent != Lifecycle::Absent
                 {
-                    self.ensure_segment(node, vm.vmid, net).await?;
+                    self.ensure_segment(node, vm.vmid, net, segment_bridge.as_deref().unwrap_or_default()).await?;
                 }
 
                 // And its way out. A machine built before the egress bridge was
@@ -1206,7 +1208,8 @@ impl Client {
             if let Some(net) = &spec.network {
                 config.push((
                     "net1".to_string(),
-                    format!("virtio={},bridge={}", marketplace_mac(&spec.id), marketplace_bridge(net)),
+                    format!("virtio={},bridge={}", marketplace_mac(&spec.id),
+                            segment_bridge.clone().unwrap_or_else(|| marketplace_bridge(net))),
                 ));
             }
             self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
