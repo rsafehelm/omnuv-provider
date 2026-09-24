@@ -695,21 +695,20 @@ impl Client {
             // The previous code read `/nodes/{node}/qemu`, which is live, and
             // the cluster-wide lookup lost that without replacing it. One extra
             // read per machine per pass buys a status that is true.
-            let mut uptime: Option<u64> = None;
-            let vm = match self
+            let (vm, uptime) = match self
                 .get_json::<serde_json::Value>(&format!(
                     "/nodes/{node}/qemu/{}/status/current",
                     vm.vmid
                 ))
                 .await
             {
-                Ok(live) => {
-                    uptime = live.get("uptime").and_then(|u| u.as_u64());
+                Ok(live) => (
                     crate::worker::VmRef {
                         status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
                         ..vm
-                    }
-                }
+                    },
+                    live.get("uptime").and_then(|u| u.as_u64()),
+                ),
                 // **Not looked at, so not acted on (24 September 2026).** This
                 // fell back to the cached listing, and the converge below then
                 // started or stopped the machine on exactly the stale reading

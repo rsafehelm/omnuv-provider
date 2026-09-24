@@ -117,9 +117,20 @@ async fn main() -> anyhow::Result<()> {
 
     if command == "agent" {
         let path = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
-        let cfg = config::load_agent(&path)?;
         // Audit before anything else, so even a failed start is on the record.
+        // It came after the config load until 24 September 2026, so the one
+        // failure this line promises to record, a bad configuration, never was.
         audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
+        let cfg = match config::load_agent(&path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // The reason goes to the journal with the returned error, not
+                // here: a parser's message can quote a value, and a token in
+                // the wrong field would then sit in the audit file.
+                audit::record("agent.start", "agent", &path, "failed", Some("the configuration could not be loaded"));
+                return Err(e);
+            }
+        };
         eprintln!("onv-provider agent starting (config {path})");
         eprintln!("audit log policy: {}", audit::REDACTION_POLICY);
         return agent::run(cfg).await;
