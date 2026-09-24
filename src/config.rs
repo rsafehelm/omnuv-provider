@@ -193,6 +193,24 @@ proxmox:
         assert_eq!(older.environment, None);
     }
 
+    /// A zero inventory interval is refused at load, in words: the reconcile
+    /// loop's `tokio::time::interval` would otherwise panic on it.
+    #[test]
+    fn a_zero_inventory_interval_is_refused_at_load() {
+        let dir = std::env::temp_dir().join(format!("onv-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        let body = |secs: &str| format!(
+            "core:\n  url: https://api.omnuv.com\n  token: t\n{secs}proxmox:\n  apiUrl: https://127.0.0.1:8006\n  tokenId: onv@pve!agent\n  tokenSecret: s\n"
+        );
+        std::fs::write(&path, body("inventoryEverySecs: 0\n")).unwrap();
+        let refused = super::load_agent(path.to_str().unwrap()).expect_err("a zero interval loaded");
+        assert!(refused.to_string().contains("inventoryEverySecs is 0"), "{refused}");
+        std::fs::write(&path, body("")).unwrap();
+        assert!(super::load_agent(path.to_str().unwrap()).is_ok(), "the default must still load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn debug_on_the_agent_config_redacts_both_credentials() {
         let cfg: super::AgentConfig = serde_yaml_ng::from_str(
@@ -399,5 +417,11 @@ fn default_snippet_dir() -> String {
 
 pub fn load_agent(path: &str) -> anyhow::Result<AgentConfig> {
     let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
-    Ok(serde_yaml_ng::from_str(&raw)?)
+    let cfg: AgentConfig = serde_yaml_ng::from_str(&raw)?;
+    // `tokio::time::interval` panics on a zero period, so this is refused here,
+    // in words, rather than as a panic in the reconcile loop.
+    if cfg.inventory_every_secs == 0 {
+        anyhow::bail!("{path}: inventoryEverySecs is 0; it must be at least 1");
+    }
+    Ok(cfg)
 }

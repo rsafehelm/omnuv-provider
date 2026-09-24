@@ -694,6 +694,20 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 }
 
+/// The heartbeat period Core asked for, in seconds.
+///
+/// **Zero is "not said", like absent (24 September 2026).** `tokio::time::interval`
+/// panics on a zero period, and the heartbeat task took Core's number with only
+/// a default for its absence, so a Core answering 0 killed the task and the
+/// agent with it. A value this agent cannot use is not a reason to stop.
+fn heartbeat_secs(handshake: &serde_json::Value) -> u64 {
+    handshake
+        .get("heartbeat_interval_secs")
+        .and_then(|x| x.as_u64())
+        .filter(|s| *s > 0)
+        .unwrap_or(30)
+}
+
 fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     core: Core,
     driver: Arc<D>,
@@ -1035,7 +1049,7 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
         match core.post(HANDSHAKE, Some(body.clone())).await {
             Ok(r) if r.status().is_success() => {
                 let v: serde_json::Value = r.json().await?;
-                let secs = v.get("heartbeat_interval_secs").and_then(|x| x.as_u64()).unwrap_or(30);
+                let secs = heartbeat_secs(&v);
                 println!(
                     "handshake ok: provider {} protocol v{} heartbeat {}s",
                     v.get("provider_id").and_then(|x| x.as_str()).unwrap_or("?"),
@@ -1669,6 +1683,22 @@ async fn reconcile_workers(
         anyhow::bail!("core rejected status report: {}", res.status());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    /// Zero and absent are both "not said"; anything else is Core's number.
+    #[tokio::test]
+    async fn a_zero_heartbeat_interval_is_not_obeyed() {
+        let secs = |v: serde_json::Value| super::heartbeat_secs(&v);
+        assert_eq!(secs(serde_json::json!({"heartbeat_interval_secs": 0})), 30);
+        assert_eq!(secs(serde_json::json!({})), 30);
+        assert_eq!(secs(serde_json::json!({"heartbeat_interval_secs": 15})), 15);
+        // And the period it yields is one tokio accepts.
+        let _ = tokio::time::interval(std::time::Duration::from_secs(secs(
+            serde_json::json!({"heartbeat_interval_secs": 0}),
+        )));
+    }
 }
 
 #[cfg(test)]
