@@ -234,6 +234,11 @@ fn loading_detail(t: Option<&omnuv_protocol::WorkloadReport>) -> Option<String> 
             format!("loading {} of weights into the card", gib(m.cached_bytes))
         }
         omnuv_protocol::ModelStage::Loaded => "loaded; waiting to serve".to_string(),
+        // A stage added after this agent was built: said as such, never
+        // guessed at as one of the three above.
+        omnuv_protocol::ModelStage::Unknown => {
+            "in a stage this agent does not recognise; it may need updating".to_string()
+        }
     })
 }
 
