@@ -114,6 +114,20 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     println!();
 
     // Refuse early rather than half-configure a machine we cannot support.
+    //
+    // **The package, or nothing (24 September 2026).** Without it, join wrote a
+    // unit of its own whose ExecStart was /usr/local/bin/onv-provider and whose
+    // User was onv: no step installs that binary (deploy-agent deletes the
+    // path) and only the package creates that account, so the service it
+    // enabled could never start. By then join had already made the Proxmox
+    // account and written the config, so the refusal is here, before any of it.
+    let packaged = std::path::Path::new(PACKAGED_UNIT).exists();
+    if !packaged && !a.dry_run {
+        anyhow::bail!(
+            "onv-provider is not installed from its package ({PACKAGED_UNIT} is missing). \
+             Install the .deb (packaging/build-deb.sh builds it), then run join again; nothing was changed"
+        );
+    }
     let version = sh("pveversion").unwrap_or_default();
     if !version.contains("pve-manager/9.") {
         anyhow::bail!("unsupported or missing Proxmox VE (found: {version:?}); this build targets 9.x");
@@ -356,19 +370,12 @@ proxmox:
     // own on top would mean two units for one service and an upgrade that
     // silently changes which one wins. Only a build installed by hand needs
     // this to write anything.
-    let packaged = std::path::Path::new("/lib/systemd/system/onv-provider.service").exists();
-    println!(
-        "\n{} the service",
-        if packaged { "Starting" } else { "Installing and starting" }
-    );
+    println!("\nStarting the service");
     if !a.dry_run {
-        if !packaged {
-            std::fs::write("/etc/systemd/system/onv-provider.service", UNIT)?;
-        }
         sh("systemctl daemon-reload && systemctl enable --now onv-provider")?;
         audit::record("join.complete", "agent", &node, "ok", Some(&a.region));
-    } else if packaged {
-        println!("  (the installed package already provides the unit)");
+    } else if !packaged {
+        println!("  (not installed from the package: a real run refuses at the start)");
     }
 
     println!("\nDone. The agent now dials {} outward.", a.core);
@@ -379,33 +386,7 @@ proxmox:
     Ok(())
 }
 
-const UNIT: &str = r#"[Unit]
-Description=Omnuv Provider Agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/onv-provider agent --config /etc/onv/agent.yaml
-User=onv
-Group=onv
-Restart=always
-RestartSec=10s
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ReadWritePaths=/var/lib/onv /var/log/onv
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-
-[Install]
-WantedBy=multi-user.target
-"#;
+const PACKAGED_UNIT: &str = "/lib/systemd/system/onv-provider.service";
 
 /// Removes everything `join` created. A provider must be able to leave as
 /// easily as they joined, without asking us.
