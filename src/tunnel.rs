@@ -135,12 +135,45 @@ mod url_lite {
     }
 }
 
+/// What one connection holds per request: the tasks a Cancel can end, and the
+/// open consoles' inputs. Per connection, so dropped with it; passed in rather
+/// than made inside, so a test can ask what an ending left behind (leak
+/// assertions, the operator's first class-closing item of 24 September 2026).
+#[derive(Clone, Default)]
+struct Tables {
+    inflight: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Open consoles, by tunnel id: where a buyer's keystrokes go. Dropping
+    /// the sender ends the session at the hypervisor.
+    sessions: Arc<Mutex<HashMap<String, mpsc::Sender<ConsoleInput>>>>,
+}
+
+impl Tables {
+    /// Open consoles, and tasks still running. Idle, both are zero.
+    #[cfg(test)]
+    async fn held(&self) -> (usize, usize) {
+        let consoles = self.sessions.lock().await.len();
+        let running = self.inflight.lock().await.values().filter(|h| !h.is_finished()).count();
+        (consoles, running)
+    }
+}
+
 async fn connect(
     ws_url: &str,
     token: &omnuv_protocol::Redacted,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
+) -> anyhow::Result<()> {
+    connect_with(ws_url, token, resolve, nudge, consoles, Tables::default()).await
+}
+
+async fn connect_with(
+    ws_url: &str,
+    token: &omnuv_protocol::Redacted,
+    resolve: ResolveWorker,
+    nudge: Arc<tokio::sync::Notify>,
+    consoles: Arc<dyn ConsoleOpener>,
+    tables: Tables,
 ) -> anyhow::Result<()> {
     let mut request = ws_url.into_client_request()?;
     request
@@ -163,12 +196,7 @@ async fn connect(
 
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<TunnelFrame>(256);
-    let inflight: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    // Open consoles, by tunnel id: where a buyer's keystrokes go. Dropping
-    // the sender ends the session at the hypervisor.
-    let sessions: Arc<Mutex<HashMap<String, mpsc::Sender<ConsoleInput>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let Tables { inflight, sessions } = tables;
 
     // Keepalive: an idle WebSocket through a NAT or proxy is reaped silently,
     // and a dead tunnel that still looks alive is worse than a closed one.
@@ -633,13 +661,90 @@ mod stalled_console {
         });
         let consoles: Arc<dyn ConsoleOpener> = Arc::new(Stalled(Default::default(), Default::default()));
         let url = format!("ws://127.0.0.1:{port}/provider/v1/tunnel");
+        let tables = Tables::default();
+        let held = tables.clone();
         let agent = tokio::spawn(async move {
             let token: omnuv_protocol::Redacted = "t".to_string().into();
-            connect(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles).await
+            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables).await
         });
         let (pong, ended) = core.await.unwrap();
-        agent.abort();
         assert!(pong, "a stalled console stopped the tunnel: Core's Ping was not answered in 3 s");
         assert!(ended, "the stalled console was left open rather than ended");
+        assert_eq!(held.held().await, (0, 0), "the cut console left its session or task behind");
+        agent.abort();
+    }
+
+    /// **Every way a console ends leaves nothing held** (leak assertions, 24
+    /// September 2026): Core's Cancel, and the machine side closing. Core's
+    /// Ping is answered after each, so each ending has been read before the
+    /// tables are asked.
+    #[tokio::test]
+    async fn every_console_ending_leaves_nothing_held() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let opener = Arc::new(Stalled(Default::default(), Default::default()));
+        let machine = opener.clone();
+        let tables = Tables::default();
+        let held = tables.clone();
+        let core = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut sink, mut stream) = ws.split();
+            let send = |f: TunnelFrame| Message::text(serde_json::to_string(&f).unwrap());
+            // Reads until `want` says yes; three seconds at most.
+            async fn until(
+                stream: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+                want: impl Fn(&TunnelFrame) -> bool,
+            ) -> bool {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while let Some(Ok(m)) = stream.next().await {
+                        if serde_json::from_str::<TunnelFrame>(&m.to_string()).is_ok_and(|f| want(&f)) {
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .await
+                .unwrap_or(false)
+            }
+            let open = |id: &str| TunnelFrame::ConsoleOpen {
+                id: id.into(),
+                instance_id: "m1".into(),
+                kind: omnuv_protocol::ConsoleKind::Serial,
+            };
+            let mut seen = Vec::new();
+
+            // Cancelled by Core.
+            sink.send(send(open("c1"))).await.unwrap();
+            assert!(until(&mut stream, |f| matches!(f, TunnelFrame::Head { id, .. } if id == "c1")).await);
+            sink.send(send(TunnelFrame::Cancel { id: "c1".into() })).await.unwrap();
+            sink.send(send(TunnelFrame::Ping)).await.unwrap();
+            assert!(until(&mut stream, |f| matches!(f, TunnelFrame::Pong)).await);
+            seen.push(("a cancel", held.held().await));
+
+            // Closed by the machine.
+            sink.send(send(open("c2"))).await.unwrap();
+            assert!(until(&mut stream, |f| matches!(f, TunnelFrame::Head { id, .. } if id == "c2")).await);
+            machine.1.lock().unwrap().clear();
+            assert!(until(&mut stream, |f| matches!(f, TunnelFrame::End { id } if id == "c2")).await,
+                    "the machine closed and Core was not told");
+            sink.send(send(TunnelFrame::Ping)).await.unwrap();
+            assert!(until(&mut stream, |f| matches!(f, TunnelFrame::Pong)).await);
+            tokio::task::yield_now().await;
+            seen.push(("the machine closing", held.held().await));
+            seen
+        });
+        let url = format!("ws://127.0.0.1:{port}/provider/v1/tunnel");
+        let consoles: Arc<dyn ConsoleOpener> = opener;
+        let agent = tokio::spawn(async move {
+            let token: omnuv_protocol::Redacted = "t".to_string().into();
+            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables).await
+        });
+        let seen = core.await.unwrap();
+        agent.abort();
+        for (ending, left) in seen {
+            assert_eq!(left.0, 0, "{ending} left the console's session held");
+            assert_eq!(left.1, 0, "{ending} left its task running");
+        }
     }
 }
