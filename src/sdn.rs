@@ -335,7 +335,7 @@ mod tests {
         let held = json!({"vnet": "onvc4d90", "zone": "onv", "alias": other});
         let mine_elsewhere = json!({"vnet": names[2], "zone": "onv", "alias": net});
         assert_eq!(choose(&[held.clone(), mine_elsewhere], net), Ok((names[2].clone(), Segment::Ready)));
-        assert_eq!(choose(&[held.clone()], net), Ok((names[1].clone(), Segment::Create)));
+        assert_eq!(choose(std::slice::from_ref(&held), net), Ok((names[1].clone(), Segment::Create)));
         assert_eq!(choose(&[json!({"vnet": "onvc4d90", "zone": "onv"})], net), Ok(("onvc4d90".into(), Segment::Adopt)));
         let unaliased_second = json!({"vnet": names[1], "zone": "onv"});
         assert_eq!(choose(&[held.clone(), unaliased_second], net), Ok((names[2].clone(), Segment::Create)),

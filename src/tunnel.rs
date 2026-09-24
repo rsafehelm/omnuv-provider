@@ -266,18 +266,36 @@ async fn connect(
                 });
                 track(&inflight, key, handle).await;
             }
+            // **Never wait on one console in the loop that serves them all.**
+            // This awaited the console's bounded input, with the sessions lock
+            // still held as a temporary of the `if let`, so a machine that did
+            // not drain its input (a paste into a slow serial line) stopped
+            // every frame for this provider: inference, Cancel, Ping, the other
+            // consoles. Core fixed the same shape in PROVIDER-19; the source
+            // review of 24 September 2026 found it here. The sender is taken
+            // out of the lock first, and a console whose input is full is cut,
+            // as Core's own `deliver` does: its End tells Core, and the buyer's
+            // page, that it closed.
             TunnelFrame::ConsoleData { id, data } => {
                 use base64::Engine as _;
-                if let (Some(to_vm), Ok(bytes)) = (
-                    sessions.lock().await.get(&id).cloned(),
-                    base64::engine::general_purpose::STANDARD.decode(data),
-                ) {
-                    let _ = to_vm.send(ConsoleInput::Data(bytes)).await;
+                let to_vm = sessions.lock().await.get(&id).cloned();
+                if let (Some(to_vm), Ok(bytes)) = (to_vm, base64::engine::general_purpose::STANDARD.decode(data))
+                    && let Err(mpsc::error::TrySendError::Full(_)) = to_vm.try_send(ConsoleInput::Data(bytes))
+                {
+                    sessions.lock().await.remove(&id);
+                    if let Some(h) = inflight.lock().await.remove(&id) {
+                        h.abort();
+                    }
+                    audit::record("console.cut", "core", &id, "failed", Some("the machine did not read its input"));
+                    let _ = out_tx.send(TunnelFrame::End { id }).await;
                 }
             }
             TunnelFrame::ConsoleResize { id, cols, rows } => {
-                if let Some(to_vm) = sessions.lock().await.get(&id).cloned() {
-                    let _ = to_vm.send(ConsoleInput::Resize { cols, rows }).await;
+                // A resize that does not fit is dropped: the next one carries
+                // the size that matters.
+                let to_vm = sessions.lock().await.get(&id).cloned();
+                if let Some(to_vm) = to_vm {
+                    let _ = to_vm.try_send(ConsoleInput::Resize { cols, rows });
                 }
             }
             TunnelFrame::Cancel { id } => {
@@ -539,5 +557,89 @@ mod inflight_is_bounded {
         assert!(map.contains_key("running"), "a running request was forgotten");
         assert!(map.len() <= 2, "{} entries for one running request", map.len());
         map.get("running").unwrap().abort();
+    }
+}
+
+#[cfg(test)]
+mod stalled_console {
+    use super::*;
+    use crate::console::{ConsoleInput, ConsoleOpener, ConsoleStream};
+    use futures_util::future::BoxFuture;
+
+    /// A console whose machine side never reads its input, as a termproxy
+    /// behind a slow serial line does: its receiver is kept alive and never
+    /// polled.
+    struct Stalled(std::sync::Mutex<Vec<mpsc::Receiver<ConsoleInput>>>, std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>);
+    impl ConsoleOpener for Stalled {
+        fn open<'a>(&'a self, _: &'a str, _: omnuv_protocol::ConsoleKind) -> BoxFuture<'a, anyhow::Result<ConsoleStream>> {
+            Box::pin(async move {
+                let (to_vm, input) = mpsc::channel::<ConsoleInput>(64);
+                let (output, from_vm) = mpsc::channel::<Vec<u8>>(256);
+                self.0.lock().unwrap().push(input);
+                self.1.lock().unwrap().push(output);
+                Ok(ConsoleStream { to_vm, from_vm, credential: None })
+            })
+        }
+    }
+
+    /// One stalled console no longer stops the tunnel: after a paste larger
+    /// than the machine takes in, Core's Ping is still answered, and the
+    /// stalled console is ended rather than left hanging. Before the fix the
+    /// Ping got no Pong in 3 s (the source review of 24 September 2026, with
+    /// this harness: a fake Core over a real websocket).
+    #[tokio::test]
+    async fn a_stalled_console_is_cut_and_the_tunnel_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let core = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut sink, mut stream) = ws.split();
+            let send = |f: TunnelFrame| Message::text(serde_json::to_string(&f).unwrap());
+            sink.send(send(TunnelFrame::ConsoleOpen {
+                id: "c1".into(),
+                instance_id: "m1".into(),
+                kind: omnuv_protocol::ConsoleKind::Serial,
+            }))
+            .await
+            .unwrap();
+            loop {
+                let m = stream.next().await.unwrap().unwrap();
+                if matches!(serde_json::from_str::<TunnelFrame>(&m.to_string()), Ok(TunnelFrame::Head { .. })) {
+                    break;
+                }
+            }
+            // A buyer pastes more than the machine takes in: 80 frames into
+            // an input that holds 64 and is never read.
+            for _ in 0..80 {
+                sink.send(send(TunnelFrame::ConsoleData { id: "c1".into(), data: "YQ==".into() })).await.unwrap();
+            }
+            sink.send(send(TunnelFrame::Ping)).await.unwrap();
+            let (mut ended, mut pong) = (false, false);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(Ok(m)) = stream.next().await {
+                    match serde_json::from_str::<TunnelFrame>(&m.to_string()) {
+                        Ok(TunnelFrame::End { id }) if id == "c1" => ended = true,
+                        Ok(TunnelFrame::Pong) => pong = true,
+                        _ => {}
+                    }
+                    if ended && pong {
+                        break;
+                    }
+                }
+            })
+            .await;
+            (pong, ended)
+        });
+        let consoles: Arc<dyn ConsoleOpener> = Arc::new(Stalled(Default::default(), Default::default()));
+        let url = format!("ws://127.0.0.1:{port}/provider/v1/tunnel");
+        let agent = tokio::spawn(async move {
+            let token: omnuv_protocol::Redacted = "t".to_string().into();
+            connect(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles).await
+        });
+        let (pong, ended) = core.await.unwrap();
+        agent.abort();
+        assert!(pong, "a stalled console stopped the tunnel: Core's Ping was not answered in 3 s");
+        assert!(ended, "the stalled console was left open rather than ended");
     }
 }
