@@ -21,6 +21,8 @@
       "disk_gib": 100,
       "ssh_keys": [],
       "console_password_hash": null,
+      "console_password_generation": 0,
+      "built": false,
       "gpu_local_ids": [],
       "reboot_token": null,
       "network": null,
