@@ -40,3 +40,6 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Fault injection over a simulated network: the tunnel under partitions and
+# silence, in simulated time (tunnel.rs, `mod partition`).
+turmoil = "0.7.2"

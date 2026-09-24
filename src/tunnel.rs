@@ -193,7 +193,27 @@ async fn connect_with(
     let (socket, _) = tokio_tungstenite::client_async_tls(request, stream).await?;
     audit::record("tunnel.open", "agent", "core", "ok", None);
     println!("tunnel connected to core");
+    serve_socket(socket, resolve, nudge, consoles, tables).await
+}
 
+/// How long Core may say nothing before its tunnel is taken as gone. Core
+/// answers each of this agent's 20-second pings, so a minute with no frame is
+/// three answers missed.
+const SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Serves one connection to Core until it closes, fails or goes silent.
+/// Generic over the transport, so a simulated network can carry it
+/// (`mod partition`).
+async fn serve_socket<S>(
+    socket: tokio_tungstenite::WebSocketStream<S>,
+    resolve: ResolveWorker,
+    nudge: Arc<tokio::sync::Notify>,
+    consoles: Arc<dyn ConsoleOpener>,
+    tables: Tables,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<TunnelFrame>(256);
     let Tables { inflight, sessions } = tables;
@@ -222,8 +242,19 @@ async fn connect_with(
         }
     });
 
-    while let Some(msg) = stream.next().await {
-        let msg = msg?;
+    // **Silence ends a tunnel** (turmoil, 24 September 2026). A link cut with
+    // nothing closed never errors a socket: this waited on it until TCP gave
+    // up, about fifteen minutes, while Core could reach nothing on this host.
+    // An error sends `run` back to reconnect.
+    loop {
+        let msg = match tokio::time::timeout(SILENCE, stream.next()).await {
+            Ok(Some(msg)) => msg?,
+            Ok(None) => break,
+            Err(_) => {
+                writer.abort();
+                anyhow::bail!("Core said nothing for {} s; reconnecting", SILENCE.as_secs());
+            }
+        };
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => break,
@@ -746,5 +777,93 @@ mod stalled_console {
             assert_eq!(left.0, 0, "{ending} left the console's session held");
             assert_eq!(left.1, 0, "{ending} left its task running");
         }
+    }
+}
+
+/// **Fault injection over a simulated network** (turmoil; the operator's
+/// class-closing item 2, 24 September 2026). The agent's real connection
+/// loop over turmoil's TCP, against a fake Core. Time is simulated.
+#[cfg(test)]
+mod partition {
+    use super::*;
+    use crate::console::{ConsoleOpener, ConsoleStream};
+    use futures_util::future::BoxFuture;
+    use std::time::Duration;
+
+    struct NoConsoles;
+    impl ConsoleOpener for NoConsoles {
+        fn open<'a>(&'a self, _: &'a str, _: omnuv_protocol::ConsoleKind) -> BoxFuture<'a, anyhow::Result<ConsoleStream>> {
+            Box::pin(async { anyhow::bail!("no consoles here") })
+        }
+    }
+
+    /// The agent's side: connects, serves until the connection ends, and
+    /// reports how long that took and whether it ended in an error.
+    fn run(core: impl Fn() -> BoxFuture<'static, turmoil::Result> + 'static) -> (Duration, Result<(), String>) {
+        let mut sim = turmoil::Builder::new().simulation_duration(Duration::from_secs(1200)).build();
+        sim.host("core", core);
+        let (told, heard) = std::sync::mpsc::channel();
+        sim.client("agent", async move {
+            let tcp = turmoil::net::TcpStream::connect("core:443").await?;
+            let (ws, _) = tokio_tungstenite::client_async("ws://core/provider/v1/tunnel", tcp).await?;
+            let started = tokio::time::Instant::now();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(900),
+                serve_socket(ws, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), Arc::new(NoConsoles), Tables::default()),
+            )
+            .await;
+            let _ = told.send((started.elapsed(), match ended {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(_) => Err("still serving after 900 s".to_string()),
+            }));
+            Ok(())
+        });
+        sim.run().unwrap();
+        heard.try_recv().expect("the agent never reported")
+    }
+
+    /// Accepts the agent, then answers each Ping with a Pong for `answer_for`
+    /// and afterwards is cut off from it with nothing closed.
+    fn core(answer_for: Duration, then_close: bool) -> impl Fn() -> BoxFuture<'static, turmoil::Result> {
+        move || {
+            Box::pin(async move {
+                let listener = turmoil::net::TcpListener::bind("0.0.0.0:443").await?;
+                let (tcp, _) = listener.accept().await?;
+                let mut ws = tokio_tungstenite::accept_async(tcp).await?;
+                let until = tokio::time::Instant::now() + answer_for;
+                while let Ok(Some(Ok(m))) = tokio::time::timeout_at(until, ws.next()).await {
+                    if matches!(serde_json::from_str::<TunnelFrame>(&m.to_string()), Ok(TunnelFrame::Ping)) {
+                        ws.send(Message::text(serde_json::to_string(&TunnelFrame::Pong)?)).await?;
+                    }
+                }
+                if then_close {
+                    ws.close(None).await?;
+                    return Ok(());
+                }
+                turmoil::partition("core", "agent");
+                tokio::time::sleep(Duration::from_secs(1100)).await;
+                Ok(())
+            })
+        }
+    }
+
+    /// **A Core that goes silent is left, so the agent can reconnect.**
+    /// Before this, the agent waited on the dead link for as long as the
+    /// simulation ran.
+    #[test]
+    fn a_silent_core_is_left_within_a_minute_and_a_half() {
+        let (after, ended) = run(core(Duration::from_secs(30), false));
+        assert!(ended.is_err(), "the agent did not leave a silent Core: {ended:?} after {after:?}");
+        assert!(after <= Duration::from_secs(120), "it took {after:?}");
+    }
+
+    /// The control: a Core that answers every ping for five minutes is kept,
+    /// and a close ends the connection cleanly.
+    #[test]
+    fn a_core_that_answers_is_kept() {
+        let (after, ended) = run(core(Duration::from_secs(300), true));
+        assert!(ended.is_ok(), "a healthy connection ended in an error: {ended:?}");
+        // The two clocks start a handshake apart; the point is "well past a minute".
+        assert!(after >= Duration::from_secs(290), "it ended early: {after:?}");
     }
 }
