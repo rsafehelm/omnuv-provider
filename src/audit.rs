@@ -61,7 +61,7 @@ pub fn init(path: Option<&str>) {
     }
     match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => {
-            *SINK.lock().unwrap() = Some(f);
+            *crate::poison::lock(&SINK, "audit file") = Some(f);
             record("audit.start", "agent", path, "ok", None);
         }
         Err(e) => {
@@ -85,13 +85,13 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
     // The journal copy means the record survives even if the file is missing.
     println!("audit {line}");
 
-    if let Ok(mut guard) = SINK.lock()
-        && let Some(f) = guard.as_mut() {
-            let _ = writeln!(f, "{line}");
-            let _ = f.flush();
-        }
+    if let Some(f) = crate::poison::lock(&SINK, "audit file").as_mut() {
+        let _ = writeln!(f, "{line}");
+        let _ = f.flush();
+    }
 
-    if let Ok(mut q) = PENDING.lock() {
+    {
+        let mut q = crate::poison::lock(&PENDING, "audit queue");
         while q.len() >= PENDING_MAX {
             q.pop_front();
         }
@@ -113,7 +113,7 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
 /// because the provider's own file has them and that is the copy that is
 /// supposed to be authoritative for the provider.
 pub fn drain(max: usize) -> Vec<omnuv_protocol::AuditEntry> {
-    let Ok(mut q) = PENDING.lock() else { return vec![] };
+    let mut q = crate::poison::lock(&PENDING, "audit queue");
     let take = max.min(q.len());
     q.drain(..take).collect()
 }

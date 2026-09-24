@@ -20,6 +20,7 @@ mod passwords;
 mod reboots;
 mod survey;
 mod workload;
+mod poison;
 #[cfg(test)]
 mod pvemock;
 

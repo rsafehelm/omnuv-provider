@@ -63,7 +63,7 @@ impl Store {
     /// telemetry. Frozen numbers are worse than absent ones: absent is
     /// obviously nothing, frozen looks like a healthy idle machine.
     pub fn observe(&self, report: WorkloadReport) -> Option<WorkloadReport> {
-        let mut m = self.inner.lock().ok()?;
+        let mut m = crate::poison::lock(&self.inner, "workload readings");
 
         let Some(seen) = m.get_mut(&report.workload_id) else {
             // First sight of this workload. There is nothing to compare it
@@ -93,9 +93,7 @@ impl Store {
     /// Forgets a workload, so a deleted worker's last words do not sit in
     /// memory for the life of the agent.
     pub fn forget(&self, workload_id: &str) {
-        if let Ok(mut m) = self.inner.lock() {
-            m.remove(workload_id);
-        }
+        crate::poison::lock(&self.inner, "workload readings").remove(workload_id);
     }
 }
 

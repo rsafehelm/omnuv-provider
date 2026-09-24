@@ -562,7 +562,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             let resolve: crate::tunnel::ResolveWorker = Arc::new(move |worker_id: &str| {
                 // Blocking lock inside a sync closure: the map is tiny and
                 // contended only by the reconcile loop.
-                map.lock().ok()?.get(worker_id).cloned()
+                crate::poison::lock(&map, "worker endpoints").get(worker_id).cloned()
             });
             crate::tunnel::run(&url, &token, resolve, nudge_tx, consoles).await;
         });
@@ -614,7 +614,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                let catalogue = wanted.lock().map(|w| w.clone()).unwrap_or_default();
+                let catalogue = crate::poison::lock(&wanted, "image catalogue").clone();
                 if catalogue.is_empty() {
                     continue;
                 }
@@ -1267,7 +1267,7 @@ async fn reconcile_workers(
         Err(e) => eprintln!("could not check for pre-rename machines: {e}"),
     }
 
-    let known = held.lock().ok().and_then(|h| h.as_ref().map(|d| d.version)).unwrap_or(0);
+    let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
 
     let fetched: DesiredState =
         match core.get_json(&format!("/provider/v1/desired-state?known={known}")).await {
@@ -1286,10 +1286,9 @@ async fn reconcile_workers(
                 // destroyed, but a machine that was meant to be running and
                 // has crashed is started again. An outage of the control plane
                 // must not become an outage of somebody's machine.
-                let specs = held
-                    .lock()
-                    .ok()
-                    .and_then(|h| h.as_ref().map(|d| d.instances.clone()))
+                let specs = crate::poison::lock(held, "held desired state")
+                    .as_ref()
+                    .map(|d| d.instances.clone())
                     .unwrap_or_default();
                 if specs.is_empty() {
                     return Err(e);
@@ -1315,7 +1314,10 @@ async fn reconcile_workers(
     // tick against the copy in hand, because drift on the hypervisor is exactly
     // what this loop exists to correct.
     let desired = if fetched.unchanged {
-        match held.lock().ok().and_then(|h| h.clone()) {
+        // Cloned out first: a guard in the scrutinee would live to the end
+        // of the match, across the fetch below.
+        let in_hand = crate::poison::lock(held, "held desired state").clone();
+        match in_hand {
             Some(d) => d,
             // Core says nothing changed but we hold nothing. Ask again in full
             // rather than reconciling against an empty picture, which would
@@ -1323,9 +1325,7 @@ async fn reconcile_workers(
             None => core.get_json("/provider/v1/desired-state").await?,
         }
     } else {
-        if let Ok(mut h) = held.lock() {
-            *h = Some(fetched.clone());
-        }
+        *crate::poison::lock(held, "held desired state") = Some(fetched.clone());
         fetched
     };
 
@@ -1338,9 +1338,7 @@ async fn reconcile_workers(
     // download finished. Writing the catalogue and waking the mirror costs a
     // lock and a notify.
     if !desired.images.is_empty() {
-        if let Ok(mut w) = mirror_wanted.lock() {
-            w.clone_from(&desired.images);
-        }
+        crate::poison::lock(mirror_wanted, "image catalogue").clone_from(&desired.images);
         mirror_kick.notify_one();
     }
 
@@ -1480,7 +1478,7 @@ async fn reconcile_workers(
     {
         // Refresh the resolver's view so tunnelled requests reach the right
         // worker as soon as it is serving.
-        let Ok(mut map) = endpoints.lock() else { return Ok(()) };
+        let mut map = crate::poison::lock(endpoints, "worker endpoints");
         for s in &statuses {
             match &s.endpoint {
                 Some(ep) => {
