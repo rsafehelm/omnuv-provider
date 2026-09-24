@@ -1,0 +1,101 @@
+# A copy of omnuv's .semgrep/review-classes.yml, which is the one edited:
+# the agent met the first rule's shape itself (the stalled console), and the
+# others are held here so a new relay or stream starts under them. Copied
+# with its fixtures, so the rules' own tests run here too.
+#
+# The shapes the source review of 24 September 2026 found, as rules, so a
+# defect fixed once cannot come back quietly (the operator's class-closing
+# item 3). Each rule is tested twice by `semgrep --test` against
+# review-classes.rs: the code as it was when the defect shipped (`ruleid:`,
+# it must match) and the fix (`ok:`, it must not).
+#
+#   docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.177.0 \
+#     semgrep --test .semgrep/                      the rules' own tests
+#   docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.177.0 \
+#     semgrep scan --config .semgrep/review-classes.yml --error \
+#     --exclude .semgrep src                        the tree
+#
+# A finding that is right to keep carries `// nosemgrep: <rule id>` and, on
+# the line above, why.
+rules:
+  - id: await-on-a-sender-from-a-shared-table
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A sender taken from a shared table is awaited. When that party stops
+      reading, its channel fills and this waits: inside a loop that serves many
+      (a tunnel's read loop), every other party stops with it. PROVIDER-29
+      (Core's deliver) and the agent's stalled console of 24 September 2026.
+      Use try_send and cut the party that cannot keep up.
+    # Search, not taint: taint does not cross an `if let Some(tx) =`
+    # binding, which is where both defects took their sender. And the `if
+    # let` binds from any expression, not from `$S`: when the binding shadows
+    # its source (`if let Some(out) = out`), semgrep matched nothing (both
+    # measured with 1.177.0).
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              let $S = <... $M.lock().await.get(...) ...>;
+              ...
+          - pattern-inside: |
+              let Some($S) = <... $M.lock().await.get(...) ...> else { ... };
+              ...
+          - pattern-inside: |
+              if let Some($S) = <... $M.lock().await.get(...) ...> { ... }
+          - pattern-inside: |
+              if let ($P($S), $B) = (<... $M.lock().await.get(...) ...>, $E) { ... }
+      - pattern-either:
+          - pattern: $S.send(...).await
+          - patterns:
+              - pattern-inside: |
+                  if let Some($T) = $X { ... }
+              - pattern: $T.send(...).await
+
+  - id: work-after-a-stream-loop
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Work awaited after the loop of an async_stream. When the client leaves,
+      the body is dropped at a `yield` and never resumed, so this never runs:
+      a streamed inference request was never metered and its worker never
+      cancelled (the review of 24 September 2026). Put what must happen on
+      every ending in a drop guard (gateway.rs, `Meter`).
+    # A regex, because semgrep does not parse a macro's body: `stream!` is
+    # opaque tokens to it (measured with 1.177.0). PCRE's recursion keeps it
+    # inside the macro: braces are matched in balanced pairs, and the await
+    # must sit at the macro's own depth, after a loop. A match is reported at
+    # the macro's first line.
+    pattern-regex: '(?s)async_stream::stream!\s*\{(?:[^{}]|(?<b>\{(?:[^{}]|(?&b))*\}))*?\n\s*(?:while|loop|for)\b[^{};]*(?&b)(?:[^{}]|(?&b))*?\.await'
+
+  - id: an-insert-whose-failure-is-discarded
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      An insert's result is discarded with `let _ =`. A refused row is then a
+      record that silently does not exist: a provider-removal escalation was
+      lost this way, refused by 0075's CHECK and never seen. Handle the error,
+      or log it where a person will read it.
+    # A regex for the same reason: `sqlx::query!` is a macro. And the one
+    # function whose whole purpose is a record somebody must read, which a
+    # regex on the insert cannot see through: provider_removal.rs discarded
+    # its refusal this way (fixed 24 September 2026).
+    pattern-either:
+      - pattern-regex: (?is)let\s+_\s*=\s*sqlx::query\w*!?\(\s*r?#*"\s*insert\b
+      - pattern: let _ = $P::escalations::raise(...).await;
+    paths:
+      exclude: ["*_test.rs", "tests/"]
+
+  - id: a-socket-authorized-only-at-its-upgrade
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A WebSocket authorized once, at its upgrade. It outlives the request
+      that authorized it, so a terminated account, a removed member or a
+      revoked credential keeps what it opened (the browser console, the
+      review of 24 September 2026). Keep the credential and ask again while
+      it is open (console.rs, `lapsed`).
+    patterns:
+      - pattern: |
+          async fn $F(..., $WS: WebSocketUpgrade, ..., CurrentUser($U): CurrentUser, ...) -> $R { ... }
+      - pattern-not: |
+          async fn $F(...) -> $R { ... <... crate::auth::credential(...) ...>; ... }

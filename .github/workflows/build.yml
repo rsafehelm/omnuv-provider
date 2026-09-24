@@ -16,6 +16,14 @@ jobs:
         run: cargo test --locked
       - name: Lints
         run: cargo clippy --locked --all-targets -- -D warnings
+      # The shapes Core's source review of 24 September 2026 found, one of
+      # them in this agent: the rules' own tests, then the tree.
+      - name: The review's defect classes (semgrep), and the rules' own tests
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.177.0 \
+            semgrep --test --strict --metrics=off --config .semgrep/review-classes.yml .semgrep/review-classes.rs
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.177.0 \
+            semgrep scan --strict --error --metrics=off --config .semgrep/review-classes.yml --exclude .semgrep src
 
   # **The package, not only the crate.** CI built and tested the crate and
   # never built what is installed, so a broken maintainer script or a missing
