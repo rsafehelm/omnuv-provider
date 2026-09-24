@@ -9,6 +9,14 @@
 //! A contract test that generates its fixture from its own dependency proves
 //! only that a library round-trips itself. These payloads come from elsewhere
 //! and are checked in; see `tests/from-core/README.md`.
+//!
+//! **When the two versions are the same, this is a weaker test, and says so
+//! (24 September 2026).** Core and this agent both pin v0.21.0 today. What
+//! runs then is that a payload Core emitted on 14 September still parses with
+//! this agent's types. That is backward compatibility, and worth keeping, but
+//! it is not the version gap described above. The gap exists between Core
+//! moving to a newer tag and this agent following it, and that is when the
+//! payload has to be recaptured from Core and this test run.
 
 use omnuv_protocol::{DesiredState, Lifecycle};
 

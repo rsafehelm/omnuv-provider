@@ -11,6 +11,12 @@ agent already deployed would have failed to deserialize on its next poll. A
 fixture generated at test time from this repository's own dependency could not
 see that, because both halves would move together.
 
+**When to recapture: when Core moves to a newer protocol tag than this agent
+pins.** That is the only time the two views differ, so it is the only time this
+test checks the gap it exists for. With equal pins (v0.21.0 on both, 24
+September 2026), it checks that the 14 September capture still parses. That is
+useful, and it is a different claim.
+
 Regenerate only when Core's output genuinely changes, and treat the diff as the
 review: a key that disappears from one of these files is a key some running
 agent is still looking for.
