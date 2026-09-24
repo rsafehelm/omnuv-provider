@@ -710,10 +710,15 @@ impl Client {
                         ..vm
                     }
                 }
-                // A node that will not answer about one machine is a separate
-                // problem; the converge below will fail in its own words rather
-                // than acting on a guess.
-                Err(_) => vm,
+                // **Not looked at, so not acted on (24 September 2026).** This
+                // fell back to the cached listing, and the converge below then
+                // started or stopped the machine on exactly the stale reading
+                // the paragraph above describes, while this comment claimed it
+                // would not act on a guess. Nothing was observed, so nothing is
+                // done or claimed; the next pass asks again (PROVIDER-26).
+                Err(e) => {
+                    return Err(NotLookedAt(format!("{node} would not say how machine {} is: {e:#}", vm.vmid)).into());
+                }
             };
             let mut running = vm.status.as_deref() == Some("running");
             // **What was seen is what is reported (PROVIDER-26).** Everything
@@ -1731,6 +1736,37 @@ mod tests {
         let (root, dir) = snippets("not-looked-at");
         let e = blind.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect_err("nothing answered");
         assert!(e.downcast_ref::<NotLookedAt>().is_some(), "a machine nobody could look for was reported: {e:#}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// When the node will not give a machine's live status, the cached
+    /// listing's reading is not acted on: a machine listed as stopped is not
+    /// started, and the pass reports it as not looked at.
+    #[tokio::test]
+    async fn a_status_the_node_would_not_give_is_not_guessed_from_the_listing() {
+        use crate::pvemock::{task_ok, Mock};
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        let key = short_tag(&sp.id);
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(ok) = task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 700, "status": "stopped", "tags": format!("{TAG};{key}")}
+                ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") => (503, serde_json::json!(null)),
+                ("GET", _) => (200, serde_json::json!({})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("status-unanswered");
+        let e = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect_err("nothing was observed");
+        assert!(e.downcast_ref::<NotLookedAt>().is_some(), "reported as something: {e:#}");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/700/status/start"), "started on the listing's stale reading");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
