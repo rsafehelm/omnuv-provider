@@ -1069,11 +1069,7 @@ impl Client {
         }
         let Some(node_owned) = chosen else {
             return Err(anyhow::Error::new(Unplaceable { waiting_on: "a provider with free capacity" })
-                .context(format!(
-                    "insufficient resources on this provider: none of its {} node(s) can place this machine. {}",
-                    candidates.len(),
-                    refused.join("; ")
-                )));
+                .context(provider_full(candidates.len(), &refused)));
         };
         let node = node_owned.as_str();
 
@@ -3023,6 +3019,15 @@ impl crate::proxmox::Client {
     }
 }
 
+/// What an operator reads when no node of the provider can place a machine:
+/// one sentence about the provider, with every node's reason behind it.
+fn provider_full(nodes: usize, refused: &[String]) -> String {
+    format!(
+        "insufficient resources on this provider: none of its {nodes} node(s) can place this machine. {}",
+        refused.join("; ")
+    )
+}
+
 #[cfg(test)]
 mod a_provider_is_not_a_node {
     //! **A provider runtime may be one host or a cluster**, and this agent
@@ -3057,11 +3062,9 @@ mod a_provider_is_not_a_node {
             "nuc0: GPU 0000:21:00.0 is already assigned to another guest here".to_string(),
             "nuc1: GPU 0000:21:00.0 is already assigned to another guest here".to_string(),
         ];
-        let message = format!(
-            "insufficient resources on this provider: none of its {} node(s) can place this machine. {}",
-            refused.len(),
-            refused.join("; ")
-        );
+        // The function ensure_instance uses, not a copy of its format string:
+        // the copy was what this test asserted until 24 September 2026.
+        let message = super::provider_full(refused.len(), &refused);
         assert!(message.starts_with("insufficient resources on this provider"));
         assert!(message.contains("2 node(s)"));
         // Every node's reason survives, because "it did not fit" without a
