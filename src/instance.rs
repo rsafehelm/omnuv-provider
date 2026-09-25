@@ -608,11 +608,12 @@ impl Client {
         else {
             return Ok(());
         };
-        self.post_form::<serde_json::Value>(
+        let answer = self.post_form::<serde_json::Value>(
             &format!("/nodes/{node}/qemu/{vmid}/config"),
             &[("net0".to_string(), format!("virtio={mac},bridge={EGRESS_BRIDGE}"))],
         )
         .await?;
+        self.settle(node, answer).await?;
         audit::record("instance.egress", "core", &vmid.to_string(), "ok", Some(EGRESS_BRIDGE));
         Ok(())
     }
@@ -628,11 +629,12 @@ impl Client {
         if current.split(',').any(|kv| kv == format!("bridge={bridge}")) {
             return Ok(());
         }
-        self.post_form::<serde_json::Value>(
+        let answer = self.post_form::<serde_json::Value>(
             &format!("/nodes/{node}/qemu/{vmid}/config"),
             &[("net1".to_string(), format!("virtio={},bridge={bridge}", net.mac))],
         )
         .await?;
+        self.settle(node, answer).await?;
         audit::record("instance.segment", "core", &vmid.to_string(), "ok", Some(&bridge));
         Ok(())
     }
@@ -753,15 +755,22 @@ impl Client {
 
                 // Converge toward the requested lifecycle rather than merely
                 // reporting what is there.
+                let mut held: Option<String> = None;
                 match spec.intent {
-                    Lifecycle::Running if !running => {
-                        let upid: String = self
-                            .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
-                            .await?;
-                        self.wait_task(node, &upid).await?;
-                        audit::record("instance.start", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
-                        running = true;
-                    }
+                    // Through the gate: its inputs first, then the start.
+                    Lifecycle::Running if !running => match self.start_when_ready(node, vm.vmid).await {
+                        Ok(()) => {
+                            audit::record("instance.start", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                            running = true;
+                        }
+                        Err(e) => match e.downcast_ref::<crate::proxmox::NotReady>() {
+                            Some(blocked) => {
+                                audit::record("instance.start", "core", &spec.id, "waiting", Some(&blocked.to_string()));
+                                held = Some(blocked.0.join("; "));
+                            }
+                            None => return Err(e),
+                        },
+                    },
                     Lifecycle::Stopped if running => {
                         let upid: String = self
                             .post_form(&format!("/nodes/{node}/qemu/{}/status/shutdown", vm.vmid), NO_FORM)
@@ -905,6 +914,7 @@ impl Client {
                     // column, the console renders it; nothing was putting anything
                     // in it.
                     waiting_on: match (running, guest_ip.is_some()) {
+                        _ if held.is_some() => held.clone(),
                         (true, false) => Some("first boot to finish".to_string()),
                         (false, _) if spec.intent == Lifecycle::Running => {
                             Some("the machine to start".to_string())
@@ -1154,11 +1164,12 @@ impl Client {
         // the next pass, finding nothing tagged, cloned again. So the claim
         // goes on first, alone, and a failure after the clone undoes the clone.
         let finished: anyhow::Result<()> = async {
-            self.post_form::<serde_json::Value>(
+            let answer = self.post_form::<serde_json::Value>(
                 &format!("/nodes/{node}/qemu/{vmid}/config"),
                 &[("tags".to_string(), crate::names::tags(TAG, &spec.id, self.environment.as_deref()))],
             )
             .await?;
+            self.settle(node, answer).await?;
 
             let config: Vec<(String, String)> = vec![
                 ("cores".into(), spec.vcpus.to_string()),
@@ -1212,22 +1223,27 @@ impl Client {
                             segment_bridge.clone().unwrap_or_else(|| marketplace_bridge(net))),
                 ));
             }
-            self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
+            let answer = self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
+            self.settle(node, answer).await?;
 
-            self.put_form::<serde_json::Value>(
+            let answer = self.put_form::<serde_json::Value>(
                 &format!("/nodes/{node}/qemu/{vmid}/resize"),
                 &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{}G", spec.disk_gib))],
             )
             .await?;
+            self.settle(node, answer).await?;
 
             // **Started only if it is meant to be running (PROVIDER-27).** A
             // machine whose destination is Stopped was built and then started —
             // its card attached, its first boot run — and shut down on the
             // next pass. Stopped is a machine that exists and is not running.
+            // **Through the gate** (`Client::start_when_ready`), and all or
+            // nothing (the operator, 25 September 2026): a machine is started
+            // only once everything handed to it is ready, and when that does
+            // not happen in time the create fails like any other step, so the
+            // clone and everything made for it are taken away below.
             if spec.intent == Lifecycle::Running {
-                let upid: String =
-                    self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
-                self.wait_task(node, &upid).await?;
+                self.start_when_ready(node, vmid).await?;
             }
             Ok(())
         }
@@ -1389,13 +1405,7 @@ impl Client {
             if !maintenance_may_touch(spec.intent, true, running) {
                 continue;
             }
-            let started: anyhow::Result<()> = async {
-                let upid: String = self
-                    .post_form(&format!("/nodes/{at}/qemu/{}/status/start", vm.vmid), NO_FORM)
-                    .await?;
-                self.wait_task(&at, &upid).await
-            }
-            .await;
+            let started: anyhow::Result<()> = self.start_when_ready(&at, vm.vmid).await;
             match started {
                 Ok(()) => {
                     audit::record("instance.maintain", "agent", &spec.id, "restarted", Some(&vm.vmid.to_string()));
@@ -1497,9 +1507,14 @@ impl Client {
     }
 
     pub(crate) async fn abandon_clone(&self, node: &str, vmid: u32, id: &str, event: &str) {
-        let _ = self
+        // Stopped before it is destroyed, and the stop waited for, so the
+        // destroy does not meet the stop's lock (the same race as the start).
+        if let Ok(answer) = self
             .post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/status/stop"), NO_FORM)
-            .await;
+            .await
+        {
+            let _ = self.settle(node, answer).await;
+        }
         let gone: anyhow::Result<()> = async {
             let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{vmid}")).await?;
             self.wait_task(node, &upid).await
@@ -1677,6 +1692,126 @@ mod tests {
         assert!(calls[first_config].body.starts_with("tags="), "the first write after the clone was not the tag");
         assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty(), "a rolled-back clone stayed recorded");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **The start waits for the resize** (Pluto VM 103, 25 September 2026:
+    /// 8 of 99 starts failed "got no worker upid" because the start ran while
+    /// the resize still held the machine). Proxmox answers the resize with a
+    /// task that is still running at the first look; the start is sent only
+    /// after that task has finished.
+    #[tokio::test]
+    async fn a_new_machine_is_started_only_after_its_resize_finished() {
+        use crate::pvemock::Mock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let resize_polls = Arc::new(AtomicUsize::new(0));
+        let polls = resize_polls.clone();
+        let mock = Mock::start(move |method, path, _| {
+            if path.contains("/tasks/") && path.ends_with("/status") {
+                if path.contains("resize") && polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (200, serde_json::json!({"status": "running"}));
+                }
+                return (200, serde_json::json!({"status": "stopped", "exitstatus": "OK"}));
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::json!("UPID:n1:config")),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (200, serde_json::json!("UPID:n1:resize")),
+                ("POST", "/nodes/n1/qemu/123/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("resize-then-start");
+        let result = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
+        assert!(result.is_ok(), "the create failed: {result:?}");
+        let calls = mock.calls.lock().unwrap();
+        let start = calls.iter().position(|c| c.path == "/nodes/n1/qemu/123/status/start").expect("started");
+        let resize_done = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.path.contains("resize") && c.path.ends_with("/status"))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert!(resize_done.len() >= 2, "the resize task was not polled to its end: {resize_done:?}");
+        assert!(start > *resize_done.last().unwrap(), "the start was sent before the resize had finished");
+        drop(calls);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The create's Proxmox, with the gate's answers given: `bridge_up` for
+    /// the segment and `card_held_by` a running machine holding the card.
+    async fn gated_create(bridge_up: bool, card_held_by: Option<u64>) -> (crate::pvemock::Mock, anyhow::Result<InstanceStatus>) {
+        use crate::pvemock::{task_ok, Mock};
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("GET", "/nodes/n1/qemu") => (200, match card_held_by {
+                    Some(other) => serde_json::json!([{"vmid": other, "status": "running"}]),
+                    None => serde_json::json!([]),
+                }),
+                ("GET", p) if p.ends_with("/qemu/800/config") => (200, serde_json::json!({"hostpci0": "mapping=onv-gpu-a,pcie=1"})),
+                ("GET", "/nodes/n1/qemu/123/config") => (200, serde_json::json!({
+                    "net1": "virtio=02:00:00:00:00:01,bridge=onvseg1", "hostpci0": "mapping=onv-gpu-a,pcie=1,rombar=0"})),
+                ("GET", "/nodes/n1/tasks?source=active") => (200, serde_json::json!([])),
+                ("GET", "/cluster/sdn/vnets") => (200, serde_json::json!([{"vnet": "onvseg1", "zone": "onv"}])),
+                ("GET", "/nodes/n1/sdn/zones/onv/content") => (200, serde_json::json!([
+                    {"vnet": "onvseg1", "status": if bridge_up { "available" } else { "pending" }}])),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::json!("UPID:n1:config")),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (200, serde_json::json!("UPID:n1:resize")),
+                ("POST", "/nodes/n1/qemu/123/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/123") => (200, serde_json::json!("UPID:n1:del")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets(&format!("gate-{bridge_up}-{card_held_by:?}"));
+        let result = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
+        std::fs::remove_dir_all(&root).unwrap();
+        (mock, result)
+    }
+
+    /// **All or nothing** (the operator, 25 September 2026): a machine whose
+    /// network segment is not up is never started, and everything the create
+    /// made for it is taken away: stopped, then destroyed.
+    #[tokio::test]
+    async fn a_machine_whose_segment_is_not_up_is_not_started_and_is_rolled_back() {
+        let (mock, result) = gated_create(false, None).await;
+        let err = result.expect_err("a create with its segment down reported success");
+        assert!(format!("{err:#}").contains("onvseg1 is not up"), "the reason is not named: {err:#}");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/123/status/start"), "started with its segment down");
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/123"), "the half-made machine was left");
+    }
+
+    /// Its card still attached to a running machine: not started, rolled back.
+    #[tokio::test]
+    async fn a_machine_whose_card_is_still_held_is_not_started_and_is_rolled_back() {
+        let (mock, result) = gated_create(true, Some(800)).await;
+        let err = result.expect_err("a create whose card was held reported success");
+        assert!(format!("{err:#}").contains("onv-gpu-a is still attached to running machine 800"), "{err:#}");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/123/status/start"), "started with its card held");
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/123"), "the half-made machine was left");
+    }
+
+    /// Everything ready: started, nothing rolled back. The same fixture as the
+    /// two refusals, so they are refusals of the gate and not of the fixture.
+    #[tokio::test]
+    async fn a_machine_whose_inputs_are_ready_is_started() {
+        let (mock, result) = gated_create(true, None).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(mock.called("POST", "/nodes/n1/qemu/123/status/start"));
+        assert!(!mock.called("DELETE", "/nodes/n1/qemu/123"));
     }
 
     fn spec() -> InstanceSpec {
@@ -1995,7 +2130,7 @@ mod tests {
                 ("GET", "/nodes/n2/qemu") => (200, serde_json::json!([{"vmid": 702, "status": "stopped", "tags": format!("{TAG};{b}")}])),
                 ("POST", "/nodes/n1/qemu/701/status/start") => (500, serde_json::Value::Null),
                 ("POST", "/nodes/n2/qemu/702/status/start") => (200, serde_json::json!("UPID:n2:start")),
-                _ => (404, serde_json::Value::Null),
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
             }
         })
         .await;

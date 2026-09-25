@@ -598,6 +598,141 @@ impl Client {
         anyhow::bail!("proxmox task {upid} did not finish in 10 minutes")
     }
 
+    /// **What must be true before a machine is started.** The start is the
+    /// last step of the machine's dependency graph: everything handed to the
+    /// VM has to exist and be free first (the operator, 25 September 2026).
+    /// Read from Proxmox, from the machine's own configuration, so every
+    /// caller asks the same questions. On Pluto 12 of 99 starts had failed on
+    /// one of these: 8 while the machine's own resize still held it ("got no
+    /// worker upid"), 3 while its card was still attached to the machine that
+    /// had it before ("PCI device already in use"), 1 while its network
+    /// segment was not up ("bridge does not exist"). Answers what is not ready,
+    /// in words; empty when it may start.
+    pub(crate) async fn start_blockers(&self, node: &str, vmid: u32) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        let id = vmid.to_string();
+
+        // Nothing of its own still running, and no network reload in flight:
+        // a reload takes every bridge down and up again.
+        let active: Vec<serde_json::Value> = self.get_json(&format!("/nodes/{node}/tasks?source=active")).await?;
+        for t in &active {
+            let ty = t["type"].as_str().unwrap_or("");
+            if t["id"].as_str() == Some(id.as_str()) && ty != "qmstart" {
+                out.push(format!("its own {ty} task is still running"));
+            }
+            if ty == "reloadnetworkall" || (ty == "srvreload" && t["id"].as_str() == Some("networking")) {
+                out.push("the node is reloading its network".to_string());
+            }
+        }
+
+        let cfg: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await?;
+        let fields = cfg.as_object().cloned().unwrap_or_default();
+        let valued = |prefix: &str, key: &str| -> Vec<String> {
+            let mut found: Vec<String> = fields
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix) && k[prefix.len()..].chars().all(|c| c.is_ascii_digit()) && k.len() > prefix.len())
+                .filter_map(|(_, v)| v.as_str())
+                .flat_map(|v| v.split(','))
+                .filter_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+                .collect();
+            found.sort();
+            found.dedup();
+            found
+        };
+
+        // Its bridges up on this node. An SDN network is asked of its zone;
+        // anything else of the node's own interface list.
+        let bridges = valued("net", "bridge");
+        if !bridges.is_empty() {
+            let vnets: Vec<serde_json::Value> = self.get_json("/cluster/sdn/vnets").await?;
+            let mut zones: std::collections::HashMap<String, Vec<serde_json::Value>> = Default::default();
+            for bridge in &bridges {
+                let zone = vnets.iter().find(|v| v["vnet"].as_str() == Some(bridge.as_str())).and_then(|v| v["zone"].as_str());
+                let up = match zone {
+                    Some(zone) => {
+                        if !zones.contains_key(zone) {
+                            let content: Vec<serde_json::Value> =
+                                self.get_json(&format!("/nodes/{node}/sdn/zones/{zone}/content")).await?;
+                            zones.insert(zone.to_string(), content);
+                        }
+                        zones[zone].iter().any(|c| c["vnet"].as_str() == Some(bridge.as_str()) && c["status"] == "available")
+                    }
+                    None => {
+                        let ifaces: Vec<serde_json::Value> = self.get_json(&format!("/nodes/{node}/network")).await?;
+                        ifaces.iter().any(|i| i["iface"].as_str() == Some(bridge.as_str()))
+                    }
+                };
+                if !up {
+                    out.push(format!("network bridge {bridge} is not up on {node}"));
+                }
+            }
+        }
+
+        // Its cards free: no other running machine on this node holds the
+        // same mapping.
+        let mappings = valued("hostpci", "mapping");
+        if !mappings.is_empty() {
+            let vms: Vec<serde_json::Value> = self.get_json(&format!("/nodes/{node}/qemu")).await?;
+            for vm in vms.iter().filter(|v| v["status"] == "running") {
+                let Some(other) = vm["vmid"].as_u64() else { continue };
+                if other == u64::from(vmid) {
+                    continue;
+                }
+                let Ok(ocfg) = self.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{other}/config")).await else {
+                    continue;
+                };
+                for (k, v) in ocfg.as_object().into_iter().flatten() {
+                    if !k.starts_with("hostpci") {
+                        continue;
+                    }
+                    for m in &mappings {
+                        if v.as_str().is_some_and(|v| v.split(',').any(|kv| kv == format!("mapping={m}"))) {
+                            out.push(format!("card {m} is still attached to running machine {other}"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// **Starts the machine once nothing blocks it**, and waits for the start.
+    /// Polls `start_blockers` every 2 s for up to 60 s (ceiling: a resize takes
+    /// milliseconds, a network reload a few seconds, and a card is released
+    /// when the machine before it is destroyed, measured at under 10 s on
+    /// Pluto); after that it answers `NotReady`, starts nothing, and leaves the
+    /// machine built: the next pass starts it through this same gate.
+    pub(crate) async fn start_when_ready(&self, node: &str, vmid: u32) -> anyhow::Result<()> {
+        let mut blockers = self.start_blockers(node, vmid).await?;
+        for _ in 0..START_GATE_LOOKS {
+            if blockers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(START_GATE_EVERY).await;
+            blockers = self.start_blockers(node, vmid).await?;
+        }
+        if !blockers.is_empty() {
+            return Err(NotReady(blockers).into());
+        }
+        let upid: String = self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), &[] as &[(String, String)]).await?;
+        self.wait_task(node, &upid).await
+    }
+
+    /// **Waits for the task a write started, when it started one.** Proxmox
+    /// answers a config POST, a disk resize and a stop with a task id and does
+    /// the work after answering, holding the machine's lock. Not waiting let
+    /// the start of a new machine run while its resize still held that lock,
+    /// and Proxmox's start worker died at birth ("got no worker upid - start
+    /// worker failed", Pluto VM 103, 25 September 2026): the buyer's machine
+    /// went to ERROR and its clone was destroyed. A write that answers null
+    /// did its work synchronously and there is nothing to wait for.
+    pub(crate) async fn settle(&self, node: &str, answer: serde_json::Value) -> anyhow::Result<()> {
+        match answer.as_str() {
+            Some(upid) if upid.starts_with("UPID:") => self.wait_task(node, upid).await,
+            _ => Ok(()),
+        }
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let res = self
             .http
@@ -1649,3 +1784,28 @@ mod first_boot_files_reach_the_node {
         assert!(format!("{e:#}").contains("not a placement node"), "{e:#}");
     }
 }
+
+/// How long the start gate waits: 30 looks 2 s apart (see `start_when_ready`
+/// for the ceiling). Short under test, where nothing becomes ready by waiting.
+#[cfg(not(test))]
+const START_GATE_LOOKS: u32 = 30;
+#[cfg(test)]
+const START_GATE_LOOKS: u32 = 2;
+#[cfg(not(test))]
+const START_GATE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const START_GATE_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A machine that may not be started yet, and why: its inputs are not all
+/// ready (`Client::start_when_ready`). Not a failure of the machine: it stays
+/// built and is started on a later pass.
+#[derive(Debug)]
+pub(crate) struct NotReady(pub Vec<String>);
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not started yet, waiting on: {}", self.0.join("; "))
+    }
+}
+
+impl std::error::Error for NotReady {}

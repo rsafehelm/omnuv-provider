@@ -367,10 +367,7 @@ impl Client {
             // running when Core wants it running must be started on this pass,
             // otherwise a failed first boot leaves it stopped forever.
             if !running && spec.intent == Lifecycle::Running {
-                let upid: String = self
-                    .post_form(&format!("/nodes/{node}/qemu/{}/status/start", vm.vmid), NO_FORM)
-                    .await?;
-                self.wait_task(node, &upid).await?;
+                self.start_when_ready(node, vm.vmid).await?;
                 running = true;
             }
             if running && spec.intent == Lifecycle::Stopped {
@@ -551,11 +548,12 @@ impl Client {
         // The claim alone, before anything that can fail; everything after it
         // is undone if it fails.
         let finished: anyhow::Result<()> = async {
-            self.post_form::<serde_json::Value>(
+            let answer = self.post_form::<serde_json::Value>(
                 &format!("/nodes/{node}/qemu/{vmid}/config"),
                 &[("tags".to_string(), crate::names::tags(TAG, &spec.id, self.environment.as_deref()))],
             )
             .await?;
+            self.settle(node, answer).await?;
 
             let mut config: Vec<(String, String)> = vec![
                 ("cores".into(), spec.vcpus.to_string()),
@@ -573,18 +571,19 @@ impl Client {
             for (i, pci) in spec.gpu_local_ids.iter().enumerate() {
                 config.push((format!("hostpci{i}"), format!("mapping={},pcie=1,rombar=0", mapping_name(pci))));
             }
-            self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
+            let answer = self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
+            self.settle(node, answer).await?;
 
             // The template disk is small; grow it to the allocated size.
-            self.put_form::<serde_json::Value>(
+            let answer = self.put_form::<serde_json::Value>(
                 &format!("/nodes/{node}/qemu/{vmid}/resize"),
                 &[("disk".to_string(), "scsi0".to_string()), ("size".to_string(), format!("{}G", spec.disk_gib))],
             )
             .await?;
+            self.settle(node, answer).await?;
 
-            let upid: String =
-                self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/start"), NO_FORM).await?;
-            self.wait_task(node, &upid).await?;
+            // Through the gate, all or nothing, as an instance's create.
+            self.start_when_ready(node, vmid).await?;
             Ok(())
         }
         .await;

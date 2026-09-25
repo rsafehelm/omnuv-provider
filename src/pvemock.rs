@@ -105,6 +105,23 @@ impl Mock {
     }
 }
 
+/// The start gate's reads (`Client::start_blockers`) answered with nothing
+/// blocking: no task in flight, a machine with no bridges and no cards, no
+/// SDN networks. For a test about something else that ends in a start; a test
+/// of the gate answers these itself.
+pub fn gate_clear(method: &str, path: &str) -> Option<(u16, serde_json::Value)> {
+    if method != "GET" {
+        return None;
+    }
+    if path.contains("/tasks?source=active") || path == "/cluster/sdn/vnets" {
+        return Some((200, serde_json::json!([])));
+    }
+    if path.starts_with("/nodes/") && path.contains("/qemu/") && path.ends_with("/config") {
+        return Some((200, serde_json::json!({})));
+    }
+    None
+}
+
 /// The routing a task-driven call needs: every UPID's status is "stopped, OK".
 pub fn task_ok(path: &str) -> Option<(u16, serde_json::Value)> {
     (path.contains("/tasks/") && path.ends_with("/status"))
