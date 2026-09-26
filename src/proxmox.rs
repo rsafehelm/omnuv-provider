@@ -89,6 +89,7 @@ pub(crate) struct PciEntry {
 
 #[derive(Deserialize)]
 struct VmEntry {
+    #[serde(deserialize_with = "number_or_string")]
     vmid: u32,
     status: Option<String>,
     #[serde(default)]
@@ -100,6 +101,22 @@ struct VmEntry {
     cpus: Option<serde_json::Value>,
     #[serde(default)]
     maxmem: Option<serde_json::Value>,
+}
+
+/// A guest's id, which Proxmox has written as a number and, in container
+/// listings, as a string. One unparseable id would fail the whole listing,
+/// and a failed container listing now withholds the node's disclosure.
+fn number_or_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        Number(u32),
+        Text(String),
+    }
+    match Id::deserialize(d)? {
+        Id::Number(n) => Ok(n),
+        Id::Text(t) => t.trim().parse().map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1509,6 +1526,16 @@ mod host_commitment_tests {
 
     /// And a name that merely *starts* with one of ours is not ours. The reading
     /// of "we do not know whose this is" stays "not ours".
+    /// Positive and negative: a quoted id is the same id, and a word is not one.
+    #[test]
+    fn a_guest_id_is_read_as_a_number_or_as_a_string_of_one() {
+        let read = |v| serde_json::from_value::<VmEntry>(v).map(|e| e.vmid).ok();
+        assert_eq!(read(serde_json::json!({"vmid": 200, "status": "running"})), Some(200));
+        assert_eq!(read(serde_json::json!({"vmid": "200", "status": "running"})), Some(200));
+        assert_eq!(read(serde_json::json!({"vmid": "ct200"})), None);
+        assert_eq!(read(serde_json::json!({"vmid": -1})), None);
+    }
+
     #[test]
     fn a_tag_that_only_looks_like_ours_is_not() {
         assert!(!is_marketplace(Some("onv-ish;x")));
