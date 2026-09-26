@@ -1103,6 +1103,45 @@ mod handshake_tests {
         assert!(beat.contains("\r\nonv-session: s-1"), "the heartbeat went without the session: {beat}");
     }
 
+    /// **The view read again before an act** (G_reread, G_viewMonotone). A
+    /// fresh full view decides; an unchanged one leaves the view held; a full
+    /// answer older than the view held decides nothing, whatever it says.
+    #[tokio::test]
+    async fn an_act_waits_on_a_fresh_view_and_never_an_older_one() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let view = |version: u64, intent: &str| {
+            format!(
+                r#"{{"protocol_version":6,"version":{version},"unchanged":false,"instances":[{{"id":"m","lifecycle":"{intent}","name":"m","vcpus":1,"memory_mib":512,"disk_gib":8}}]}}"#
+            )
+        };
+        let held_at = |version: u64, intent: Lifecycle| {
+            let mut spec = omnuv_protocol::InstanceSpec { id: "m".into(), name: "m".into(), vcpus: 1, memory_mib: 512, disk_gib: 8, ..Default::default() };
+            spec.intent = intent;
+            Arc::new(Mutex::new(Some(DesiredState {
+                protocol_version: 6,
+                version,
+                unchanged: false,
+                inference_workers: vec![],
+                instances: vec![spec],
+                images: vec![],
+                poll_interval_secs: None,
+            })))
+        };
+        for (answer, held, want_absent, want_wanted, why) in [
+            (view(8, "deleted"), held_at(7, Lifecycle::Running), true, false, "a newer view saying Absent"),
+            (view(8, "running"), held_at(7, Lifecycle::Absent), false, true, "a newer view wanting it again"),
+            (view(6, "deleted"), held_at(7, Lifecycle::Running), false, false, "an older view (G_viewMonotone)"),
+            (r#"{"protocol_version":6,"version":7,"unchanged":true}"#.to_string(), held_at(7, Lifecycle::Running), false, true, "unchanged: the view held"),
+        ] {
+            let (base, _rx) = session_stub(move |_, _| ("200 OK", answer.clone())).await;
+            let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+            assert_eq!(still_absent(&core, &held, "m").await.unwrap(), want_absent, "{why}: still_absent");
+            assert_eq!(still_wanted(&core, &held, "m").await.unwrap(), want_wanted, "{why}: still_wanted");
+        }
+    }
+
     /// **Against an old Core, no session is sent** (mixed versions). A Core
     /// that predates sessions, or runs them switched off, answers the
     /// handshake without one: this agent then calls exactly as it did before.
@@ -1910,6 +1949,15 @@ async fn reconcile_workers(
             // The image names a template this provider must have. Refusing
             // here, with the reason reported, is what keeps the scheduler's
             // provider_images honest: Core only places images we said we offer.
+            // **Re-read before a build** (G_reread, S8): a machine Core has
+            // not seen built is cloned only if a fresh view still wants it.
+            // Not wanted, or the view could not be read: nothing is built,
+            // nothing is said, and the observation is incomplete.
+            _ if !spec.built && !matches!(still_wanted(core, held, &spec.id).await, Ok(true)) => {
+                Err(anyhow::Error::from(crate::instance::NotLookedAt(
+                    "Core's view, read again just before the build, no longer wants this machine; nothing was built".into(),
+                )))
+            }
             _ => match cfg.proxmox.template_for(&spec.image.id) {
                 Some(template) => {
                     driver.ensure_instance(node, template, storage, &cfg.proxmox.snippet_dir, spec).await
@@ -2104,25 +2152,46 @@ fn waiting_on(gone: &crate::teardown::Gone) -> Option<String> {
 /// licenses no destroy (the model's G_viewMonotone, kept beside the re-read:
 /// their pair was never model-checked, TODO.md). Could not ask is not yes.
 async fn still_absent(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<bool> {
+    Ok(intent_now(core, held, id).await? == Some(Lifecycle::Absent))
+}
+
+/// **Core's view, read again just before a build** (G_reread for creates;
+/// S8: "the agent builds (k, t) only on its newest session's view, re-read
+/// just before"). The model's counterexample is exactly this: the agent
+/// fetched a machine Running, the buyer deleted it, and the agent cloned and
+/// started it from the view it held. A machine Core has not seen built is
+/// cloned only if a fresh view still wants it.
+async fn still_wanted(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<bool> {
+    Ok(matches!(intent_now(core, held, id).await?, Some(Lifecycle::Running | Lifecycle::Stopped)))
+}
+
+/// What a fresh view says of `id`: its intent, or nothing — not in the view,
+/// or no view this agent may act on. A full answer older than the view held
+/// is never acted on (G_viewMonotone).
+async fn intent_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<Option<Lifecycle>> {
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
     let fetched: DesiredState = core.get_json(&format!("/provider/v1/desired-state?known={known}")).await?;
     let view = if fetched.unchanged {
         match crate::poison::lock(held, "held desired state").clone() {
             Some(d) => d,
-            None => return Ok(false),
+            None => return Ok(None),
         }
     } else if fetched.version < known {
         eprintln!(
-            "the view read again before a destroy is revision {}, older than the {known} this agent holds; nothing is destroyed on it",
+            "the view read again before an act is revision {}, older than the {known} this agent holds; nothing is done on it",
             fetched.version
         );
-        return Ok(false);
+        return Ok(None);
     } else {
         *crate::poison::lock(held, "held desired state") = Some(fetched.clone());
         fetched
     };
-    Ok(view.instances.iter().any(|s| s.id == id && s.intent == Lifecycle::Absent)
-        || view.inference_workers.iter().any(|s| s.id == id && s.intent == Lifecycle::Absent))
+    Ok(view
+        .instances
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.intent)
+        .or_else(|| view.inference_workers.iter().find(|s| s.id == id).map(|s| s.intent)))
 }
 
 #[cfg(test)]
