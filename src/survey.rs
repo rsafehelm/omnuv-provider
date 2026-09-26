@@ -111,6 +111,78 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
     out
 }
 
+/// **What each machine's drive refresh did this pass (gap 4, 25 September
+/// 2026).**
+///
+/// A machine that already exists has its generated cloud-init brought up to
+/// date on every pass, and a failure there was printed and nothing else: it is
+/// retried, so a transient one heals, and a lasting one lived only in the
+/// agent's own journal where nobody was looking. It is a check now, on the
+/// channel the report already carries — reported and deciding nothing, like
+/// every other check here.
+///
+/// ```text
+/// instance.cloud_init   fail   one per machine whose refresh failed, subject = its key tag
+/// instances.refreshed   pass   how many were refreshed, said every pass
+/// ```
+///
+/// Emptied by `drain` at the end of the pass that filled it, so the checks
+/// describe that pass and a machine Core stopped asking about stops being
+/// mentioned. Cloned with the driver, which is why the outcomes are behind an
+/// `Arc`.
+/// One machine's id, and why its refresh failed when it did.
+type Refreshed = (String, Option<String>);
+
+#[derive(Clone, Default)]
+pub struct Refreshes {
+    outcomes: std::sync::Arc<std::sync::Mutex<Vec<Refreshed>>>,
+}
+
+impl Refreshes {
+    /// One machine's outcome: `Err` carries the failure as it was printed.
+    pub fn record(&self, id: &str, outcome: Result<(), String>) {
+        crate::poison::lock(&self.outcomes, "cloud-init refreshes")
+            .push((id.to_string(), outcome.err()));
+    }
+
+    /// The checks this pass's refreshes contribute, and empties the store.
+    pub fn drain(&self) -> Vec<SelfCheck> {
+        let outcomes: Vec<Refreshed> =
+            std::mem::take(&mut *crate::poison::lock(&self.outcomes, "cloud-init refreshes"));
+        if outcomes.is_empty() {
+            return Vec::new();
+        }
+        let failed = outcomes.iter().filter(|(_, e)| e.is_some()).count();
+        let mut out: Vec<SelfCheck> = outcomes
+            .iter()
+            .filter_map(|(id, e)| {
+                e.as_ref().map(|why| SelfCheck {
+                    name: "instance.cloud_init".into(),
+                    kind: CheckKind::Presence,
+                    result: CheckResult::Fail,
+                    detail: Some(format!(
+                        "this machine's first-boot drive could not be brought up to date, \
+                         so a generator change has not reached it: {why}"
+                    )),
+                    subject: Some(crate::names::short_tag(id)),
+                })
+            })
+            .collect();
+        out.push(SelfCheck {
+            name: "instances.refreshed".into(),
+            kind: CheckKind::Presence,
+            result: if failed == 0 { CheckResult::Pass } else { CheckResult::Fail },
+            detail: Some(format!(
+                "{} of {} machine(s) had their first-boot drive brought up to date",
+                outcomes.len() - failed,
+                outcomes.len()
+            )),
+            subject: None,
+        });
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +207,36 @@ mod tests {
 
     fn guest(vmid: u32, tags: &str) -> ClaimedGuest {
         ClaimedGuest { node: "pve1".into(), vmid, tags: tags.into() }
+    }
+
+    /// **Both directions** (gap 4). A pass where every drive refresh worked
+    /// says so and names no machine; one where a refresh failed says which.
+    /// A pass that refreshed nothing says nothing, rather than a pass with
+    /// nothing wrong: this is a check that must not read as running when it
+    /// is not.
+    #[test]
+    fn a_refresh_is_reported_both_ways() {
+        let store = Refreshes::default();
+        assert!(store.drain().is_empty(), "a pass with no machines invented a check");
+
+        store.record(ASKED, Ok(()));
+        let green = store.drain();
+        assert_eq!(green.len(), 1, "{green:?}");
+        assert_eq!(green[0].name, "instances.refreshed");
+        assert_eq!(green[0].result, CheckResult::Pass);
+        assert!(green[0].detail.as_deref().unwrap().contains("1 of 1"));
+
+        store.record(ASKED, Ok(()));
+        store.record(GONE, Err("the hypervisor said no".into()));
+        let red = store.drain();
+        let failed: Vec<_> = red.iter().filter(|c| c.name == "instance.cloud_init").collect();
+        assert_eq!(failed.len(), 1, "{red:?}");
+        assert_eq!(failed[0].subject.as_deref(), Some(crate::names::short_tag(GONE).as_str()));
+        assert!(failed[0].detail.as_deref().unwrap().contains("the hypervisor said no"));
+        let summary = red.iter().find(|c| c.name == "instances.refreshed").expect("a summary");
+        assert_eq!(summary.result, CheckResult::Fail);
+        assert!(summary.detail.as_deref().unwrap().contains("1 of 2"));
+        assert!(store.drain().is_empty(), "the store was not emptied by the pass that read it");
     }
 
     const ASKED: &str = "3f2a1b4c-5d6e-4f70-8192-a3b4c5d6e7f8";

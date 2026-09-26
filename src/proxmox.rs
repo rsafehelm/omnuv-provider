@@ -191,6 +191,9 @@ pub struct Client {
     /// what workers are told. The defaults until `with_timings`, which are the
     /// values these were compiled in as.
     pub(crate) timings: crate::timings::Timings,
+    /// What each machine's cloud-init refresh did this pass, for the checks
+    /// the report carries. See `survey::Refreshes`.
+    pub(crate) refreshes: crate::survey::Refreshes,
 }
 
 impl ComputeDriver for Client {
@@ -386,6 +389,7 @@ impl Client {
             showall,
             images: Default::default(),
             timings: Default::default(),
+            refreshes: Default::default(),
         })
     }
 

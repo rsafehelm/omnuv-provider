@@ -788,8 +788,15 @@ impl Client {
                 // rebooting it to apply a marketplace change is not ours to
                 // decide. It takes effect at their next boot — including the one
                 // they may ask for on the line below.
-                if spec.intent != Lifecycle::Absent
-                    && let Err(e) = self
+                //
+                // **A failure here is a check, not only a line in the journal**
+                // (gap 4, 25 September 2026). It is retried every pass, so a
+                // transient one heals and never needed reporting; a lasting one
+                // was visible nowhere but `journalctl` on the provider, and
+                // what it means is that a generator change has not reached a
+                // buyer's machine. See `survey::Refreshes`.
+                if spec.intent != Lifecycle::Absent {
+                    let refreshed = self
                         .sync_cloud_init(
                             node,
                             vm.vmid,
@@ -797,9 +804,11 @@ impl Client {
                             &crate::names::snippet_instance(&spec.id),
                             &cloud_init(spec, self.apt_mirror.as_deref(), vm.vmid),
                         )
-                        .await
-                {
-                    eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
+                        .await;
+                    if let Err(e) = &refreshed {
+                        eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
+                    }
+                    self.refreshes.record(&spec.id, refreshed.map(|_| ()).map_err(|e| format!("{e:#}")));
                 }
 
                 // **Once per token (PROVIDER-4).** Performed here and echoed back so
@@ -1009,6 +1018,40 @@ impl Client {
             });
         }
 
+        // **One clone at a time for one machine (gap 1, 25 September 2026).**
+        // The journal was settled at the start of every create, and a clone it
+        // could not settle — one still running, or one whose rollback failed —
+        // was left journalled and then cloned again anyway: two clones of the
+        // same machine, two disks, and the first destroyed once it was found
+        // finished. The pass settled the journal before this loop ran, so
+        // anything still recorded is work in flight, and the answer is to say
+        // what is being waited on rather than to start a second one.
+        //
+        // No `local_id`: Core reads one as *built* (`instances.local_id is not
+        // null`), and a machine reported built that is then rolled back is
+        // reported lost for ever rather than created again.
+        if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), &spec.id) {
+            eprintln!("instance {}: not cloned again; waiting on {}", spec.id, owed.waiting_on());
+            return Ok(InstanceStatus {
+                id: spec.id.clone(),
+                rebooted_token: None,
+                state: InstanceState::Provisioning,
+                retryable: None,
+                waiting_on: Some(owed.waiting_on()),
+                local_id: None,
+                node: None,
+                console_password_generation: None,
+                private_ip: None,
+                adapters: Vec::new(),
+                diagnostics: None,
+                message: Some(format!(
+                    "an earlier clone of this machine is not settled ({}); nothing new was started",
+                    owed.waiting_on()
+                )),
+                recipe_progress: None,
+            });
+        }
+
         // **A card that is not free is refused before anything is built, and
         // every node is asked.**
         //
@@ -1090,8 +1133,9 @@ impl Client {
         // address there needs to be unique on one wire, and the hypervisor's
         // own id is what guarantees that. A read, so taking it earlier costs
         // nothing.
-        // Settle what an earlier create left unrecorded before starting another.
-        self.recover_pending(snippet_dir).await;
+        // The journal was settled at the top of this pass, before anything was
+        // created or deleted (`recover_pending`), and the check above refused
+        // to get this far while anything was still owed for this machine.
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
 
         let user_data = match spec.image.first_boot {
@@ -1123,6 +1167,7 @@ impl Client {
             node: node.to_string(),
             upid: None,
             claim: TAG.to_string(),
+            stage: crate::pending::Stage::Cloning,
         };
         crate::pending::write(&journal, &pending)?;
 
@@ -1148,16 +1193,18 @@ impl Client {
         // A full clone of a large template can outlast ten minutes, and one
         // unanswered status read is not an ending. Only Proxmox's own answer
         // decides: a failed clone is rolled back now; one whose end could not
-        // be seen stays recorded, and a later create settles it.
+        // be seen stays recorded, and the next pass settles it.
         match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs, self.timings.clone_budget_max)).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
-                self.abandon_clone(node, vmid, &spec.id, "instance").await;
-                crate::pending::remove(&journal, vmid);
-                anyhow::bail!("proxmox task failed: {exit}");
+                let gone = self.abandon_clone(&journal, &pending, "instance").await;
+                if gone {
+                    anyhow::bail!("proxmox task failed: {exit}");
+                }
+                anyhow::bail!("proxmox task failed: {exit}; {}", shell_left(vmid));
             }
             crate::proxmox::TaskEnd::Unknown(why) => {
-                anyhow::bail!("the clone of {vmid} has not been seen to finish ({why}); it stays recorded, and the next create settles it");
+                anyhow::bail!("the clone of {vmid} has not been seen to finish ({why}); it stays recorded, and the next pass settles it");
             }
         }
 
@@ -1233,6 +1280,18 @@ impl Client {
             .await?;
             self.settle(node, answer).await?;
 
+            // **The machine is complete here, so the record goes here** (RC4,
+            // 26 September 2026). It used to go after the start below, and an
+            // agent stopped inside a start task left the clone's record behind:
+            // the next create read it as a leftover clone and destroyed a
+            // machine that had just come up, with Core never having said
+            // Absent. `deploy-agent.yml` restarts the agent, so the window was
+            // a start task's duration rather than anything rare. A configured
+            // machine carries its claim, so every sweep and every later pass
+            // finds it by tag; the start is convergence, which the next pass
+            // does anyway.
+            crate::pending::remove(&journal, vmid);
+
             // **Started only if it is meant to be running (PROVIDER-27).** A
             // machine whose destination is Stopped was built and then started —
             // its card attached, its first boot run — and shut down on the
@@ -1249,11 +1308,13 @@ impl Client {
         }
         .await;
         if let Err(e) = finished {
-            self.abandon_clone(node, vmid, &spec.id, "instance").await;
-            crate::pending::remove(&journal, vmid);
-            return Err(e);
+            // The rollback writes its own record before it asks for anything,
+            // and keeps it if the destroy is not seen to succeed.
+            let gone = self.abandon_clone(&journal, &pending, "instance").await;
+            // `context` rather than a new error: `NotReady` and the rest stay
+            // downcastable, and the caller's classification is unchanged.
+            return Err(if gone { e } else { e.context(shell_left(vmid)) });
         }
-        crate::pending::remove(&journal, vmid);
         audit::record("instance.create", "core", &spec.id, "ok", Some(&vmid.to_string()));
         // The first-boot password is the generation this spec carried. Written
         // down so a reset asked for while the machine was being built is not
@@ -1420,27 +1481,41 @@ impl Client {
         Ok(restarted)
     }
 
-    /// Undoes a clone this create made and could not finish.
+    /// **Settle the clones a create never saw finish (PROVIDER-1), on every
+    /// pass.** Each record is a VMID this agent asked Proxmox to clone into
+    /// for one machine, and something this agent still owes for it.
     ///
-    /// By VMID, because the machine may not carry its tag yet. That is safe
-    /// only because this very call created it a moment ago: nothing else can
-    /// be at that id. A failure here is recorded and left; if the tag went on,
-    /// the next pass finds the machine by it and does not clone again.
-    /// **Settle the clones a create never saw finish (PROVIDER-1).** Each
-    /// record is a VMID this agent asked Proxmox to clone into for one
-    /// machine, and whose ending it did not see.
+    /// It ran at the start of every create until 26 September 2026, and that
+    /// one fact is the cause of four defects: a clone left behind by a delete
+    /// (nothing creates on a provider whose last machine is being removed), a
+    /// second clone started beside a first, a rollback that failed and was
+    /// forgotten, and a machine destroyed because the record of its own clone
+    /// outlived the create. It is called once per reconcile pass now, before
+    /// anything is created or deleted.
     ///
     /// ```text
-    /// the clone is still running          kept, and asked again next time
-    /// no machine at that VMID             the record goes: nothing was made
-    /// ours by its claim, or untagged with   claimed, then removed, then the
-    /// its clone task finished OK and the   record goes: the create never
-    /// clone's stamp and pool on it         finished, and the next one clones
-    ///                                     afresh
-    /// untagged, and its config unreadable  kept, and asked again next time
-    /// anything else                        left alone and said: this agent
-    ///                                     cannot prove it made it
+    /// stage        what is there                     what happens
+    /// Abandoned    nothing at that VMID              the record goes: the rollback took
+    /// Abandoned    a machine                         stopped and destroyed again; the record
+    ///                                                stays until it is seen gone
+    /// Cloning      the clone is still running        kept, and asked again next pass
+    /// Cloning      no machine at that VMID           the record goes: nothing was made
+    /// Cloning      ours, by its claim                the record goes and the machine stays:
+    ///                                                the create got as far as claiming it
+    /// Cloning      untagged, with the clone's stamp  claimed, then destroyed, then the record
+    ///              and pool on it                    goes: the create never finished
+    /// Cloning      untagged, config unreadable       kept, and asked again next pass
+    /// Cloning      anything else                     left alone and said: this agent cannot
+    ///                                                prove it made it
     /// ```
+    ///
+    /// **A claimed machine is kept, not destroyed** (RC4, 26 September 2026).
+    /// A record whose machine carries the claim is a record that outlived its
+    /// create — the create removes it the moment the machine is configured —
+    /// and the machine is one every sweep and every later pass can find by its
+    /// tag. Destroying it was a running machine destroyed without Core having
+    /// said Absent. A rollback that is genuinely owed says so in its stage,
+    /// which is written before the destroy is asked for.
     ///
     /// Untagged alone is not proof (26 September 2026): Proxmox reuses a freed
     /// VMID, so a leftover clone removed by somebody else can be followed at
@@ -1453,8 +1528,30 @@ impl Client {
     pub(crate) async fn recover_pending(&self, snippet_dir: &str) {
         let journal = crate::pending::dir(snippet_dir);
         for entry in crate::pending::list(&journal) {
+            let event = if entry.claim == crate::names::TAG_WORKER { "worker" } else { "instance" };
+            // **A rollback that failed is owed until the machine is gone**
+            // (gap 3, 25 September 2026). It used to be logged, the record
+            // removed anyway, and the create reported with no runtime id —
+            // which is the proof Core frees a claim on, given for a shell
+            // still holding a card. Asked again here, every pass, until the
+            // machine is not there.
+            if entry.stage == crate::pending::Stage::Abandoned {
+                match self.vm_at(entry.vmid).await {
+                    Err(e) => eprintln!("pending clone {}: cannot list machines, its rollback is still owed: {e}", entry.vmid),
+                    Ok(None) => {
+                        audit::record(&format!("{event}.create"), "core", &entry.id, "rollback confirmed", Some(&entry.vmid.to_string()));
+                        crate::pending::remove(&journal, entry.vmid);
+                    }
+                    Ok(Some(_)) => {
+                        self.abandon_clone(&journal, &entry, event).await;
+                    }
+                }
+                continue;
+            }
             // Proxmox's record of the clone, when there is one: the only proof
-            // that a machine at this VMID is the one this agent made.
+            // that a machine at this VMID is the one this agent made. Asked
+            // before the listing, because a clone still running may not be in
+            // the listing at all and its absence there means nothing.
             let cloned = match &entry.upid {
                 Some(upid) => match self.task_end(&entry.node, upid, 1).await {
                     crate::proxmox::TaskEnd::Ended(Ok(())) => true,
@@ -1463,27 +1560,30 @@ impl Client {
                 },
                 None => false,
             };
-            #[derive(serde::Deserialize)]
-            struct ClusterVm {
-                vmid: u32,
-                #[serde(default)]
-                tags: Option<String>,
-                #[serde(default)]
-                pool: Option<String>,
-            }
-            let vms: Vec<ClusterVm> = match self.get_json("/cluster/resources?type=vm").await {
-                Ok(v) => v,
+            let vm = match self.vm_at(entry.vmid).await {
+                Ok(Some(vm)) => vm,
+                Ok(None) => {
+                    crate::pending::remove(&journal, entry.vmid);
+                    continue;
+                }
                 Err(e) => {
                     eprintln!("pending clone {}: cannot list machines, kept: {e}", entry.vmid);
                     continue;
                 }
             };
-            let Some(vm) = vms.into_iter().find(|v| v.vmid == entry.vmid) else {
-                crate::pending::remove(&journal, entry.vmid);
-                continue;
-            };
             let tags = vm.tags.clone().unwrap_or_default();
             let ours = tags.split(';').any(|t| t == entry.claim) && tags.split(';').any(|t| t == short_tag(&entry.id));
+            // **The create claimed it, so it is a machine and not a leftover**
+            // (RC4). See the note above.
+            if ours {
+                eprintln!(
+                    "pending clone {}: it carries this agent's claim, so it is a machine and not a leftover; the record goes and the machine stays",
+                    entry.vmid
+                );
+                audit::record(&format!("{event}.create"), "core", &entry.id, "claimed machine kept", Some(&entry.vmid.to_string()));
+                crate::pending::remove(&journal, entry.vmid);
+                continue;
+            }
             // **Untagged is not proof** (phase 1, 26 September 2026). A clone
             // left behind can be removed by somebody else, and Proxmox gives
             // its VMID to the next VM created, which may be the host owner's
@@ -1492,7 +1592,7 @@ impl Client {
             // if it carries what the clone call itself wrote — the stamp in its
             // description, in the pool the clone put it in. A config that
             // cannot be read proves nothing, and keeps the record for later.
-            let stamped = if !ours && cloned && tags.trim().is_empty() {
+            let stamped = if cloned && tags.trim().is_empty() {
                 let pool = if entry.claim == crate::names::TAG_WORKER { crate::join::GATEWAY_POOL } else { BUYER_POOL };
                 let config = match self
                     .get_json::<serde_json::Value>(&format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid))
@@ -1515,7 +1615,7 @@ impl Client {
             // anybody's: the request may never have arrived, and the VMID been
             // given to something else since. It is named, for the operator,
             // and left.
-            if !ours && !stamped {
+            if !stamped {
                 eprintln!(
                     "pending clone {}: a machine is there (tags: {tags:?}) that this agent cannot prove it made; left for the operator",
                     entry.vmid
@@ -1524,24 +1624,52 @@ impl Client {
                 crate::pending::remove(&journal, entry.vmid);
                 continue;
             }
-            if !ours
-                && let Err(e) = self
-                    .post_form::<serde_json::Value>(
-                        &format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid),
-                        &[("tags".to_string(), crate::names::tags(&entry.claim, &entry.id, self.environment.as_deref()))],
-                    )
-                    .await
+            if let Err(e) = self
+                .post_form::<serde_json::Value>(
+                    &format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid),
+                    &[("tags".to_string(), crate::names::tags(&entry.claim, &entry.id, self.environment.as_deref()))],
+                )
+                .await
             {
                 eprintln!("pending clone {}: could not claim it, kept: {e}", entry.vmid);
                 continue;
             }
-            let event = if entry.claim == crate::names::TAG_WORKER { "worker" } else { "instance" };
-            self.abandon_clone(&entry.node, entry.vmid, &entry.id, event).await;
-            crate::pending::remove(&journal, entry.vmid);
+            self.abandon_clone(&journal, &entry, event).await;
         }
     }
 
-    pub(crate) async fn abandon_clone(&self, node: &str, vmid: u32, id: &str, event: &str) {
+    /// One machine as the cluster lists it, or nothing there. Never "could not
+    /// ask" read as "not there": the error is the caller's to keep.
+    async fn vm_at(&self, vmid: u32) -> anyhow::Result<Option<ClusterVm>> {
+        let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
+        Ok(vms.into_iter().find(|v| v.vmid == vmid))
+    }
+
+    /// **Takes away a clone this create made and could not finish, and says
+    /// whether it is gone.**
+    ///
+    /// By VMID, because the machine may not carry its tag yet. That is safe
+    /// only because this very call created it a moment ago, or because the
+    /// record proves this agent made what is at that id.
+    ///
+    /// The record is written as `Abandoned` *before* anything is asked for, so
+    /// an agent stopped inside a rollback still owes it, and it is removed
+    /// only when Proxmox has said the machine is gone. A destroy that failed
+    /// used to be printed and the record dropped: the shell stayed, tagged, on
+    /// the host, and the create reported "nothing built", which is the proof
+    /// three release paths in Core take (gap 3).
+    pub(crate) async fn abandon_clone(
+        &self,
+        journal: &std::path::Path,
+        entry: &crate::pending::PendingClone,
+        event: &str,
+    ) -> bool {
+        let (node, vmid, id) = (entry.node.as_str(), entry.vmid, entry.id.as_str());
+        if let Err(e) = crate::pending::write(journal, &entry.abandoned()) {
+            // Said, and the rollback still attempted: a record that could not
+            // be written is a reason to try harder, never to leave a shell.
+            eprintln!("instance {id}: the rollback of {vmid} could not be written down: {e:#}");
+        }
         // Stopped before it is destroyed, and the stop waited for, so the
         // destroy does not meet the stop's lock (the same race as the start).
         if let Ok(answer) = self
@@ -1557,8 +1685,15 @@ impl Client {
         .await;
         let outcome = if gone.is_ok() { "rolled back" } else { "rollback failed" };
         audit::record(&format!("{event}.create"), "core", id, outcome, Some(&vmid.to_string()));
-        if let Err(e) = gone {
-            eprintln!("instance {id}: could not remove clone {vmid} after a failed create: {e}");
+        match gone {
+            Ok(()) => {
+                crate::pending::remove(journal, vmid);
+                true
+            }
+            Err(e) => {
+                eprintln!("instance {id}: could not remove clone {vmid} after a failed create, and it stays recorded: {e}");
+                false
+            }
         }
     }
 
@@ -1568,6 +1703,27 @@ impl Client {
         id: &str,
         snippet_dir: &str,
     ) -> anyhow::Result<()> {
+        // **Nothing carrying the claim is not nothing there** (gap 2, 25
+        // September 2026). A clone is untagged from the moment it exists until
+        // the create claims it, so a delete arriving while one was in flight —
+        // or after a create timed out on one — found nothing tagged and
+        // reported the machine gone. That report is the proof Core releases a
+        // claim on, and the clone went on to finish as an untagged disk that
+        // only the next create on that provider would have settled.
+        //
+        // So the journal is asked first, and this pass settled it before
+        // anything was deleted (`recover_pending`). What is left is a clone
+        // still running or a rollback still owed, and in neither case is this
+        // machine gone.
+        if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), id) {
+            anyhow::bail!(
+                "this machine is not gone: {} (vm {} on {}), so nothing it holds may be released yet",
+                owed.waiting_on(),
+                owed.vmid,
+                owed.node
+            );
+        }
+
         // The cloud-init snippet goes with the machine.
         //
         // It was written on create and released by nothing: `CLAUDE.md`'s
@@ -1622,6 +1778,27 @@ impl Client {
     }
 }
 
+
+/// One guest as `/cluster/resources` lists it, reduced to what settling a
+/// journal record needs: is it there, whose claim does it carry, and is it in
+/// the pool the clone put it in.
+#[derive(serde::Deserialize)]
+pub(crate) struct ClusterVm {
+    pub(crate) vmid: u32,
+    #[serde(default)]
+    pub(crate) tags: Option<String>,
+    #[serde(default)]
+    pub(crate) pool: Option<String>,
+}
+
+/// **What a create's failure says when its clone was not seen to go away**
+/// (gap 3). Core frees a claim on a create that reports nothing built, so a
+/// rollback that failed must not read like one that took: the shell is named,
+/// the record keeps the rollback owed, and the machine's delete refuses to
+/// report it gone until it is.
+pub(crate) fn shell_left(vmid: u32) -> String {
+    format!("vm {vmid} was not seen to go away, so nothing was proven to have been taken back")
+}
 
 /// Whether a tag list belongs to a machine this agent built under an older
 /// name. **Two generations now**, `omnu-` and `omnuv-`, because there have been
@@ -2384,7 +2561,7 @@ mod tests {
         .await;
         let (root, dir) = snippets("unproven");
         let journal = crate::pending::dir(&dir);
-        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None, claim: TAG.to_string() })
+        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None, claim: TAG.to_string(), stage: crate::pending::Stage::Cloning })
             .unwrap();
         mock.client().recover_pending(&dir).await;
         let calls = mock.calls.lock().unwrap();
@@ -2430,6 +2607,7 @@ mod tests {
                 &crate::pending::PendingClone {
                     vmid: 777, id: "i-decoy".into(), node: "n1".into(),
                     upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
+                    stage: crate::pending::Stage::Cloning,
                 },
             )
             .unwrap();
@@ -2445,6 +2623,343 @@ mod tests {
             assert_eq!(crate::pending::list(&journal).len(), usize::from(kept), "{name}: the record");
             std::fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    /// **RC4: a machine the create claimed is not destroyed by its own
+    /// record** (the lifecycle model's family A2, 26 September 2026).
+    ///
+    /// The record used to be removed only after the start task returned, so an
+    /// agent stopped inside that window left it behind — and `recover_pending`
+    /// destroyed the machine it found at that VMID, which by then was a
+    /// buyer's machine that had just come up. Core never said Absent.
+    ///
+    /// The record goes; the machine stays; nothing is asked of it.
+    #[tokio::test]
+    async fn a_machine_that_carries_the_claim_is_not_destroyed_by_its_own_record() {
+        use crate::pvemock::{task_ok, Mock};
+        let sp = spec();
+        let key = short_tag(&sp.id);
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (
+                    200,
+                    serde_json::json!([{
+                        "node": "n1", "vmid": 123, "status": "running",
+                        "pool": BUYER_POOL, "tags": format!("{TAG};{key};onv-test")
+                    }]),
+                ),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("rc4");
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(
+            &journal,
+            &crate::pending::PendingClone {
+                vmid: 123,
+                id: sp.id.clone(),
+                node: "n1".into(),
+                upid: Some("UPID:n1:clone".into()),
+                claim: TAG.to_string(),
+                stage: crate::pending::Stage::Cloning,
+            },
+        )
+        .unwrap();
+        mock.client().recover_pending(&dir).await;
+        let calls = mock.calls.lock().unwrap();
+        let touched: Vec<String> = calls
+            .iter()
+            .filter(|c| c.method != "GET" && c.path.starts_with("/nodes/n1/qemu/123"))
+            .map(|c| format!("{} {}", c.method, c.path))
+            .collect();
+        assert!(touched.is_empty(), "a machine carrying this agent's claim was acted on: {touched:?}");
+        drop(calls);
+        assert!(crate::pending::list(&journal).is_empty(), "the stale record was kept, so the next pass asks again");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **And the window itself is gone**: by the time the start is asked for,
+    /// the create has already removed the record. This is the same defect as
+    /// the test above, proved where it is caused rather than where it bites —
+    /// an agent killed at any point from here on leaves nothing that a later
+    /// pass could read as a leftover clone.
+    #[tokio::test]
+    async fn the_clone_record_is_gone_before_the_start_is_asked_for() {
+        use crate::pvemock::Mock;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+        let (root, dir) = snippets("record-before-start");
+        let journal = crate::pending::dir(&dir);
+        // 0 not asked, 1 the record was still there, 2 it was gone.
+        let at_start = Arc::new(AtomicU8::new(0));
+        let seen = at_start.clone();
+        let record = journal.join("123.json");
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = crate::pvemock::task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::json!("UPID:n1:config")),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (200, serde_json::json!("UPID:n1:resize")),
+                ("POST", "/nodes/n1/qemu/123/status/start") => {
+                    seen.store(if record.exists() { 1 } else { 2 }, Ordering::SeqCst);
+                    (200, serde_json::json!("UPID:n1:start"))
+                }
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+            }
+        })
+        .await;
+        let result = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
+        assert!(result.is_ok(), "the create failed: {result:?}");
+        assert_eq!(
+            at_start.load(Ordering::SeqCst),
+            2,
+            "the clone's record was still there when the start was asked for, so an agent stopped \
+             inside the start task leaves a record that the next create reads as a leftover clone"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A rollback that failed is owed, and the create says so** (gap 3, 25
+    /// September 2026). The destroy failing was printed, the record dropped,
+    /// and the create reported with no runtime id — which is the proof Core
+    /// frees a claim on, given while a tagged shell held the card.
+    ///
+    /// Two halves: the create keeps the record and names the shell, and the
+    /// next pass asks again and removes the record only once the machine is
+    /// not there.
+    #[tokio::test]
+    async fn a_rollback_that_failed_stays_owed_and_is_asked_again() {
+        use crate::pvemock::{task_ok, Mock};
+        let mock = Mock::start(|method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                // The hypervisor refuses to destroy it: the shell stays.
+                ("DELETE", "/nodes/n1/qemu/123") => (500, serde_json::Value::Null),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("rollback-failed");
+        let journal = crate::pending::dir(&dir);
+        let e = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await.expect_err("the resize failed");
+        assert!(
+            format!("{e:#}").contains("not seen to go away"),
+            "a create whose rollback failed reported as though nothing was built: {e:#}"
+        );
+        let owed = crate::pending::list(&journal);
+        assert_eq!(owed.len(), 1, "the failed rollback was forgotten, so nothing ever asks again");
+        assert_eq!(owed[0].stage, crate::pending::Stage::Abandoned);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other half: the next pass asks again, and stops asking only when
+    /// the machine is no longer there.
+    #[tokio::test]
+    async fn an_owed_rollback_is_retried_until_the_machine_is_gone() {
+        use crate::pvemock::{task_ok, Mock};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // The machine is there for the first listing and gone for the second.
+        let listings = Arc::new(AtomicUsize::new(0));
+        let seen = listings.clone();
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (200, serde_json::json!([{"node": "n1", "vmid": 123, "status": "stopped"}]))
+                    } else {
+                        (200, serde_json::json!([]))
+                    }
+                }
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/123") => (500, serde_json::Value::Null),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("rollback-retried");
+        let journal = crate::pending::dir(&dir);
+        let entry = crate::pending::PendingClone {
+            vmid: 123,
+            id: "i-abandoned".into(),
+            node: "n1".into(),
+            upid: Some("UPID:n1:clone".into()),
+            claim: TAG.to_string(),
+            stage: crate::pending::Stage::Abandoned,
+        };
+        crate::pending::write(&journal, &entry).unwrap();
+        let client = mock.client();
+        client.recover_pending(&dir).await;
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/123"), "the owed rollback was not asked again");
+        assert_eq!(crate::pending::list(&journal).len(), 1, "a destroy that failed again dropped the record");
+        client.recover_pending(&dir).await;
+        assert!(crate::pending::list(&journal).is_empty(), "the record outlived the machine it was about");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A delete does not report a machine gone while its clone is not
+    /// settled** (gap 2, 25 September 2026). A clone carries no tag until the
+    /// create claims it, so a delete arriving while one was in flight found
+    /// nothing tagged and answered `deleted` — the one proof Core releases a
+    /// claim on — while the clone went on to finish as an untagged disk.
+    #[tokio::test]
+    async fn a_delete_does_not_report_gone_while_a_clone_is_unsettled() {
+        use crate::pvemock::Mock;
+        let mock = Mock::start(|method, path, _| match (method, path) {
+            // Nothing carries the claim: the clone is still untagged.
+            ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+            ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let (root, dir) = snippets("delete-during-clone");
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(
+            &journal,
+            &crate::pending::PendingClone {
+                vmid: 123,
+                id: "i-being-cloned".into(),
+                node: "n1".into(),
+                upid: Some("UPID:n1:clone".into()),
+                claim: TAG.to_string(),
+                stage: crate::pending::Stage::Cloning,
+            },
+        )
+        .unwrap();
+        let e = mock
+            .client()
+            .delete_instance("n1", "i-being-cloned", &dir)
+            .await
+            .expect_err("a machine whose clone is still in flight was reported gone");
+        assert!(format!("{e:#}").contains("not gone"), "{e:#}");
+        // And it does report gone once nothing is owed.
+        crate::pending::remove(&journal, 123);
+        mock.client().delete_instance("n1", "i-being-cloned", &dir).await.expect("nothing owed, nothing there");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **One clone at a time for one machine** (gap 1, 25 September 2026). A
+    /// clone whose end this agent never saw was left journalled by the
+    /// recovery and then cloned again in the same call: two clones, two disks,
+    /// and the first destroyed once it was found finished.
+    #[tokio::test]
+    async fn a_second_clone_is_not_started_while_the_first_is_unsettled() {
+        use crate::pvemock::Mock;
+        let sp = spec();
+        let mock = Mock::start(|method, path, _| {
+            if path.contains("/tasks/") && path.ends_with("/status") {
+                // The first clone is still running.
+                return (200, serde_json::json!({"status": "running"}));
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("124")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("one-clone");
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(
+            &journal,
+            &crate::pending::PendingClone {
+                vmid: 123,
+                id: sp.id.clone(),
+                node: "n1".into(),
+                upid: Some("UPID:n1:clone".into()),
+                claim: TAG.to_string(),
+                stage: crate::pending::Stage::Cloning,
+            },
+        )
+        .unwrap();
+        let status = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a report, not a failure");
+        let clones: Vec<String> = mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.path.ends_with("/clone"))
+            .map(|c| c.path.clone())
+            .collect();
+        assert!(clones.is_empty(), "a second clone was started beside the first: {clones:?}");
+        assert_eq!(status.state, InstanceState::Provisioning);
+        assert!(
+            status.waiting_on.as_deref().is_some_and(|w| w.contains("clone")),
+            "the report did not say what it was waiting on: {:?}",
+            status.waiting_on
+        );
+        assert!(status.local_id.is_none(), "an unfinished clone was reported as a machine Core has been built");
+        assert_eq!(crate::pending::list(&journal).len(), 1, "the record of the clone in flight was dropped");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A drive refresh that failed is a check, not a line in a journal**
+    /// (gap 4, 25 September 2026). It is retried every pass, so a transient
+    /// failure heals; a lasting one meant a generator change had not reached a
+    /// buyer's machine, and said so nowhere the estate could see.
+    #[tokio::test]
+    async fn a_drive_refresh_that_failed_is_reported_as_a_check() {
+        use crate::pvemock::{task_ok, Mock};
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        let key = short_tag(&sp.id);
+        let tags = format!("{TAG};{key}");
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(ok) = task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 700, "status": "running", "tags": tags.clone()}
+                ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 9000})),
+                // The drive refresh, and nothing else, fails.
+                ("PUT", "/nodes/n1/qemu/700/cloudinit") => (500, serde_json::json!(null)),
+                ("GET", _) => (200, serde_json::json!({})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("refresh-check");
+        let client = mock.client();
+        // The machine is reported as what was seen: the failure is the
+        // estate's business, not this machine's state.
+        client.ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("the machine was seen");
+        let checks = client.refreshes.drain();
+        let failed = checks.iter().find(|c| c.name == "instance.cloud_init").expect("no check said the refresh failed");
+        assert_eq!(failed.result, omnuv_protocol::CheckResult::Fail);
+        assert_eq!(failed.subject.as_deref(), Some(key.as_str()));
+        let summary = checks.iter().find(|c| c.name == "instances.refreshed").expect("no summary");
+        assert_eq!(summary.result, omnuv_protocol::CheckResult::Fail);
+        assert!(client.refreshes.drain().is_empty(), "a pass's checks outlived the pass");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The rename guard has to recognise **every** generation, and getting it

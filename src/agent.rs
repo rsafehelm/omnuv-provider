@@ -1519,6 +1519,16 @@ async fn reconcile_workers(
         mirror_kick.notify_one();
     }
 
+    // **The journal, settled on every pass** (26 September 2026). This ran at
+    // the start of every create, and that one fact is the cause of four
+    // defects: a clone left behind by a delete, a second clone started beside
+    // a first, a rollback that failed and was forgotten, and a machine
+    // destroyed because its own clone's record outlived the create that made
+    // it. It is one place, before anything below creates or deletes anything,
+    // so a create refuses to clone twice and a delete refuses to report gone
+    // while either of those is still owed. See `pending`.
+    driver.recover_pending(&cfg.proxmox.snippet_dir).await;
+
     // Segments whose last machine has gone, including when this provider has
     // no desired machines left.
     match driver.reap_unused_segments(node).await {
@@ -1799,6 +1809,13 @@ async fn reconcile_workers(
     }
     for i in &instances {
         println!("instance {} -> {:?} {}", i.id, i.state, i.private_ip.as_deref().unwrap_or(""));
+    }
+    // What each existing machine's drive refresh did, which was printed and
+    // nothing else until 26 September 2026 (gap 4). After the loop, because
+    // that is what fills it.
+    checks.extend(driver.refreshes.drain());
+    for c in checks.iter().filter(|c| c.name == "instance.cloud_init") {
+        eprintln!("  warning: {}", c.detail.as_deref().unwrap_or("a machine's cloud-init was not refreshed"));
     }
 
     // **What this report covers, said honestly.**

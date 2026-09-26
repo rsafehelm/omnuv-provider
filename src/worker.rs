@@ -480,6 +480,31 @@ impl Client {
             });
         }
 
+        // **One clone at a time for one machine (gap 1).** The same rule as
+        // `ensure_instance`, for the same reason: the journal was settled only
+        // at the start of a create, and a clone it could not settle was left
+        // recorded and cloned again beside. The pass settled it before this
+        // ran, so what is still recorded is work in flight.
+        if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), &spec.id) {
+            eprintln!("worker {}: not cloned again; waiting on {}", spec.id, owed.waiting_on());
+            return Ok(WorkerStatus {
+                id: spec.id.clone(),
+                state: WorkerState::Deploying,
+                retryable: None,
+                waiting_on: Some(owed.waiting_on()),
+                // No `local_id`: Core reads one as built.
+                local_id: None,
+                endpoint: None,
+                adapters: Vec::new(),
+                diagnostics: None,
+                message: Some(format!(
+                    "an earlier clone of this worker is not settled ({}); nothing new was started",
+                    owed.waiting_on()
+                )),
+                telemetry: None,
+            });
+        }
+
         // Snippet must exist before the VM references it.
         let file = crate::names::snippet_worker(&spec.id);
         // 0600: a worker's user data carries its credentials to Core.
@@ -532,7 +557,10 @@ impl Client {
         // September 2026)**, as an instance's create is (PROVIDER-1). This path
         // had none of the three: an untagged clone was leaked and cloned again
         // on every pass, and a tagged but half-built one was started as it was.
-        self.recover_pending(snippet_dir).await;
+        //
+        // The settling moved out: the pass does it once, before anything is
+        // created or deleted, and the check above refused to get this far
+        // while anything was still owed for this worker.
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
         let journal = crate::pending::dir(snippet_dir);
         let mut pending = crate::pending::PendingClone {
@@ -541,6 +569,7 @@ impl Client {
             node: node.to_string(),
             upid: None,
             claim: TAG.to_string(),
+            stage: crate::pending::Stage::Cloning,
         };
         crate::pending::write(&journal, &pending)?;
 
@@ -569,12 +598,13 @@ impl Client {
         match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs, self.timings.clone_budget_max)).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
-                self.abandon_clone(node, vmid, &spec.id, "worker").await;
-                crate::pending::remove(&journal, vmid);
-                anyhow::bail!("proxmox task failed: {exit}");
+                if self.abandon_clone(&journal, &pending, "worker").await {
+                    anyhow::bail!("proxmox task failed: {exit}");
+                }
+                anyhow::bail!("proxmox task failed: {exit}; {}", crate::instance::shell_left(vmid));
             }
             crate::proxmox::TaskEnd::Unknown(why) => {
-                anyhow::bail!("the clone of {vmid} has not been seen to finish ({why}); it stays recorded, and the next create settles it");
+                anyhow::bail!("the clone of {vmid} has not been seen to finish ({why}); it stays recorded, and the next pass settles it");
             }
         }
 
@@ -615,17 +645,21 @@ impl Client {
             .await?;
             self.settle(node, answer).await?;
 
+            // **The machine is complete here, so the record goes here** (RC4,
+            // as `ensure_instance`): the start is convergence, and an agent
+            // stopped inside one used to leave a record the next create read as
+            // a leftover clone.
+            crate::pending::remove(&journal, vmid);
+
             // Through the gate, all or nothing, as an instance's create.
             self.start_when_ready(node, vmid).await?;
             Ok(())
         }
         .await;
         if let Err(e) = finished {
-            self.abandon_clone(node, vmid, &spec.id, "worker").await;
-            crate::pending::remove(&journal, vmid);
-            return Err(e);
+            let gone = self.abandon_clone(&journal, &pending, "worker").await;
+            return Err(if gone { e } else { e.context(crate::instance::shell_left(vmid)) });
         }
-        crate::pending::remove(&journal, vmid);
 
         Ok(WorkerStatus {
             id: spec.id.clone(),
@@ -654,6 +688,20 @@ impl Client {
         worker_id: &str,
         snippet_dir: &str,
     ) -> anyhow::Result<()> {
+        // **Nothing carrying the claim is not nothing there** (gap 2, as
+        // `delete_instance`): a clone is untagged until the create claims it,
+        // and a rollback that failed leaves a shell. Core releases the card on
+        // this report, so it may not say gone while the journal owes anything
+        // for this worker.
+        if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), worker_id) {
+            anyhow::bail!(
+                "this worker is not gone: {} (vm {} on {}), so nothing it holds may be released yet",
+                owed.waiting_on(),
+                owed.vmid,
+                owed.node
+            );
+        }
+
         // **The snippet goes with the worker.** Until 13 September 2026 this
         // function stopped the VM, deleted the VM, and touched no file — so every
         // inference worker ever built left its cloud-init behind, carrying that
