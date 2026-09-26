@@ -108,6 +108,29 @@ pub(crate) fn disk_volids(config: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Every volume a guest's configuration names, a container's included
+/// (`rootfs`, `mpN`): what a leftover volume must not be before it is removed.
+fn named_volids(config: &serde_json::Value) -> Vec<String> {
+    let mut out = disk_volids(config);
+    if let Some(fields) = config.as_object() {
+        out.extend(
+            fields
+                .iter()
+                .filter(|(k, _)| {
+                    k.as_str() == "rootfs"
+                        || k.strip_prefix("mp").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                })
+                .filter_map(|(_, v)| v.as_str())
+                .filter_map(|v| v.split(',').next())
+                .filter(|volid| volid.contains(':'))
+                .map(str::to_string),
+        );
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 impl Client {
     /// **Every guest carrying this claim**, across the cluster: the kind tag
     /// and the id tag, both, as whole tokens. All of them, not the first —
@@ -509,17 +532,30 @@ impl Client {
         if !present(&listed) {
             return Ok(false);
         }
-        // Referenced by any configuration on this node: not ours to take.
+        // **Named by any guest's configuration, anywhere: not ours to take.**
+        // Every guest in the cluster, VM or container, since a shared storage
+        // is reachable from every node. A configuration that cannot be read
+        // (its node offline, say) is not "names nothing": the volume is left,
+        // and stays a residue for the operator, rather than blocking the proof.
         #[derive(serde::Deserialize)]
-        struct OnNode {
+        struct Guest {
             node: String,
             vmid: u32,
+            #[serde(default, rename = "type")]
+            kind: Option<String>,
         }
-        let guests: Vec<OnNode> = self.get_json("/cluster/resources?type=vm").await?;
-        for g in guests.iter().filter(|g| g.node == node) {
-            let config: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{}/config", g.vmid)).await?;
-            if disk_volids(&config).iter().any(|v| v == volid) {
-                eprintln!("{volid}: vm {} names it now; it is not removed, and it stays a residue", g.vmid);
+        let guests: Vec<Guest> = self.get_json("/cluster/resources?type=vm").await?;
+        for g in &guests {
+            let kind = if g.kind.as_deref() == Some("lxc") { "lxc" } else { "qemu" };
+            let config: serde_json::Value = match self.get_json(&format!("/nodes/{}/{kind}/{}/config", g.node, g.vmid)).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{volid}: guest {} on {} could not be read, so it is not removed: {e}", g.vmid, g.node);
+                    return Ok(true);
+                }
+            };
+            if named_volids(&config).iter().any(|v| v == volid) {
+                eprintln!("{volid}: guest {} names it now; it is not removed, and it stays a residue", g.vmid);
                 return Ok(true);
             }
         }
@@ -638,6 +674,21 @@ mod tests {
                 "local-lvm:vm-9001-disk-3",
                 "zfs-fast:vm-9001-disk-1",
             ]
+        );
+    }
+
+    /// A container's volumes are named too, so a leftover one of ours that a
+    /// container mounts is never removed.
+    #[test]
+    fn a_containers_volumes_are_named_too() {
+        let config = serde_json::json!({
+            "rootfs": "local-lvm:subvol-300-disk-0,size=8G",
+            "mp0": "local-lvm:vm-9101-disk-0,mp=/data",
+            "mpx": "local-lvm:not-a-slot",
+        });
+        assert_eq!(
+            named_volids(&config),
+            vec!["local-lvm:subvol-300-disk-0".to_string(), "local-lvm:vm-9101-disk-0".to_string()]
         );
     }
 
