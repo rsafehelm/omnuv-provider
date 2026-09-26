@@ -76,8 +76,17 @@ pub(crate) struct Node {
 
 impl OwnerUse {
     /// One guest of the owner's. `cpus` and `maxmem` are the hypervisor's own
-    /// listing, which applies its defaults (a memory size a config leaves out,
-    /// a container without a core limit); the disks come from `config`.
+    /// listing, which applies its defaults; the disks come from `config`.
+    ///
+    /// What Proxmox 9.2 puts in the listing, read in its source on nuc0 on 26
+    /// September 2026 (`vmstatus` in `PVE/QemuServer.pm` and `PVE/LXC.pm`):
+    ///
+    /// ```text
+    /// VM         cpus    sockets × cores, at most the host's threads; vcpus if set
+    ///            maxmem  the configured memory; a running one's balloon maximum
+    /// container  cpus    cores, else cpulimit (a fraction), else the host's threads
+    ///            maxmem  memory, 512 MiB when unset
+    /// ```
     pub(crate) fn observe(
         &mut self,
         status: Option<&str>,

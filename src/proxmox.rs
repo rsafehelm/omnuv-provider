@@ -103,9 +103,14 @@ struct VmEntry {
     maxmem: Option<serde_json::Value>,
 }
 
-/// A guest's id, which Proxmox has written as a number and, in container
-/// listings, as a string. One unparseable id would fail the whole listing,
-/// and a failed container listing now withholds the node's disclosure.
+/// A guest's id, as a number or as a string of one.
+///
+/// Proxmox 9.2 writes both listings' ids as numbers (`int($vmid)` in
+/// `PVE/LXC.pm`, read on nuc0 on 26 September 2026), so the string is a guard
+/// and not a measured case: a provider on another version is not ruled out,
+/// "numbers as numbers or as strings depending on the field and the version"
+/// being this file's experience elsewhere, and one unparseable id fails the
+/// whole listing — which, for containers, now withholds the node's disclosure.
 fn number_or_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
