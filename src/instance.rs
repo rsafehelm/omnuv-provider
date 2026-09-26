@@ -1132,6 +1132,9 @@ impl Client {
                 &[
                     ("newid".to_string(), vmid.to_string()),
                     ("name".to_string(), crate::names::instance(&spec.name)),
+                    // The stamp, written by the clone itself: what lets a later
+                    // recovery tell this VM from anybody else's at the same VMID.
+                    ("description".to_string(), crate::names::description(TAG, &spec.id)),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // The pool that carries the console grant; only machines
@@ -1190,10 +1193,7 @@ impl Client {
                     format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}"),
                 ),
                 ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
-                (
-                    "description".into(),
-                    format!("Omnuv instance {}\nManaged by onv-provider. Do not edit.", spec.id),
-                ),
+                ("description".into(), crate::names::description(TAG, &spec.id)),
             ];
             let mut config = config;
             // The GPUs the marketplace allocated, by the host's published
@@ -1434,12 +1434,19 @@ impl Client {
     /// the clone is still running          kept, and asked again next time
     /// no machine at that VMID             the record goes: nothing was made
     /// ours by its claim, or untagged with   claimed, then removed, then the
-    /// its clone task finished OK           record goes: the create never
-    ///                                     finished, and the next one clones
+    /// its clone task finished OK and the   record goes: the create never
+    /// clone's stamp and pool on it         finished, and the next one clones
     ///                                     afresh
+    /// untagged, and its config unreadable  kept, and asked again next time
     /// anything else                        left alone and said: this agent
     ///                                     cannot prove it made it
     /// ```
+    ///
+    /// Untagged alone is not proof (26 September 2026): Proxmox reuses a freed
+    /// VMID, so a leftover clone removed by somebody else can be followed at
+    /// the same id by the host owner's own VM. Only what the clone call wrote,
+    /// the stamp in the description (`names::stamped`) and the pool, ties the
+    /// VM to this record.
     ///
     /// The claim goes on before the removal, so what is removed is a
     /// claim-tagged machine, as every other removal here is.
@@ -1461,6 +1468,8 @@ impl Client {
                 vmid: u32,
                 #[serde(default)]
                 tags: Option<String>,
+                #[serde(default)]
+                pool: Option<String>,
             }
             let vms: Vec<ClusterVm> = match self.get_json("/cluster/resources?type=vm").await {
                 Ok(v) => v,
@@ -1473,14 +1482,40 @@ impl Client {
                 crate::pending::remove(&journal, entry.vmid);
                 continue;
             };
-            let tags = vm.tags.unwrap_or_default();
+            let tags = vm.tags.clone().unwrap_or_default();
             let ours = tags.split(';').any(|t| t == entry.claim) && tags.split(';').any(|t| t == short_tag(&entry.id));
+            // **Untagged is not proof** (phase 1, 26 September 2026). A clone
+            // left behind can be removed by somebody else, and Proxmox gives
+            // its VMID to the next VM created, which may be the host owner's
+            // own: untagged, and at the journaled VMID. Such a VM was taken as
+            // this clone and destroyed. Now an untagged VM is this clone only
+            // if it carries what the clone call itself wrote — the stamp in its
+            // description, in the pool the clone put it in. A config that
+            // cannot be read proves nothing, and keeps the record for later.
+            let stamped = if !ours && cloned && tags.trim().is_empty() {
+                let pool = if entry.claim == crate::names::TAG_WORKER { crate::join::GATEWAY_POOL } else { BUYER_POOL };
+                let config = match self
+                    .get_json::<serde_json::Value>(&format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid))
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("pending clone {}: its config cannot be read, kept: {e}", entry.vmid);
+                        continue;
+                    }
+                };
+                let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
+                vm.pool.as_deref() == Some(pool)
+                    && first == Some(crate::names::stamped(&entry.claim, &entry.id).as_str())
+            } else {
+                false
+            };
             // **Never an unclaimed machine this agent cannot prove it made.**
             // Without a finished clone task, a machine at this VMID may be
             // anybody's: the request may never have arrived, and the VMID been
             // given to something else since. It is named, for the operator,
             // and left.
-            if !ours && !(cloned && tags.trim().is_empty()) {
+            if !ours && !stamped {
                 eprintln!(
                     "pending clone {}: a machine is there (tags: {tags:?}) that this agent cannot prove it made; left for the operator",
                     entry.vmid
@@ -2273,6 +2308,9 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let answering = std::sync::Arc::new(AtomicBool::new(false));
         let now = answering.clone();
+        // What the clone call wrote: the stamp in the description and the
+        // buyers' pool. Without them an untagged VM is not this clone (phase 1).
+        let stamp = crate::names::description(TAG, &spec().id);
         let mock = Mock::start(move |method, path, _| {
             if path.contains("UPID%3An1%3Aclone") && !now.load(Ordering::SeqCst) {
                 return (500, serde_json::Value::Null);
@@ -2281,8 +2319,12 @@ mod tests {
                 return r;
             }
             match (method, path) {
-                ("GET", "/cluster/resources?type=vm") if now.load(Ordering::SeqCst) => {
-                    (200, serde_json::json!([{"node": "n1", "vmid": 123, "status": "stopped"}]))
+                ("GET", "/cluster/resources?type=vm") if now.load(Ordering::SeqCst) => (
+                    200,
+                    serde_json::json!([{"node": "n1", "vmid": 123, "status": "stopped", "pool": BUYER_POOL}]),
+                ),
+                ("GET", "/nodes/n1/qemu/123/config") if now.load(Ordering::SeqCst) => {
+                    (200, serde_json::json!({"description": stamp.clone()}))
                 }
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
@@ -2303,6 +2345,11 @@ mod tests {
         let first = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
         assert!(first.is_err());
         assert!(!mock.called("DELETE", "/nodes/n1/qemu/123"), "a clone of unknown state was removed");
+        assert!(
+            mock.calls.lock().unwrap().iter().any(|c| c.method == "POST" && c.path.ends_with("/clone")
+                && c.body.contains("description=Omnuv")),
+            "the clone call did not write the stamp"
+        );
         assert_eq!(crate::pending::list(&journal).len(), 1, "the clone was not left recorded");
         assert_eq!(crate::pending::list(&journal)[0].upid.as_deref(), Some("UPID:n1:clone"));
 
@@ -2339,6 +2386,60 @@ mod tests {
         assert!(crate::pending::list(&journal).is_empty(), "the record was kept, to be reported again forever");
         std::fs::remove_dir_all(&root).unwrap();
     }
+    /// **Phase 1: the host owner's VM at a journaled VMID survives.** The clone
+    /// finished, its leftover was removed by somebody else, and Proxmox gave
+    /// the VMID to the owner's own VM: untagged, where the record points. It
+    /// was destroyed as this clone. Now it is left alone unless it carries what
+    /// the clone call wrote — the stamp and the pool — and a config that
+    /// cannot be read keeps the record rather than deciding.
+    #[tokio::test]
+    async fn an_untagged_decoy_at_a_journaled_vmid_survives() {
+        use crate::pvemock::{task_ok, Mock};
+        let stamp = crate::names::description(TAG, "i-decoy");
+        let cases: [(&str, serde_json::Value, (u16, serde_json::Value), bool); 3] = [
+            // the owner's own VM: no stamp, in no pool of ours
+            ("owner", serde_json::json!({"node": "n1", "vmid": 777}), (200, serde_json::json!({"description": "the owner's database"})), false),
+            // the stamp copied, but not in the pool the clone put it in
+            ("unpooled", serde_json::json!({"node": "n1", "vmid": 777}), (200, serde_json::json!({"description": stamp})), false),
+            // a config nobody can read: nothing decided, the record kept
+            ("unreadable", serde_json::json!({"node": "n1", "vmid": 777, "pool": BUYER_POOL}), (500, serde_json::Value::Null), true),
+        ];
+        for (name, listed, config, kept) in cases {
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([listed.clone()])),
+                    ("GET", "/nodes/n1/qemu/777/config") => config.clone(),
+                    _ => (200, serde_json::Value::Null),
+                }
+            })
+            .await;
+            let (root, dir) = snippets(&format!("decoy-{name}"));
+            let journal = crate::pending::dir(&dir);
+            crate::pending::write(
+                &journal,
+                &crate::pending::PendingClone {
+                    vmid: 777, id: "i-decoy".into(), node: "n1".into(),
+                    upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
+                },
+            )
+            .unwrap();
+            mock.client().recover_pending(&dir).await;
+            let calls = mock.calls.lock().unwrap();
+            let touched: Vec<String> = calls
+                .iter()
+                .filter(|c| c.method != "GET" && c.path.starts_with("/nodes/n1/qemu/777"))
+                .map(|c| format!("{} {}", c.method, c.path))
+                .collect();
+            assert!(touched.is_empty(), "{name}: a VM this agent cannot prove it made was touched: {touched:?}");
+            drop(calls);
+            assert_eq!(crate::pending::list(&journal).len(), usize::from(kept), "{name}: the record");
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
     /// The rename guard has to recognise **every** generation, and getting it
     /// wrong either blocks a healthy host forever or lets the duplicate-machine
     /// accident through. Two now: `omnu-` and `omnuv-`.

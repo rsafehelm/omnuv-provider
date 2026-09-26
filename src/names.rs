@@ -98,6 +98,22 @@ pub const TAG_INSTANCE: &str = "onv-instance";
 pub const TAG_GATEWAY: &str = "onv-gateway";
 pub const TAG_WORKER: &str = "onv-worker";
 
+/// **The stamp a machine carries from the moment it is cloned** (phase 1 of
+/// the lifecycle roadmap, 26 September 2026). Its first line names the claim
+/// and the whole marketplace id. The clone call itself writes it, so a VM at a
+/// journaled VMID that does not carry it was not made by that clone; the
+/// configure step writes the same text; the GPU matcher (`proxmox::accounted_pci`)
+/// and clone recovery (`recover_pending`) read the first line.
+pub fn stamped(claim: &str, id: &str) -> String {
+    let label = if claim == TAG_WORKER { "inference worker" } else { "instance" };
+    format!("Omnuv {label} {id}")
+}
+
+/// The whole description: the stamp, then a line for whoever opens the VM.
+pub fn description(claim: &str, id: &str) -> String {
+    format!("{}\nManaged by onv-provider. Do not edit.", stamped(claim, id))
+}
+
 /// Prefixes of earlier generations, kept **only** so a removal play and the
 /// reconciler can still recognise a machine built before a rename. Never used
 /// to name anything new.

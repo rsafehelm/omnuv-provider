@@ -519,6 +519,8 @@ impl Client {
                 &[
                     ("newid".to_string(), vmid.to_string()),
                     ("name".to_string(), crate::names::worker(&spec.id)),
+                    // The stamp, written by the clone itself (see names::stamped).
+                    ("description".to_string(), crate::names::description(TAG, &spec.id)),
                     ("full".to_string(), "1".to_string()),
                     ("storage".to_string(), storage.to_string()),
                     // Into the marketplace's own pool, where the file-read
@@ -564,7 +566,7 @@ impl Client {
                 ("agent".into(), "enabled=1".into()),
                 ("ipconfig0".into(), "ip=dhcp".into()),
                 ("cicustom".into(), format!("user=onv-snippets:snippets/{file}")),
-                ("description".into(), format!("Omnuv inference worker {}\nManaged by onv-provider. Do not edit.", spec.id)),
+                ("description".into(), crate::names::description(TAG, &spec.id)),
             ];
             // Mappings rather than raw addresses: a non-root token may only attach
             // a device the host has explicitly published.
