@@ -703,6 +703,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures-util",
+ "hyper",
  "omnuv-protocol",
  "reqwest",
  "rustls",

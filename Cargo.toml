@@ -35,6 +35,11 @@ sha2 = "0.11"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "stream"] }
 futures-util = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# Only for `hyper::ext::ReasonPhrase`: Proxmox puts a refusal's reason in the
+# HTTP status line (pve-http-server answers a handler's `die` there), and
+# reqwest keeps it only as hyper's response extension. The version reqwest
+# already pulls in; no new crate in the build.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 
 [workspace]
 

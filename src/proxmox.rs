@@ -60,6 +60,58 @@ struct Envelope<T> {
     data: T,
 }
 
+/// **What Proxmox said when it refused a call** (the lifecycle phase 7
+/// regression, nuc0, 26 September: the journal said "500 Internal Server
+/// Error" and nothing else). `pve-http-server` answers a handler's `die` with
+/// the message as the HTTP reason phrase, which reqwest keeps only as hyper's
+/// extension, and some answers carry it in the body as well. Both are said:
+/// the reason, then the body's `message`, or the body itself when it has none
+/// (cut to 300 characters). **Never the token**: its id and secret are
+/// replaced wherever Proxmox might have echoed them.
+pub(crate) fn refusal_text(
+    status: reqwest::StatusCode,
+    reason: Option<&str>,
+    body: &str,
+    auth: &omnuv_protocol::Redacted,
+) -> String {
+    let mut said = status.as_u16().to_string();
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    let canonical = status.canonical_reason().unwrap_or("");
+    said.push(' ');
+    said.push_str(reason.unwrap_or(canonical));
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|m| m.trim().to_string()));
+    let detail = match message {
+        Some(m) => m,
+        None => {
+            let b = body.trim();
+            if b == r#"{"data":null}"# { String::new() } else { b.to_string() }
+        }
+    };
+    if !detail.is_empty() && Some(detail.as_str()) != reason {
+        said.push_str(": ");
+        said.push_str(&detail);
+    }
+    let mut said: String = said.chars().take(300).collect();
+    // `PVEAPIToken=<id>=<secret>`: each part scrubbed on its own.
+    let token = auth.expose().trim_start_matches("PVEAPIToken=");
+    let (id, secret) = token.split_once('=').unwrap_or((token, ""));
+    for part in [secret, id] {
+        if part.len() >= 3 {
+            said = said.replace(part, "<token>");
+        }
+    }
+    said
+}
+
+/// The reason phrase of a response, when it was not the canonical one.
+fn reason_of(res: &reqwest::Response) -> Option<String> {
+    res.extensions()
+        .get::<hyper::ext::ReasonPhrase>()
+        .map(|r| String::from_utf8_lossy(r.as_bytes()).into_owned())
+}
+
 #[derive(Deserialize)]
 struct NodeEntry {
     node: String,
@@ -555,10 +607,9 @@ impl Client {
             .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
         let status = res.status();
         if !status.is_success() {
-            let detail = res.text().await.unwrap_or_default();
-            // Proxmox puts the useful reason in the body; the token id is not
-            // echoed on these endpoints, so it is safe to surface.
-            anyhow::bail!("{path}: {status} {}", detail.chars().take(300).collect::<String>());
+            let reason = reason_of(&res);
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("{path}: {}", refusal_text(status, reason.as_deref(), &body, &self.auth));
         }
         Ok(res.json::<Envelope<T>>().await?.data)
     }
@@ -573,7 +624,9 @@ impl Client {
             .await?;
         let status = res.status();
         if !status.is_success() {
-            anyhow::bail!("DELETE {path}: {status}");
+            let reason = reason_of(&res);
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("DELETE {path}: {}", refusal_text(status, reason.as_deref(), &body, &self.auth));
         }
         Ok(res.json::<Envelope<T>>().await?.data)
     }
@@ -793,11 +846,15 @@ impl Client {
 
         let status = res.status();
         if !status.is_success() {
-            // The body can echo the token id, so it is not propagated.
+            // What Proxmox said, with the token scrubbed from it (`refusal_text`),
+            // after the hint each of these two answers has always carried.
+            let reason = reason_of(&res);
+            let body = res.text().await.unwrap_or_default();
+            let said = refusal_text(status, reason.as_deref(), &body, &self.auth);
             anyhow::bail!(match status.as_u16() {
-                401 => format!("GET {path}: 401 unauthorized - check the token id and secret"),
-                403 => format!("GET {path}: 403 forbidden - the token lacks the required privileges"),
-                _ => format!("GET {path}: {status}"),
+                401 => format!("GET {path}: 401 unauthorized - check the token id and secret ({said})"),
+                403 => format!("GET {path}: 403 forbidden - the token lacks the required privileges ({said})"),
+                _ => format!("GET {path}: {said}"),
             });
         }
         Ok(res.json::<Envelope<T>>().await?.data)
