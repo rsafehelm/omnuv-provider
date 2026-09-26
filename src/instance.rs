@@ -2583,6 +2583,87 @@ mod tests {
         assert!(crate::pending::list(&journal).is_empty(), "the record was kept, to be reported again forever");
         std::fs::remove_dir_all(&root).unwrap();
     }
+    /// **An owed rollback never takes a VM it cannot prove it made** (the
+    /// lifecycle phase 7 regression review, 26 September; RC4, H3). Phase 1
+    /// put the stamp check on a clone's record; the rollback's record still
+    /// destroyed whatever sat at its VMID.
+    #[tokio::test]
+    async fn an_owed_rollback_never_takes_a_vm_it_cannot_prove_it_made() {
+        use crate::pvemock::{task_ok, Mock};
+        // A rollback owed for vm 777 (Abandoned); since then the shell went
+        // and the host owner's VM took the number. It is untagged, unstamped,
+        // and in no pool of ours: nothing may stop or destroy it.
+        let mock = Mock::start(|method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([{"node": "n1", "vmid": 777, "status": "running"}])),
+                ("GET", "/nodes/n1/qemu/777/config") => (200, serde_json::json!({"description": "the owner's database"})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("owed-rollback-decoy");
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(
+            &journal,
+            &crate::pending::PendingClone {
+                vmid: 777, id: "i-rolled-back".into(), node: "n1".into(),
+                upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
+                stage: crate::pending::Stage::Abandoned,
+            },
+        )
+        .unwrap();
+        mock.client().recover_pending(&dir).await;
+        let touched: Vec<String> = mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.method != "GET" && c.path.starts_with("/nodes/n1/qemu/777"))
+            .map(|c| format!("{} {}", c.method, c.path))
+            .collect();
+        assert!(touched.is_empty(), "an owed rollback took a VM it cannot prove it made: {touched:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The control: our own stamped shell, in our pool, is still taken away.
+    #[tokio::test]
+    async fn an_owed_rollback_of_our_own_shell_still_takes_it() {
+        use crate::pvemock::{task_ok, Mock};
+        let stamp = crate::names::description(TAG, "i-rolled-back");
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => {
+                    (200, serde_json::json!([{"node": "n1", "vmid": 777, "status": "stopped", "pool": BUYER_POOL}]))
+                }
+                ("GET", "/nodes/n1/qemu/777/config") => (200, serde_json::json!({"description": stamp})),
+                ("POST", "/nodes/n1/qemu/777/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/777") => (200, serde_json::json!("UPID:n1:destroy")),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("owed-rollback-ours");
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(
+            &journal,
+            &crate::pending::PendingClone {
+                vmid: 777, id: "i-rolled-back".into(), node: "n1".into(),
+                upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
+                stage: crate::pending::Stage::Abandoned,
+            },
+        )
+        .unwrap();
+        mock.client().recover_pending(&dir).await;
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/777"), "our own stamped shell was not taken away");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// **Phase 1: the host owner's VM at a journaled VMID survives.** The clone
     /// finished, its leftover was removed by somebody else, and Proxmox gave
     /// the VMID to the owner's own VM: untagged, where the record points. It

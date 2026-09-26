@@ -1034,4 +1034,158 @@ mod tests {
     const TWIN_ELSEWHERE: &str = "1b2c3d4e-5f60-4a0b-8c1d-2e3f4a5b6c7d";
     const RECENT: &str = "2c3d4e5f-6071-4a0b-8c1d-2e3f4a5b6c7d";
     const LEFT: &str = "3d4e5f60-7182-4a0b-8c1d-2e3f4a5b6c7d";
+
+    /// A host whose cluster listing lags the node, as `/cluster/resources`
+    /// does (pvestatd refreshes it every 10 s): guest 9301 reads `stopped`
+    /// there while the node's own status says `running`, because it was
+    /// started a moment ago. Proxmox refuses to destroy a running guest with a
+    /// 500 whose reason says so, as it did on nuc0 on 26 September.
+    async fn lagging(stop_takes: bool) -> (crate::pvemock::Mock, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let exists = std::sync::Arc::new(AtomicBool::new(true));
+        let (live, there) = (running.clone(), exists.clone());
+        let (_, tags, stamp) = ours(9301, ID);
+        let mock = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(ok) = crate::pvemock::task_ok(path) {
+                return ok;
+            }
+            let listed = || {
+                if there.load(Ordering::SeqCst) {
+                    // Stale: the listing has not caught up with the start.
+                    serde_json::json!([{"node": "n1", "vmid": 9301, "tags": tags, "status": "stopped"}])
+                } else {
+                    serde_json::json!([])
+                }
+            };
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") | ("GET", "/nodes/n1/qemu") => (200, listed()),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu/9301/config") => {
+                    (200, serde_json::json!({"description": stamp, "scsi0": "local-lvm:vm-9301-disk-0,size=8G"}))
+                }
+                ("GET", "/nodes/n1/qemu/9301/status/current") => (
+                    200,
+                    serde_json::json!({"status": if live.load(Ordering::SeqCst) { "running" } else { "stopped" }}),
+                ),
+                ("POST", "/nodes/n1/qemu/9301/status/stop") => {
+                    if stop_takes {
+                        live.store(false, Ordering::SeqCst);
+                    }
+                    (200, serde_json::json!("UPID:n1:stop"))
+                }
+                ("DELETE", "/nodes/n1/qemu/9301?purge=1&destroy-unreferenced-disks=0") => {
+                    if live.load(Ordering::SeqCst) {
+                        return (500, crate::pvemock::refusal("VM 9301 is running - destroy failed"));
+                    }
+                    there.store(false, Ordering::SeqCst);
+                    (200, serde_json::json!("UPID:n1:destroy"))
+                }
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        (mock, running)
+    }
+
+    /// Method and path of every call that changes something, in order.
+    fn acts(mock: &crate::pvemock::Mock) -> Vec<String> {
+        mock.calls.lock().unwrap().iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect()
+    }
+
+    /// **A guest started a moment ago is stopped before it is destroyed**
+    /// (the regression of 26 September on nuc0). Core named the machine
+    /// Absent in the second its create finished; the cluster listing still
+    /// said `stopped`, the stop was skipped on that word, and Proxmox refused
+    /// the destroy of a running guest. The destroy asks the node, now.
+    #[tokio::test]
+    async fn a_guest_started_a_moment_ago_is_stopped_before_it_is_destroyed() {
+        let (root, dir) = state_dir("started-just-now");
+        let (mock, running) = lagging(true).await;
+        let gone = mock.client().delete_instance("n1", ID, &dir, &[], async { Ok(true) }).await;
+        assert!(matches!(&gone, Ok(Gone::NotYet(why)) if why.contains("was destroyed")), "{gone:?}");
+        assert_eq!(
+            acts(&mock),
+            vec![
+                "POST /nodes/n1/qemu/9301/status/stop".to_string(),
+                "DELETE /nodes/n1/qemu/9301?purge=1&destroy-unreferenced-disks=0".to_string(),
+            ],
+            "the running guest was not stopped first"
+        );
+        assert!(!running.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A guest the stop did not stop is not destroyed**: the node still
+    /// says it runs, so the destroy is not asked for, and the delete says why.
+    #[tokio::test]
+    async fn a_guest_still_running_after_its_stop_is_not_destroyed() {
+        let (root, dir) = state_dir("stop-did-not-take");
+        let (mock, _) = lagging(false).await;
+        let e = mock.client().delete_instance("n1", ID, &dir, &[], async { Ok(true) }).await.expect_err("destroyed while running");
+        assert!(e.to_string().contains("running"), "{e:#}");
+        assert!(
+            !acts(&mock).iter().any(|a| a.starts_with("DELETE")),
+            "a destroy was asked for while the node said the guest runs: {:?}",
+            acts(&mock)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A volume name a new guest took is not ours to remove** (the class of
+    /// the regression: a record trusted after the world moved). A deleted
+    /// machine's tombstone names `vm-9101-disk-0`; its VMID was given to the
+    /// next clone, whose disk took the same name, and whose configuration does
+    /// not name it yet (a full clone writes its disks into the configuration
+    /// when the copy ends). The volume survives the proof and the retries.
+    #[tokio::test]
+    async fn a_volume_name_a_new_guest_took_is_not_removed() {
+        let (root, dir) = state_dir("vmid-reused");
+        let host = machine();
+        let mock = stateful(host.clone()).await;
+        assert!(matches!(pass(&mock, &dir).await, Gone::NotYet(_)));
+        {
+            // The destroy took both disks; the next clone takes VMID 9101 and
+            // allocates the same first disk name, not yet in its config.
+            let mut h = host.lock().unwrap();
+            assert_eq!(h.volumes, vec![FOREIGN.to_string()]);
+            h.guests.push((9101, String::new(), "a clone in progress".into(), vec![]));
+            h.volumes.push(DISK.to_string());
+        }
+        let proven = pass(&mock, &dir).await;
+        assert!(host.lock().unwrap().volumes.contains(&DISK.to_string()), "the new guest's disk was removed: {proven:?}");
+        let _ = mock.client().retry_residues(&dir).await;
+        assert!(host.lock().unwrap().volumes.contains(&DISK.to_string()), "a retry removed the new guest's disk");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Proxmox's reason travels with a refusal** (the regression's log said
+    /// only "500 Internal Server Error"). A destroy, a read and a form call
+    /// that Proxmox refuses each carry its reason, from the status line and
+    /// the body, and never the token.
+    #[tokio::test]
+    async fn a_refusal_says_what_proxmox_said() {
+        let mock = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
+            ("DELETE", "/nodes/n1/qemu/100") => (500, crate::pvemock::refusal("VM 100 is running - destroy failed")),
+            ("GET", "/cluster/resources?type=vm") => (500, crate::pvemock::refusal("cluster not ready - no quorum?")),
+            ("POST", "/nodes/n1/qemu/100/status/start") => (500, crate::pvemock::refusal("VM 100 already running")),
+            ("GET", "/version") => (403, crate::pvemock::refusal("Permission check failed (onv@pve!agent, Sys.Audit)")),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let px = mock.client();
+        let e = px.delete_task::<String>("/nodes/n1/qemu/100").await.expect_err("refused").to_string();
+        assert!(e.contains("VM 100 is running - destroy failed"), "the destroy's refusal lost its reason: {e}");
+        let e = px.get_json::<serde_json::Value>("/cluster/resources?type=vm").await.expect_err("refused").to_string();
+        assert!(e.contains("no quorum"), "the read's refusal lost its reason: {e}");
+        let e = px
+            .post_form::<serde_json::Value>("/nodes/n1/qemu/100/status/start", &[] as &[(String, String)])
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("VM 100 already running"), "the form call's refusal lost its reason: {e}");
+        let e = px.get_json::<serde_json::Value>("/version").await.expect_err("refused").to_string();
+        assert!(e.contains("Permission check failed") && e.contains("Sys.Audit"), "{e}");
+        assert!(!e.contains("onv@pve!agent") && !e.contains("secret"), "the token reached the message: {e}");
+    }
 }

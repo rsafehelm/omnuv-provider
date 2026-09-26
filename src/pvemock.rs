@@ -64,9 +64,9 @@ impl Mock {
                     let path = path.strip_prefix("/api2/json").unwrap_or(&path).to_string();
                     recorded.lock().unwrap().push(Call { method: method.clone(), path: path.clone(), body: body.clone() });
                     let (status, data) = route(&method, &path, &body);
-                    let payload = serde_json::json!({ "data": data }).to_string();
+                    let (reason, payload) = shape(data);
                     let head = format!(
-                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         payload.len()
                     );
                     let _ = s.write_all(head.as_bytes()).await;
@@ -111,6 +111,25 @@ impl Mock {
 
     pub fn called(&self, method: &str, path: &str) -> bool {
         self.calls.lock().unwrap().iter().any(|c| c.method == method && c.path == path)
+    }
+}
+
+/// **An answer as Proxmox shapes an error**: the reason in the status line,
+/// which is where `pve-http-server` puts a handler's `die` message, and a body
+/// of its own. A route answers `refusal("VM 100 is running - destroy failed")`
+/// with a 500 to get the line `500 VM 100 is running - destroy failed` and the
+/// body `{"data":null,"message":...}`.
+pub fn refusal(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "_reason": reason, "_body": { "data": null, "message": format!("{reason}\n") } })
+}
+
+/// The reason phrase and the body for what a route answered: `refusal`'s
+/// shape as it asks, anything else under `data` with the reason "X", as this
+/// mock has always answered.
+fn shape(data: serde_json::Value) -> (String, String) {
+    match (data.get("_reason").and_then(|r| r.as_str()), data.get("_body")) {
+        (Some(reason), Some(body)) => (reason.to_string(), body.to_string()),
+        _ => ("X".to_string(), serde_json::json!({ "data": data }).to_string()),
     }
 }
 
