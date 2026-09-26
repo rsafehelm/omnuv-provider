@@ -9,6 +9,7 @@ mod join;
 mod diagnostics;
 mod driver;
 mod proxmox;
+mod disclosure;
 mod sdn;
 mod tls;
 mod tunnel;
