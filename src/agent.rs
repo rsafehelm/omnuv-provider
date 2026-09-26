@@ -2065,6 +2065,10 @@ async fn reconcile_workers(
     // volumes a deleted machine left, which Core no longer sends once it ended
     // the compute claim on them.
     checks.extend(driver.retry_residues(&cfg.proxmox.snippet_dir).await);
+    let reaped = driver.reap_tombstones(&cfg.proxmox.snippet_dir, cfg.timings.tombstone_keep).await;
+    if reaped > 0 {
+        println!("reaped {reaped} tombstone(s) past timings.tombstoneKeep");
+    }
     for c in checks.iter().filter(|c| c.name == "instance.cloud_init") {
         eprintln!("  warning: {}", c.detail.as_deref().unwrap_or("a machine's cloud-init was not refreshed"));
     }

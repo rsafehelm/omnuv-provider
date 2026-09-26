@@ -538,6 +538,39 @@ impl Client {
         Ok(present(&again))
     }
 
+    /// **Tombstones are reaped by time, after a look** (R1's rule 10; D13).
+    /// A tombstone proven longer ago than `keep`, with no residue, goes — but
+    /// only once a listing made now finds nothing carrying its claim: the
+    /// clock that concludes "nothing can come back for this" re-observes
+    /// first (TD11). A guest that carries it keeps the tombstone, and says so.
+    pub(crate) async fn reap_tombstones(&self, snippet_dir: &str, keep: crate::dur::Dur) -> usize {
+        let dir = tombstones(snippet_dir);
+        let cutoff = now() - keep.as_secs() as i64;
+        let mut reaped = 0;
+        for t in list_tombs(&dir) {
+            if !t.residue.is_empty() || t.proven_at.is_none_or(|p| p > cutoff) {
+                continue;
+            }
+            match self.claimed_guests(&t.claim, &t.id).await {
+                Ok(left) if left.is_empty() => {
+                    if let Err(e) = std::fs::remove_file(tomb_file(&dir, &t.id)) {
+                        eprintln!("tombstone {}: not removed: {e}", t.id);
+                        continue;
+                    }
+                    crate::audit::record("teardown.tombstone", "agent", &t.id, "reaped", None);
+                    reaped += 1;
+                }
+                Ok(left) => eprintln!(
+                    "tombstone {}: past its horizon, and {} guest(s) carry its claim; kept",
+                    t.id,
+                    left.len()
+                ),
+                Err(e) => eprintln!("tombstone {}: past its horizon, and the listing failed; kept: {e}", t.id),
+            }
+        }
+        reaped
+    }
+
     /// **Residues are retried every pass** (RC9), whether or not Core still
     /// sends the machine: once Core ended the compute claim on a residue, the
     /// machine leaves the view, and nothing else would look again. Answers a
@@ -906,4 +939,48 @@ mod tests {
         assert!(built_again(&dir, ID).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// **A tombstone past its horizon goes, after a look** (R1's rule 10,
+    /// D13; re-observe before concluding). Four tombstones: an old one with
+    /// nothing left carrying its claim goes; an old one whose claim a guest
+    /// still carries stays; a recent one stays; an old one with a residue
+    /// stays.
+    #[tokio::test]
+    async fn a_tombstone_past_its_horizon_goes_only_after_a_look() {
+        let (root, dir) = state_dir("tomb-reap");
+        let tombs = tombstones(&dir);
+        let long_ago = now() - 40 * 24 * 3600;
+        let tomb = |id: &str, proven_at: i64, residue: Vec<String>| Tombstone {
+            id: id.to_string(),
+            claim: crate::names::TAG_INSTANCE.to_string(),
+            node: Some("n1".into()),
+            vmid: Some(9101),
+            volids: Vec::new(),
+            destroyed_at: Some(proven_at),
+            proven_at: Some(proven_at),
+            residue,
+        };
+        write_tomb(&tombs, &tomb(ID, long_ago, vec![])).unwrap();
+        write_tomb(&tombs, &tomb(TWIN_ELSEWHERE, long_ago, vec![])).unwrap();
+        write_tomb(&tombs, &tomb(RECENT, now() - 3600, vec![])).unwrap();
+        write_tomb(&tombs, &tomb(LEFT, long_ago, vec![DISK.to_string()])).unwrap();
+        // A guest still carries TWIN_ELSEWHERE's claim.
+        let (vmid, tags, stamp) = ours(9200, TWIN_ELSEWHERE);
+        let host = std::sync::Arc::new(std::sync::Mutex::new(Host {
+            guests: vec![(vmid, tags, stamp, vec![])],
+            ..Default::default()
+        }));
+        let mock = stateful(host).await;
+        let reaped = mock.client().reap_tombstones(&dir, crate::dur::Dur::hours(30 * 24)).await;
+        assert_eq!(reaped, 1);
+        let left: Vec<String> = list_tombs(&tombs).into_iter().map(|t| t.id).collect();
+        let mut want = vec![TWIN_ELSEWHERE.to_string(), RECENT.to_string(), LEFT.to_string()];
+        want.sort();
+        assert_eq!(left, want, "the wrong tombstones went");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const TWIN_ELSEWHERE: &str = "1b2c3d4e-5f60-4a0b-8c1d-2e3f4a5b6c7d";
+    const RECENT: &str = "2c3d4e5f-6071-4a0b-8c1d-2e3f4a5b6c7d";
+    const LEFT: &str = "3d4e5f60-7182-4a0b-8c1d-2e3f4a5b6c7d";
 }

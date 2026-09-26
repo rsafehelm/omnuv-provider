@@ -45,6 +45,11 @@ pub mod defaults {
     pub const WORKLOAD_STUCK_AFTER_READS: u32 = 3;
     /// The clamp in `Client::clone_polls`, `proxmox.rs`: 1800 one-second polls.
     pub const CLONE_BUDGET_MAX: Dur = Dur::mins(30);
+    /// How long a tombstone outlives its proof (`teardown::reap_tombstones`):
+    /// D13's "until older than the oldest restorable backup", which this
+    /// agent cannot see, so 30 days (unmeasured; a site with older backups
+    /// says more).
+    pub const TOMBSTONE_KEEP: Dur = Dur::hours(30 * 24);
 }
 
 /// The poll this agent keeps while Core says none: a Core that predates
@@ -103,6 +108,10 @@ pub struct Timings {
     pub clone_budget_max: Dur,
     /// What this agent writes into every worker's `/etc/onv/workload.yaml`.
     pub workload: WorkloadConfig,
+    /// How long a machine's tombstone is kept after its delete was proven
+    /// (lifecycle phase 7; D13). Past it the tombstone goes, once a listing
+    /// shows nothing carries the machine's claim.
+    pub tombstone_keep: Dur,
 }
 
 impl Default for Timings {
@@ -119,6 +128,7 @@ impl Default for Timings {
             workload_stuck_after_reads: WORKLOAD_STUCK_AFTER_READS,
             clone_budget_max: CLONE_BUDGET_MAX,
             workload: WorkloadConfig::default(),
+            tombstone_keep: TOMBSTONE_KEEP,
         }
     }
 }
@@ -172,6 +182,9 @@ impl Timings {
             "at least one read, and frozen numbers are not shown for more than twenty passes");
         within(&mut bad, "cloneBudgetMax", self.clone_budget_max, Dur::mins(1), Dur::hours(2),
             "a clone holds every other placement on this provider for as long as a pass waits on it");
+        within(&mut bad, "tombstoneKeep", self.tombstone_keep, Dur::hours(24), Dur::hours(24 * 3650),
+            "a tombstone is what stops a restored view rebuilding a machine this agent deleted, so it \
+             outlives at least a day of backups");
         bad.extend(self.workload.check("timings.workload."));
         // A worker's report must move between the reads that could call it
         // stuck: a reporter slower than that reads as a dead one. Reads come
@@ -221,10 +234,13 @@ mod tests {
         assert_eq!(t.workload, WorkloadConfig::default());
         assert!(t.check().is_ok(), "{:?}", t.check());
         assert_eq!(poll(None).as_secs(), 120, "the reconcile interval in agent.rs");
+        assert_eq!(t.tombstone_keep.as_secs(), 30 * 24 * 3600, "lifecycle phase 7: a new key, D13's horizon");
         // And their hash, pinned: every agent running the defaults reports
         // this. A change to a default or to the canonical form moves it on
         // every provider at once, so it moves here, on purpose, in that change.
-        assert_eq!(t.hash(), "a57be9feb152");
+        // Lifecycle phase 7 added `tombstoneKeep`: a57be9feb152 became
+        // 3cf6624da40e.
+        assert_eq!(t.hash(), "3cf6624da40e");
     }
 
     /// Core's poll is obeyed inside Core's own range, and zero or absent is
