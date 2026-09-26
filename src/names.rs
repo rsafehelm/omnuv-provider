@@ -328,6 +328,21 @@ pub fn write_private(path: &str, contents: &[u8], mode: u32) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
+    /// **The stamp's exact text, per claim** (phase 1). The clone call, the
+    /// configure step and recovery all go through `stamped`, so only a literal
+    /// catches the labels trading places; and the GPU matcher
+    /// (`proxmox::accounted_pci`) builds the same line on its own, so the two
+    /// must agree word for word or every card reads as unaccounted.
+    #[test]
+    fn the_stamp_names_the_claim_and_the_whole_id() {
+        assert_eq!(stamped(TAG_INSTANCE, "i-1"), "Omnuv instance i-1");
+        assert_eq!(stamped(TAG_WORKER, "w-1"), "Omnuv inference worker w-1");
+        assert_eq!(
+            description(TAG_INSTANCE, "i-1"),
+            "Omnuv instance i-1\nManaged by onv-provider. Do not edit."
+        );
+    }
+
     use super::write_private;
 
     /// Born with its mode, and a file that already existed wider is tightened.
