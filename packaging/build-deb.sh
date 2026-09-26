@@ -45,7 +45,9 @@ if [ -n "${1:-}" ] && [ "$1" != "$CRATE" ] && [ "$1" != "$VERSION" ]; then
     echo "Cargo.toml says $CRATE (package $VERSION), not $1." >&2
     exit 2
 fi
-OUT="$ROOT/dist"
+# dist/ is what deploy-agent.yml installs. A check builds elsewhere
+# (packaging/check.sh), so checking never replaces the package a deploy ships.
+OUT="${ONV_PACKAGE_OUT:-$ROOT/dist}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 STAGE="$OUT/.deb"
 
