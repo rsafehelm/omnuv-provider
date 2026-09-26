@@ -5,8 +5,303 @@
 //! already sold, and sells nothing on a node whose disclosure is missing or
 //! older than two polls. So `committed_*` must be the part of the owner's use
 //! that falls *inside* the contributed slice. The whole host's own guests,
-//! which is what the agent measured until now, exceed the slice on both
-//! production hosts and would have made both unsellable.
+//! which is what the agent measured until 26 September 2026, exceed the slice
+//! on both production hosts and would have made both unsellable.
+//!
+//! **What `committed_*` means now.** The owner contributes a slice and keeps
+//! the rest of the host — `host total − reported` — for their own guests.
+//! What those guests use beyond that is the intrusion, and the intrusion is
+//! what is disclosed, never more than the slice itself:
+//!
+//! ```text
+//! committed = min(reported, max(0, owner's use − (host total − reported)))
+//! ```
+//!
+//! `reported` is the capacity the node reports, which is the contribution
+//! already clamped to what is physically there. Which of the owner's guests
+//! count, per resource (the allocation report, Part I §5.2, §5.8, gap 4b):
+//!
+//! ```text
+//! vCPU     running and paused guests, VMs and containers: the hypervisor's own
+//!          count, so a container with no core limit counts every host thread
+//! memory   running and paused guests, VMs and containers: their configured
+//!          maximum. A stopped guest has no process and holds none (§5.7); the
+//!          pass after its owner starts it discloses it
+//! disk     every guest, running or stopped, templates included, on the
+//!          storages this node contributes: a stopped guest holds its disks
+//! ```
+//!
+//! **Disk's host total is the contributed storages' total, and `reported` is
+//! already free space** (`min(contributed, avail)`). So an owner's disk that
+//! is already written is outside `reported` before this is worked out, and
+//! the formula counts only what the free-space figure cannot see: configured
+//! size not yet written, on a sparse pool, that can still grow into the slice.
+//! On a thick pool it discloses zero, correctly, and never counts a disk twice.
+//!
+//! **Always on.** Disclosure is a condition of selling (D10), so it is not a
+//! toggle; what it reveals is the owner's intrusion into their own offer, not
+//! what they run, which is zero whenever the owner stays inside what they
+//! kept. `guests` is still a count of the owner's guests, never an identity.
+//!
+//! **An incomplete survey discloses nothing.** One guest that cannot be read
+//! — its listing, its configuration, its power state, a running guest's size —
+//! and the node reports no commitment at all, so Core stops selling it after
+//! two polls rather than reading "could not look" as "nothing there".
+
+use std::collections::BTreeMap;
+
+/// The owner's own guests on one node, as the hypervisor has configured them:
+/// every VM and container the marketplace did not create. Raw, and never sent:
+/// what leaves this process is `commitment`'s answer.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct OwnerUse {
+    /// vCPUs of the running guests, as the hypervisor counts them.
+    pub(crate) running_cores: u64,
+    /// Configured memory of the running guests, in MiB.
+    pub(crate) running_memory_mib: u64,
+    /// Configured disk of every guest, running or stopped, per storage id, in GiB.
+    pub(crate) disk_gib: BTreeMap<String, u64>,
+    /// VMs, templates and containers, running or not.
+    pub(crate) guests: u32,
+}
+
+/// One node's figures, as `discover` measured them.
+pub(crate) struct Node {
+    /// The host's threads, memory in MiB, and the total of the storages this
+    /// node contributes, in GiB.
+    pub(crate) host: (u64, u64, u64),
+    /// What the node reports: the contribution clamped to what is there.
+    pub(crate) reported: (u64, u64, u64),
+}
+
+impl OwnerUse {
+    /// One guest of the owner's. `cpus` and `maxmem` are the hypervisor's own
+    /// listing, which applies its defaults (a memory size a config leaves out,
+    /// a container without a core limit); the disks come from `config`.
+    pub(crate) fn observe(
+        &mut self,
+        status: Option<&str>,
+        cpus: Option<&serde_json::Value>,
+        maxmem: Option<&serde_json::Value>,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let config = config.as_object().ok_or_else(|| anyhow::anyhow!("the configuration is not an object"))?;
+        let running = match status {
+            // Paused holds its memory, and resumes without asking anybody.
+            Some("running" | "paused") => true,
+            Some("stopped") => false,
+            _ => anyhow::bail!("the power state is unobserved"),
+        };
+        if running {
+            let cpus = cpus.and_then(number).filter(|c| c.is_finite() && *c >= 0.0)
+                .ok_or_else(|| anyhow::anyhow!("a running guest's vCPUs are not listed"))?;
+            let bytes = maxmem.and_then(number).filter(|m| m.is_finite() && *m >= 0.0)
+                .ok_or_else(|| anyhow::anyhow!("a running guest's memory is not listed"))?;
+            // Up, both: a fraction of a core or of a MiB is still taken.
+            self.running_cores += cpus.ceil() as u64;
+            self.running_memory_mib += (bytes / (1024.0 * 1024.0)).ceil() as u64;
+        }
+        for (storage, gib) in volumes(config) {
+            *self.disk_gib.entry(storage.to_string()).or_default() += gib;
+        }
+        self.guests += 1;
+        Ok(())
+    }
+
+    pub(crate) fn add(&mut self, other: OwnerUse) {
+        self.running_cores += other.running_cores;
+        self.running_memory_mib += other.running_memory_mib;
+        for (storage, gib) in other.disk_gib {
+            *self.disk_gib.entry(storage).or_default() += gib;
+        }
+        self.guests += other.guests;
+    }
+}
+
+/// What a node discloses: the part of its owner's use inside the slice it
+/// reports. `storages` are the ids it contributes — the owner's disks on any
+/// other storage never touch the slice.
+pub(crate) fn commitment(owner: &OwnerUse, node: &Node, storages: &[&str]) -> omnuv_protocol::HostCommitment {
+    let disk: u64 = owner.disk_gib.iter().filter(|(s, _)| storages.contains(&s.as_str())).map(|(_, g)| g).sum();
+    omnuv_protocol::HostCommitment {
+        // The slice is a `u32` of cores, and the intrusion is never more.
+        cpu_cores: intrusion(owner.running_cores, node.host.0, node.reported.0) as u32,
+        memory_mib: intrusion(owner.running_memory_mib, node.host.1, node.reported.1),
+        disk_gib: intrusion(disk, node.host.2, node.reported.2),
+        guests: owner.guests,
+    }
+}
+
+/// The part of `owner` that falls inside `reported`: whatever exceeds the room
+/// the owner kept, `host − reported`, and never more than the slice itself.
+pub(crate) fn intrusion(owner: u64, host: u64, reported: u64) -> u64 {
+    owner.saturating_sub(host.saturating_sub(reported)).min(reported)
+}
+
+/// Every volume a guest's configuration gives a storage and a size: a VM's
+/// disks on its four buses, a container's root and mount points. A bind mount,
+/// a passed-through device and an empty drive have no `storage:volume`, and
+/// are nobody's disk here.
+fn volumes(config: &serde_json::Map<String, serde_json::Value>) -> Vec<(&str, u64)> {
+    const NUMBERED: [&str; 5] = ["scsi", "virtio", "sata", "ide", "mp"];
+    config
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() == "rootfs"
+                || NUMBERED.iter().any(|b| k.strip_prefix(b).is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())))
+        })
+        .filter_map(|(_, v)| {
+            let raw = v.as_str()?;
+            let (storage, _) = raw.split(',').next()?.split_once(':')?;
+            if storage.is_empty() || storage.starts_with('/') {
+                return None;
+            }
+            Some((storage, crate::proxmox::size_gib(raw)?))
+        })
+        .collect()
+}
+
+/// Proxmox writes numbers as numbers or as strings, and `cpus` may be a
+/// fraction for a container with a CPU limit.
+fn number(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
+/// Record, on the provider's own side, what was disclosed about this node.
+///
+/// The party giving something up should be able to see that they did, in
+/// their own journal, without asking the marketplace; `audit::record` also
+/// sends it up with the report, so neither side can quietly lose it. Once per
+/// node, and again whenever the figure changes: disclosure is permanent now,
+/// so the hourly reminder that it was switched on has nothing left to remind.
+///
+/// It records what was sent and nothing more — never the whole host's figures,
+/// which do not leave this process.
+pub(crate) fn noted(node: &str, c: &omnuv_protocol::HostCommitment) {
+    use std::sync::Mutex;
+    static LAST: Mutex<BTreeMap<String, omnuv_protocol::HostCommitment>> = Mutex::new(BTreeMap::new());
+
+    let mut last = match LAST.lock() {
+        Ok(l) => l,
+        Err(e) => e.into_inner(),
+    };
+    if last.get(node) == Some(c) {
+        return;
+    }
+    last.insert(node.to_string(), *c);
+    crate::audit::record(
+        "host.usage.disclosed",
+        "agent",
+        node,
+        "ok",
+        Some(&format!(
+            "disclosed {} vCPU, {} MiB and {} GiB of this host's own use inside the slice it contributes \
+             ({} guest(s) of its own)",
+            c.cpu_cores, c.memory_mib, c.disk_gib, c.guests
+        )),
+    );
+}
+
+#[cfg(test)]
+mod arithmetic {
+    use super::*;
+    use serde_json::json;
+
+    /// The formula, at its three edges: inside the room the owner kept, past
+    /// it, and past the whole slice.
+    #[test]
+    fn only_what_passes_the_room_the_owner_kept_is_an_intrusion() {
+        // Titan's memory: 257024 MiB, 65536 of it offered.
+        assert_eq!(intrusion(159_744, 257_024, 65_536), 0, "156 GiB fits in the 187 kept");
+        assert_eq!(intrusion(191_488, 257_024, 65_536), 0, "exactly the room kept is not an intrusion");
+        assert_eq!(intrusion(196_608, 257_024, 65_536), 5_120);
+        assert_eq!(intrusion(400_000, 257_024, 65_536), 65_536, "never more than the slice");
+        // A contribution larger than the host: it reports the host, the owner
+        // kept nothing, and every running guest of theirs is inside the slice.
+        assert_eq!(intrusion(10, 12, 12), 10);
+        // Nothing reported, nothing to intrude on.
+        assert_eq!(intrusion(10, 0, 0), 0);
+    }
+
+    /// **A disk already written is already outside the free-space figure**,
+    /// so it is not counted a second time. What is counted is configured size
+    /// that can still grow into the slice.
+    #[test]
+    fn a_written_disk_is_not_counted_twice_and_a_sparse_one_is_counted_once() {
+        let owner = |gib| OwnerUse { disk_gib: BTreeMap::from([("pool".to_string(), gib)]), ..Default::default() };
+        // Thick: 1000 GiB pool, 800 of it the owner's and written, 200 free.
+        // The node reports 200 of the 500 offered; the owner's 800 is exactly
+        // what lies outside it.
+        let thick = Node { host: (0, 0, 1000), reported: (0, 0, 200) };
+        assert_eq!(commitment(&owner(800), &thick, &["pool"]).disk_gib, 0);
+        // Sparse: the same 800 configured and 100 of it written, so 900 free
+        // and the node reports its whole 500. At full size the owner leaves
+        // 200 of the pool, so 300 of the slice is theirs.
+        let sparse = Node { host: (0, 0, 1000), reported: (0, 0, 500) };
+        assert_eq!(commitment(&owner(800), &sparse, &["pool"]).disk_gib, 300);
+        // And a pool this node does not offer is not in the sum at all.
+        assert_eq!(commitment(&owner(800), &sparse, &["other"]).disk_gib, 0);
+    }
+
+    #[test]
+    fn a_stopped_guest_holds_its_disks_and_nothing_else() {
+        let mut o = OwnerUse::default();
+        let config = json!({"memory": 131072, "scsi0": "tank:vm-1-disk-0,size=100G"});
+        o.observe(Some("stopped"), Some(&json!(64)), Some(&json!(128u64 << 30)), &config).unwrap();
+        assert_eq!((o.running_cores, o.running_memory_mib, o.guests), (0, 0, 1));
+        assert_eq!(o.disk_gib, BTreeMap::from([("tank".to_string(), 100)]));
+        o.observe(Some("paused"), Some(&json!(2)), Some(&json!(4u64 << 30)), &json!({})).unwrap();
+        assert_eq!((o.running_cores, o.running_memory_mib), (2, 4096), "paused holds its memory");
+    }
+
+    /// A container's limit may be a fraction of a core, and Proxmox may quote
+    /// any number. Up, never down: half a core is still taken.
+    #[test]
+    fn listed_sizes_are_read_quoted_or_not_and_rounded_up() {
+        let mut o = OwnerUse::default();
+        o.observe(Some("running"), Some(&json!("1.5")), Some(&json!("1073741825")), &json!({})).unwrap();
+        assert_eq!((o.running_cores, o.running_memory_mib), (2, 1025));
+    }
+
+    #[test]
+    fn a_guest_that_cannot_be_sized_is_refused_rather_than_read_as_zero() {
+        let mut o = OwnerUse::default();
+        assert!(o.observe(Some("running"), None, Some(&json!(1)), &json!({})).is_err());
+        assert!(o.observe(Some("running"), Some(&json!(1)), None, &json!({})).is_err());
+        assert!(o.observe(Some("running"), Some(&json!("many")), Some(&json!(1)), &json!({})).is_err());
+        assert!(o.observe(Some("prelaunch"), Some(&json!(1)), Some(&json!(1)), &json!({})).is_err());
+        assert!(o.observe(None, Some(&json!(1)), Some(&json!(1)), &json!({})).is_err());
+        assert!(o.observe(Some("stopped"), None, None, &json!("not an object")).is_err());
+        assert_eq!(o, OwnerUse::default(), "a refused guest left a partial count behind");
+    }
+
+    /// Positive and negative: every kind of volume a guest can be given a size
+    /// on, and the nearest things that are not one.
+    #[test]
+    fn a_volume_is_a_storage_and_a_size() {
+        let config = json!({
+            "scsi0": "tank:vm-100-disk-0,iothread=1,size=32G",
+            "virtio1": "tank:vm-100-disk-1,size=1T",
+            "sata2": "other:vm-100-disk-2,size=10G",
+            "ide3": "tank:vm-100-disk-3,size=512M",
+            "rootfs": "tank:subvol-200-disk-0,size=8G",
+            "mp0": "tank:subvol-200-disk-1,mp=/data,size=100G",
+            // Not volumes, or not ones with a storage and a size.
+            "ide2": "none,media=cdrom",
+            "ide1": "local:iso/ubuntu.iso,media=cdrom",
+            "mp1": "/srv/shared,mp=/shared",
+            "scsi5": "/dev/disk/by-id/ata-DISK,size=100G",
+            "scsi6": "/dev/disk/by-path/pci-0000:00:17.0-ata-1,size=100G",
+            "unused0": "tank:vm-100-disk-9",
+            "scsihw": "virtio-scsi-pci",
+            "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+            "mpx": "tank:x,size=1G",
+        });
+        let mut got = volumes(config.as_object().unwrap());
+        got.sort();
+        assert_eq!(got, vec![("other", 10), ("tank", 0), ("tank", 8), ("tank", 32), ("tank", 100), ("tank", 1024)]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

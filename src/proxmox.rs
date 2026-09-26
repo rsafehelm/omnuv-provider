@@ -72,6 +72,8 @@ struct NodeEntry {
 struct StorageEntry {
     storage: String,
     avail: Option<u64>,
+    /// The storage's size, which is disk's host total for disclosure.
+    total: Option<u64>,
     content: Option<String>,
     active: Option<u8>,
 }
@@ -91,6 +93,13 @@ struct VmEntry {
     status: Option<String>,
     #[serde(default)]
     tags: Option<String>,
+    /// The hypervisor's own count of the guest's vCPUs and its memory in
+    /// bytes, with its defaults applied — what disclosure sums. A container's
+    /// `cpus` may be a fraction, so neither is typed here.
+    #[serde(default)]
+    cpus: Option<serde_json::Value>,
+    #[serde(default)]
+    maxmem: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -112,19 +121,22 @@ pub(crate) struct PciClaims {
     accounted: HashSet<String>,
     /// Conflicting or unaccounted marketplace claims are never free capacity.
     blocked: HashSet<String>,
-    /// What guests the marketplace did not create have already been given.
+    /// What the owner's own VMs — every one the marketplace did not create —
+    /// have been given, collected on the pass that already reads every guest
+    /// config for PCI claims: no extra call. Containers are read beside it, by
+    /// `owner_containers`, and `discover` turns the two into the node's
+    /// disclosure (`disclosure::commitment`).
     ///
     /// A provider advertises capacity and the ledger books against that number
     /// alone, so a host advertising 64 cores while its owner runs a 60-core
     /// workload passes every oversell check we have and the first sign of
     /// trouble is a buyer's machine that will not start. This is the other half
-    /// of that sum, collected on the pass that already reads every guest config
-    /// for PCI claims — no extra call, and nothing recorded about *what* those
-    /// guests are, which is the provider's business.
+    /// of that sum — nothing recorded about *what* those guests are, which is
+    /// the provider's business.
     ///
-    /// `None` when enumeration failed: an unmeasured commitment must never read
-    /// as zero.
-    committed: Option<omnuv_protocol::HostCommitment>,
+    /// `None` when any VM could not be read: an unmeasured commitment must
+    /// never read as zero.
+    owner: Option<crate::disclosure::OwnerUse>,
     /// False if enumeration failed. Nothing is offered when we cannot prove
     /// a device is free.
     pub(crate) complete: bool,
@@ -178,9 +190,6 @@ pub struct Client {
     /// What each worker's Workload Agent last reported, held across passes so
     /// a reporter that has stopped advancing is noticed (PROVIDER-15).
     pub(crate) workload: crate::workload::Store,
-    /// Whether this provider has opted in to disclosing what its host has
-    /// already given its own guests. See `config::ProxmoxRuntime::showall`.
-    showall: bool,
     /// Marketplace image id -> the template vmid holding it on this host.
     ///
     /// Set separately rather than through `new`, which already takes ten
@@ -370,7 +379,6 @@ impl Client {
         location: Option<omnuv_protocol::GeoLocation>,
         city: Option<String>,
         apt_mirror: Option<String>,
-        showall: bool,
     ) -> anyhow::Result<Self> {
         let tls = crate::tls::config(fingerprint)?;
         Ok(Self {
@@ -386,7 +394,6 @@ impl Client {
             environment: None,
             alloc: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             workload: crate::workload::Store::new(),
-            showall,
             images: Default::default(),
             timings: Default::default(),
             refreshes: Default::default(),
@@ -426,10 +433,9 @@ impl Client {
             None,
             None,
             // The debug `discover` command reads inventory and builds nothing,
-            // so it has no cloud-init to write and no mirror to name — and it
-            // discloses nothing about the provider's own guests either.
+            // so it has no cloud-init to write and no mirror to name. What it
+            // prints includes the disclosure, which it sends nowhere.
             None,
-            false,
         )
     }
 
@@ -943,12 +949,9 @@ impl Client {
 
     pub(crate) async fn claimed_pci(&self, node: &str, desired: Option<&DesiredState>) -> PciClaims {
         let mut claims = PciClaims { complete: true, ..Default::default() };
-        let mut foreign = omnuv_protocol::HostCommitment {
-            cpu_cores: 0,
-            memory_mib: 0,
-            disk_gib: 0,
-            guests: 0,
-        };
+        // The owner's VMs, and whether every one of them could be read.
+        let mut owner = crate::disclosure::OwnerUse::default();
+        let mut owner_seen = true;
         let vms: Vec<VmEntry> = match self.get(&format!("/nodes/{node}/qemu")).await {
             Ok(v) => v,
             // Without VM.Audit we cannot prove a device is free, so nothing is
@@ -959,12 +962,16 @@ impl Client {
                 return claims;
             }
         };
+        // Unreadable mappings leave no card provable, and nothing else: the
+        // guests are still surveyed, because what the owner's guests hold is
+        // not a question about cards, and a node that cannot disclose sells
+        // nothing at all (D10).
         let mappings: Vec<PciMapping> = match self.get("/cluster/mapping/pci").await {
             Ok(mappings) => mappings,
             Err(e) => {
                 eprintln!("  warning: cannot read PCI mappings ({e}); offering no GPUs");
                 claims.complete = false;
-                return claims;
+                Vec::new()
             }
         };
         for vm in vms {
@@ -972,39 +979,55 @@ impl Client {
                 match self.get(&format!("/nodes/{node}/qemu/{}/config", vm.vmid)).await {
                     Ok(c) => c,
                     Err(_) => {
-                        eprintln!("  warning: cannot read config of vm {}; offering no GPUs", vm.vmid);
+                        eprintln!("  warning: cannot read config of vm {}; offering no GPUs and disclosing nothing", vm.vmid);
                         claims.complete = false;
+                        owner_seen = false;
                         continue;
                     }
                 };
             if let Err(e) = claims.observe_vm(&vm, &cfg, node, &mappings, desired) {
                 eprintln!("  warning: cannot resolve PCI claims of vm {} ({e}); offering no GPUs", vm.vmid);
-                continue;
             }
-            let Some(map) = cfg.as_object() else { continue };
 
             // Anything the marketplace did not create is the provider's own,
             // and what it has been given is capacity nobody should sell twice.
-            if !is_marketplace(vm.tags.as_deref()) {
-                foreign.guests += 1;
-                foreign.cpu_cores += configured_cores(map);
-                foreign.memory_mib += map.get("memory").and_then(as_u64).unwrap_or(0);
-                foreign.disk_gib += configured_disk_gib(map);
+            if !is_marketplace(vm.tags.as_deref())
+                && let Err(e) = owner.observe(vm.status.as_deref(), vm.cpus.as_ref(), vm.maxmem.as_ref(), &cfg)
+            {
+                eprintln!("  warning: cannot size vm {} ({e}); disclosing nothing", vm.vmid);
+                owner_seen = false;
             }
-
         }
-        // Only when every guest was readable — a partial survey undercounts,
-        // and an undercount here reads as free capacity — and only when this
-        // provider asked for it to be sent at all.
-        //
-        // The survey itself always runs: it is the same pass that proves a GPU
-        // is free, and it never leaves this process unless `showall` is set.
-        // What the flag gates is *disclosure*, not measurement.
-        claims.committed = (claims.complete && self.showall).then_some(foreign);
-        if self.showall && claims.complete {
-            disclosure_noted(node, &foreign);
-        }
+        // Only when every VM was readable: a partial survey undercounts, and
+        // an undercount here reads as free capacity.
+        claims.owner = owner_seen.then_some(owner);
         claims
+    }
+
+    /// The owner's containers on `node`, which Proxmox lists apart from its
+    /// VMs (gap 4b of the allocation report: the escrow was blind to them).
+    /// The marketplace creates none, so every untagged one is the owner's.
+    /// `None` when the listing or any container could not be read.
+    async fn owner_containers(&self, node: &str) -> Option<crate::disclosure::OwnerUse> {
+        let listed: Vec<VmEntry> = match self.get(&format!("/nodes/{node}/lxc")).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("  warning: cannot enumerate containers ({e}); disclosing nothing");
+                return None;
+            }
+        };
+        let mut owner = crate::disclosure::OwnerUse::default();
+        for ct in listed.iter().filter(|ct| !is_marketplace(ct.tags.as_deref())) {
+            let observed = match self.get::<serde_json::Value>(&format!("/nodes/{node}/lxc/{}/config", ct.vmid)).await {
+                Ok(cfg) => owner.observe(ct.status.as_deref(), ct.cpus.as_ref(), ct.maxmem.as_ref(), &cfg),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = observed {
+                eprintln!("  warning: cannot size container {} ({e}); disclosing nothing", ct.vmid);
+                return None;
+            }
+        }
+        Some(owner)
     }
 
     pub async fn discover(
@@ -1034,19 +1057,31 @@ impl Client {
 
             let storages: Vec<StorageEntry> =
                 self.get(&format!("/nodes/{}/storage", entry.node)).await.unwrap_or_default();
-
-            // Free space, not capacity: one of these pools is 97% full, and its
-            // total says nothing about what can actually be allocated.
-            let avail_gib: u64 = storages
+            let offered: Vec<&StorageEntry> = storages
                 .iter()
                 .filter(|s| s.active.unwrap_or(0) == 1)
                 .filter(|s| s.content.as_deref().is_some_and(|x| x.contains("images")))
                 .filter(|s| c.storage.is_empty() || c.storage.contains(&s.storage))
-                .filter_map(|s| s.avail)
-                .sum::<u64>()
-                / (1024 * 1024 * 1024);
+                .collect();
 
-            let claims = self.claimed_pci(&entry.node, desired).await;
+            // Free space, not capacity: one of these pools is 97% full, and its
+            // total says nothing about what can actually be allocated.
+            let avail_gib: u64 = offered.iter().filter_map(|s| s.avail).sum::<u64>() / (1024 * 1024 * 1024);
+            // Disk's host total for disclosure. A storage that reports no total
+            // adds nothing, which shrinks the room the owner is said to have
+            // kept: an unreadable total can only make the slice smaller.
+            let total_gib: u64 = offered.iter().filter_map(|s| s.total).sum::<u64>() / (1024 * 1024 * 1024);
+
+            let mut claims = self.claimed_pci(&entry.node, desired).await;
+            // The owner's containers are read only when their VMs were: one
+            // unreadable guest already means nothing is disclosed.
+            let owner = match claims.owner.take() {
+                Some(mut vms) => self.owner_containers(&entry.node).await.map(|cts| {
+                    vms.add(cts);
+                    vms
+                }),
+                None => None,
+            };
             let pci: Vec<PciEntry> =
                 self.get(&format!("/nodes/{}/hardware/pci", entry.node)).await.unwrap_or_default();
 
@@ -1110,14 +1145,33 @@ impl Client {
             // only ever reduce what is offered, never invent capacity.
             let physical_cores = entry.maxcpu.unwrap_or(0);
             let physical_mib = entry.maxmem.unwrap_or(0) / (1024 * 1024);
+            let cpu_cores = c.cpu_cores.min(physical_cores);
+            let memory_mib = c.memory_mib.min(physical_mib);
+            let disk_gib = c.disk_gib.min(avail_gib);
+
+            // **Disclosure is a condition of selling** (D10), so it is made on
+            // every pass whose survey was complete, and on no other: what is
+            // sent is the owner's use *inside* the slice, never the whole
+            // host's. See `disclosure` for what counts.
+            let committed = owner.map(|o| {
+                let names: Vec<&str> = offered.iter().map(|s| s.storage.as_str()).collect();
+                let node = crate::disclosure::Node {
+                    host: (physical_cores.into(), physical_mib, total_gib),
+                    reported: (cpu_cores.into(), memory_mib, disk_gib),
+                };
+                crate::disclosure::commitment(&o, &node, &names)
+            });
+            if let Some(c) = &committed {
+                crate::disclosure::noted(&entry.node, c);
+            }
 
             nodes.push(NodeInventory {
                 local_id: entry.node,
-                cpu_cores: c.cpu_cores.min(physical_cores),
-                memory_mib: c.memory_mib.min(physical_mib),
-                disk_gib: c.disk_gib.min(avail_gib),
+                cpu_cores,
+                memory_mib,
+                disk_gib,
                 gpus,
-                committed: claims.committed,
+                committed,
             });
         }
 
@@ -1240,7 +1294,8 @@ mod pci_claim_tests {
 
     fn vm() -> VmEntry {
         VmEntry { vmid: 200, status: Some("running".into()),
-            tags: Some(format!("onv-instance;{}", crate::names::short_tag(&desired().instances[0].id))) }
+            tags: Some(format!("onv-instance;{}", crate::names::short_tag(&desired().instances[0].id))),
+            cpus: None, maxmem: None }
     }
 
     fn config() -> serde_json::Value {
@@ -1308,7 +1363,7 @@ mod pci_claim_tests {
             "gpu_local_ids": ["0000:21:00.0"]
         })).unwrap());
         let worker = VmEntry { vmid: 201, status: Some("running".into()),
-            tags: Some(format!("onv-worker;{}", crate::names::short_tag(&id))) };
+            tags: Some(format!("onv-worker;{}", crate::names::short_tag(&id))), cpus: None, maxmem: None };
         let config = json!({"hostpci0":"mapping=card", "description":format!("Omnuv inference worker {id}\nManaged by onv-provider. Do not edit.")});
         let mut observed = claims();
         observed.observe_vm(&worker, &config, "Pluto", &mappings(), Some(&state)).unwrap();
@@ -1403,35 +1458,13 @@ fn is_marketplace(tags: Option<&str>) -> bool {
     })
 }
 
-/// Proxmox writes numbers as numbers or as strings depending on the field and
-/// the version; both mean the same thing.
-fn as_u64(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64().or_else(|| v.as_str()?.parse().ok())
-}
-
-/// `cores` is per socket. A two-socket guest with `cores: 8` has sixteen.
-fn configured_cores(map: &serde_json::Map<String, serde_json::Value>) -> u32 {
-    let cores = map.get("cores").and_then(as_u64).unwrap_or(0);
-    let sockets = map.get("sockets").and_then(as_u64).unwrap_or(1).max(1);
-    (cores * sockets) as u32
-}
-
-/// Every disk a guest has been given, summed. `scsi0: local-lvm:vm-100-disk-0,size=32G`.
+/// The size a volume's configuration gives it, in whole GiB: `size=32G` in
+/// `local-lvm:vm-100-disk-0,size=32G`.
 ///
 /// Sizes below a gibibyte round to zero rather than up: a handful of cloud-init
 /// drives must not add a phantom gigabyte each to what the provider is said to
 /// owe.
-fn configured_disk_gib(map: &serde_json::Map<String, serde_json::Value>) -> u64 {
-    const BUSES: [&str; 4] = ["scsi", "virtio", "sata", "ide"];
-    map.iter()
-        .filter(|(k, _)| {
-            BUSES.iter().any(|b| k.strip_prefix(b).is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()))
-        })
-        .filter_map(|(_, v)| size_gib(v.as_str()?))
-        .sum()
-}
-
-fn size_gib(raw: &str) -> Option<u64> {
+pub(crate) fn size_gib(raw: &str) -> Option<u64> {
     let field = raw.split(',').find_map(|p| p.trim().strip_prefix("size="))?;
     let (num, unit) = field.split_at(field.find(|c: char| c.is_ascii_alphabetic())?);
     let n: f64 = num.parse().ok()?;
@@ -1482,27 +1515,6 @@ mod host_commitment_tests {
         assert!(!is_marketplace(Some("omnuv-something-else")));
     }
 
-    #[test]
-    fn cores_are_per_socket() {
-        let m = serde_json::json!({"cores": 8, "sockets": 2});
-        assert_eq!(configured_cores(m.as_object().unwrap()), 16);
-        let one = serde_json::json!({"cores": 4});
-        assert_eq!(configured_cores(one.as_object().unwrap()), 4);
-    }
-
-    #[test]
-    fn every_disk_counts_and_nothing_else_does() {
-        let m = serde_json::json!({
-            "scsi0": "local-lvm:vm-100-disk-0,size=32G",
-            "virtio1": "local-lvm:vm-100-disk-1,size=1T",
-            "ide2": "local:iso/ubuntu.iso,media=cdrom",
-            "scsihw": "virtio-scsi-pci",
-            "net0": "virtio=AA:BB:CC:DD:EE:FF",
-        });
-        // 32 + 1024; the cdrom has no size and the controller is not a disk.
-        assert_eq!(configured_disk_gib(m.as_object().unwrap()), 1056);
-    }
-
     /// A cloud-init drive is a few megabytes. Rounding each one up to a
     /// gibibyte would invent capacity the provider does not owe.
     #[test]
@@ -1510,55 +1522,6 @@ mod host_commitment_tests {
         assert_eq!(size_gib("local-lvm:vm-100-cloudinit,size=4M"), Some(0));
         assert_eq!(size_gib("local:iso/x.iso,media=cdrom"), None);
     }
-
-    #[test]
-    fn proxmox_numbers_are_read_whether_quoted_or_not() {
-        let m = serde_json::json!({"cores": "4", "sockets": "1"});
-        assert_eq!(configured_cores(m.as_object().unwrap()), 4);
-    }
-}
-
-/// Record, on the provider's own side, that host usage was disclosed.
-///
-/// The audit entry is written here rather than only at Core because the party
-/// giving something up should be able to see that they did, in their own
-/// journal, without asking the marketplace. It flows upward with the report as
-/// well — `audit::record` does both — so the trail exists on both sides and
-/// neither can quietly lose it.
-///
-/// Hourly while the flag stays on, plus once whenever the figure changes.
-/// Every pass would bury the audit stream in 720 entries a day; silence after
-/// the first would let a diagnostic flag become permanent without anyone
-/// noticing. Repeating is meant to be slightly annoying: `showall` is for
-/// diagnosing a host that keeps refusing placements, and then for turning off.
-fn disclosure_noted(node: &str, c: &omnuv_protocol::HostCommitment) {
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    static LAST: Mutex<Option<(Instant, omnuv_protocol::HostCommitment)>> = Mutex::new(None);
-
-    let mut last = match LAST.lock() {
-        Ok(l) => l,
-        Err(e) => e.into_inner(),
-    };
-    let due = match last.as_ref() {
-        None => true,
-        Some((at, was)) => was != c || at.elapsed() >= Duration::from_secs(3600),
-    };
-    if !due {
-        return;
-    }
-    *last = Some((Instant::now(), *c));
-    crate::audit::record(
-        "host.usage.disclosed",
-        "agent",
-        node,
-        "ok",
-        Some(&format!(
-            "showall is on: reporting {} vCPU, {} MiB and {} GiB committed to {} guest(s) \
-             this provider runs itself",
-            c.cpu_cores, c.memory_mib, c.disk_gib, c.guests
-        )),
-    );
 }
 
 #[cfg(test)]

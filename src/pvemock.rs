@@ -95,7 +95,6 @@ impl Mock {
             None,
             None,
             None,
-            false,
         )
         .expect("client")
         .with_timings(crate::timings::Timings {

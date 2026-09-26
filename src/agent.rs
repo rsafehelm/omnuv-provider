@@ -529,7 +529,6 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         },
         cfg.proxmox.city.clone(),
         cfg.proxmox.apt_mirror.clone(),
-        cfg.proxmox.showall,
     )?
     .with_images(cfg.proxmox.image_map())
     .with_environment(cfg.environment.clone())
