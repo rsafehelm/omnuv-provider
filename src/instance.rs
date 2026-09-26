@@ -1702,6 +1702,11 @@ impl Client {
     /// view still wants; `reread` asks Core's view again, just before the
     /// destroy, whether this machine is still Absent (G_reread), and is not
     /// asked at all when there is nothing to destroy.
+    ///
+    /// **What it answers is what can be proven** (lifecycle phase 7, RC1,
+    /// TD3): the pass that destroys says so and nothing more; "deleted" comes
+    /// from a later pass's complete listing, or a residue naming the volumes
+    /// that stayed (`teardown::Gone`).
     pub async fn delete_instance(
         &self,
         _node: &str,
@@ -1709,7 +1714,7 @@ impl Client {
         snippet_dir: &str,
         live_tags: &[String],
         reread: impl std::future::Future<Output = anyhow::Result<bool>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::teardown::Gone> {
         // **Nothing carrying the claim is not nothing there** (gap 2, 25
         // September 2026). A clone is untagged from the moment it exists until
         // the create claims it, so a delete arriving while one was in flight —
@@ -1767,20 +1772,17 @@ impl Client {
         // **And only the one guest licence (a) names** (lifecycle phase 7):
         // every guest carrying the claim is listed, and a copy, a twelve-digit
         // twin or a tag a live machine shares is refused rather than taken.
-        let doomed = match self.licence(TAG, id, live_tags).await? {
-            crate::teardown::Licence::Nothing => return Ok(()),
-            crate::teardown::Licence::Destroy(d) => d,
-        };
-        if !reread.await? {
-            return Err(crate::teardown::Refused(format!(
-                "vm {}: Core's view, read again just before the destroy, no longer names this machine Absent",
-                doomed.vmid
-            ))
-            .into());
+        let snippets: Vec<String> = [crate::names::snippet_instance(id), crate::names::snippet_network(id)]
+            .iter()
+            .map(|name| format!("{snippet_dir}/{name}"))
+            .collect();
+        let gone = self.tear_down(TAG, id, snippet_dir, &snippets, live_tags, reread).await?;
+        if let crate::teardown::Gone::NotYet(why) = &gone
+            && why.contains("was destroyed")
+        {
+            audit::record("instance.delete", "core", id, "destroyed", None);
         }
-        self.destroy(&doomed).await?;
-        audit::record("instance.delete", "core", id, "ok", Some(&doomed.vmid.to_string()));
-        Ok(())
+        Ok(gone)
     }
 }
 

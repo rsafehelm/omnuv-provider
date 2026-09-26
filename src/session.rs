@@ -33,10 +33,13 @@ pub const HEADER: &str = "onv-session";
 /// `provider_api::CAPABILITIES`, as far as this build has them.
 ///
 /// ```text
-/// session   this agent holds its provider under a session and stops when
-///           superseded
+/// session        this agent holds its provider under a session and stops
+///                when superseded
+/// proven-delete  "deleted" is said one complete listing after the destroy,
+///                and a volume that stayed is reported as a residue
+///                (`teardown`)
 /// ```
-pub const CAPABILITIES: &[&str] = &["session"];
+pub const CAPABILITIES: &[&str] = &["session", "proven-delete"];
 
 /// The session in force, if any.
 pub fn current(session: &Session) -> Option<String> {

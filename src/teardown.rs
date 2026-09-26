@@ -177,7 +177,7 @@ impl Client {
             }
         };
         let tag = crate::names::short_tag(id);
-        if live_tags.iter().any(|t| *t == tag) {
+        if live_tags.contains(&tag) {
             return Err(Refused(format!(
                 "vm {} carries tag {tag}, which a machine Core still wants shares; it is not destroyed",
                 one.vm.vmid
@@ -218,6 +218,358 @@ impl Client {
             .delete_task(&format!("/nodes/{node}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=0"))
             .await?;
         self.wait_task(node, &upid).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A delete is proven one listing later (RC1, S5, TD3), and remembered (RC5, TD2)
+// ---------------------------------------------------------------------------
+//
+// The delete reported "deleted" the moment the destroy task said OK, and that
+// word is the proof Core ends a claim on. Proxmox drops a config even when
+// freeing a disk fails, and one user found one or two disks left per six
+// destroys, all under TASK OK (the report's [63], [72]): the claim ended, the
+// card was sold again, and the disk stayed on the host counted by nobody.
+//
+// Now the destroy writes a tombstone first, and "deleted" is said only by a
+// later pass, on a listing that began after the destroy and found nothing of
+// the machine: no guest carrying its claim anywhere, its node answering, none
+// of the volumes its config named left in their storages, no task running for
+// its VMID, no HA resource, its snippets gone (Part II §6.3). A volume that
+// stays after it was asked to go is a residue: the compute claim may end, the
+// disk stays counted, and the volumes are named — never dropped.
+
+/// What a delete can say about a machine, on this pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Gone {
+    /// deleted(k): a complete listing after the destroy found nothing of it.
+    Proven,
+    /// Deleted with residue: nothing of it runs or is configured, and these
+    /// volumes stayed after they were asked to go.
+    Residue(Vec<String>),
+    /// Not proven: what blocks the proof, in words. Nothing may be released.
+    NotYet(String),
+}
+
+/// **The word Core ends a claim on**, as each outcome says it.
+///
+/// `deleted` is the word every agent has sent; `deleted; residue <volid>…` is
+/// new (lifecycle phase 7) and deliberately not `deleted`: a Core that
+/// predates it reads it as no proof and keeps the claim, which is safe.
+/// **A fourth untyped string on this wire** (after the handshake, `deleted`
+/// and the image refusal): Core's `claims::residue_of` is the one parser, and
+/// both sides pin the grammar in tests. A typed reason code is queued for the
+/// next protocol release.
+pub(crate) fn said(gone: &Gone) -> String {
+    match gone {
+        Gone::Proven => "deleted".to_string(),
+        Gone::Residue(volids) => format!("deleted; residue {}", volids.join(" ")),
+        Gone::NotYet(why) => format!("not proven gone: {why}"),
+    }
+}
+
+/// **The agent's record of a machine it destroyed** (RC5, TD2; the model's
+/// G_agentTomb). Written before the destroy is asked for, so an agent stopped
+/// inside one still owes the proof; kept after the proof, so a machine this
+/// agent answered deleted for is never built again under the same id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Tombstone {
+    pub id: String,
+    pub claim: String,
+    /// Where the guest was, when there was one. None: nothing of it was ever
+    /// found here, and the tombstone records only the answer.
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub vmid: Option<u32>,
+    /// The volumes its config named when the destroy was decided.
+    #[serde(default)]
+    pub volids: Vec<String>,
+    /// When the destroy task was seen to finish. None: decided, not seen.
+    #[serde(default)]
+    pub destroyed_at: Option<i64>,
+    /// When a listing proved it gone, residue or not.
+    #[serde(default)]
+    pub proven_at: Option<i64>,
+    /// Volumes that stayed after they were asked to go.
+    #[serde(default)]
+    pub residue: Vec<String>,
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Where tombstones live: beside the clone journal, one file per id.
+pub(crate) fn tombstones(snippet_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(snippet_dir).parent().unwrap_or(std::path::Path::new("/var/lib/onv")).join("tombstones")
+}
+
+fn tomb_file(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    dir.join(format!("{safe}.json"))
+}
+
+pub(crate) fn read_tomb(dir: &std::path::Path, id: &str) -> Option<Tombstone> {
+    let raw = std::fs::read(tomb_file(dir, id)).ok()?;
+    match serde_json::from_slice(&raw) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // Unreadable is not absent: the id is treated as tombstoned, so
+            // nothing is built under it, and the operator is told.
+            eprintln!("tombstone for {id} unreadable, kept: {e}");
+            Some(Tombstone {
+                id: id.to_string(),
+                claim: String::new(),
+                node: None,
+                vmid: None,
+                volids: Vec::new(),
+                destroyed_at: None,
+                proven_at: None,
+                residue: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Written before what it describes happens: a failure here stops the destroy.
+pub(crate) fn write_tomb(dir: &std::path::Path, t: &Tombstone) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let raw = serde_json::to_vec(t)?;
+    crate::names::write_private(&tomb_file(dir, &t.id).to_string_lossy(), &raw, 0o600)
+        .map_err(|e| anyhow::anyhow!("recording the tombstone of {}: {e}", t.id))
+}
+
+/// Every tombstone that parses, for the pass that retries residues.
+pub(crate) fn list_tombs(dir: &std::path::Path) -> Vec<Tombstone> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<Tombstone> = entries
+        .flatten()
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter_map(|raw| serde_json::from_slice(&raw).ok())
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// **Never built again** (G_agentTomb): an id this agent destroyed, or
+/// answered deleted for, is refused a create, with the reason.
+pub(crate) fn built_again(snippet_dir: &str, id: &str) -> Option<String> {
+    read_tomb(&tombstones(snippet_dir), id).map(|_| {
+        "this machine was deleted on this provider and its tombstone is kept; it is not built again under the same id"
+            .to_string()
+    })
+}
+
+impl Client {
+    /// **Tears one machine or worker down and says what can be proven**:
+    /// licence (a) for what may be destroyed, a tombstone before the destroy,
+    /// and the proof only on a later listing. The caller has checked the
+    /// clone journal and removed the snippets.
+    pub(crate) async fn tear_down(
+        &self,
+        kind: &str,
+        id: &str,
+        snippet_dir: &str,
+        snippets: &[String],
+        live_tags: &[String],
+        reread: impl std::future::Future<Output = anyhow::Result<bool>>,
+    ) -> anyhow::Result<Gone> {
+        let dir = tombstones(snippet_dir);
+        let held = read_tomb(&dir, id);
+        if let Some(t) = &held
+            && t.destroyed_at.is_some()
+        {
+            // The destroy was seen to finish on an earlier pass: this listing
+            // is the one that may prove it.
+            return self.prove(&dir, t.clone(), snippets).await;
+        }
+        let doomed = match self.licence(kind, id, live_tags).await? {
+            crate::teardown::Licence::Nothing => {
+                // Nothing carries the claim, on a complete listing made after
+                // this pass read the Absent: a machine never built here, or one
+                // destroyed without its tombstone seen. Recorded, and proven by
+                // the same listing a destroy's would be.
+                let t = held.unwrap_or(Tombstone {
+                    id: id.to_string(),
+                    claim: kind.to_string(),
+                    node: None,
+                    vmid: None,
+                    volids: Vec::new(),
+                    destroyed_at: None,
+                    proven_at: None,
+                    residue: Vec::new(),
+                });
+                let t = Tombstone { destroyed_at: Some(t.destroyed_at.unwrap_or_else(now)), ..t };
+                write_tomb(&dir, &t)?;
+                return self.prove(&dir, t, snippets).await;
+            }
+            crate::teardown::Licence::Destroy(d) => d,
+        };
+        if !reread.await? {
+            return Err(Refused(format!(
+                "vm {}: Core's view, read again just before the destroy, no longer names this machine Absent",
+                doomed.vmid
+            ))
+            .into());
+        }
+        let mut t = Tombstone {
+            id: id.to_string(),
+            claim: kind.to_string(),
+            node: Some(doomed.node.clone()),
+            vmid: Some(doomed.vmid),
+            volids: doomed.volids.clone(),
+            destroyed_at: None,
+            proven_at: None,
+            residue: Vec::new(),
+        };
+        // Merged with what an earlier, unconfirmed destroy recorded: a volume
+        // named then is still this machine's to account for.
+        if let Some(old) = held {
+            for v in old.volids {
+                if !t.volids.contains(&v) {
+                    t.volids.push(v);
+                }
+            }
+        }
+        write_tomb(&dir, &t)?;
+        self.destroy(&doomed).await?;
+        t.destroyed_at = Some(now());
+        write_tomb(&dir, &t)?;
+        Ok(Gone::NotYet(format!(
+            "vm {} was destroyed on {}; the next complete listing proves it gone",
+            doomed.vmid, doomed.node
+        )))
+    }
+
+    /// **The proof, on this pass's listing** (§6.3). Each condition that fails
+    /// is a blocker, named; only the volumes may fail alone, and then it is a
+    /// residue. A volume still there is asked to go once per pass, and only
+    /// when no configuration names it.
+    async fn prove(&self, dir: &std::path::Path, mut t: Tombstone, snippets: &[String]) -> anyhow::Result<Gone> {
+        let mut blockers = Vec::new();
+        let left = self.claimed_guests(&t.claim, &t.id).await?;
+        if !left.is_empty() {
+            let named: Vec<String> = left.iter().map(|c| format!("vm {} on {}", c.vm.vmid, c.node)).collect();
+            blockers.push(format!("{} still carries its claim", named.join(", ")));
+        }
+        let nodes: Vec<serde_json::Value> = self.get_json("/nodes").await?;
+        let online = |n: &str| nodes.iter().any(|x| x["node"].as_str() == Some(n) && x["status"].as_str() == Some("online"));
+        let mut residue = Vec::new();
+        if let (Some(node), Some(vmid)) = (t.node.clone(), t.vmid) {
+            if !online(&node) {
+                // An offline node holding k's disk blocks k (the roadmap's
+                // cost for this phase): nothing on it can be listed.
+                blockers.push(format!("node {node}, which held vm {vmid} and its disks, does not answer"));
+            } else {
+                let active: Vec<serde_json::Value> = self.get_json(&format!("/nodes/{node}/tasks?source=active")).await?;
+                if active.iter().any(|a| a["id"].as_str() == Some(vmid.to_string().as_str())) {
+                    blockers.push(format!("a task for vm {vmid} is still running on {node}"));
+                }
+                let ha: Vec<serde_json::Value> = self.get_json("/cluster/ha/resources").await?;
+                if ha.iter().any(|r| r["sid"].as_str() == Some(format!("vm:{vmid}").as_str())) {
+                    blockers.push(format!("vm {vmid} is still an HA resource"));
+                }
+                for volid in &t.volids {
+                    match self.volume_left(&node, volid).await {
+                        Ok(false) => {}
+                        Ok(true) => residue.push(volid.clone()),
+                        Err(e) => blockers.push(format!("{volid} could not be looked for: {e}")),
+                    }
+                }
+            }
+        }
+        for s in snippets {
+            if std::path::Path::new(s).exists() {
+                blockers.push(format!("its snippet {s} is still there"));
+            }
+        }
+        if !blockers.is_empty() {
+            return Ok(Gone::NotYet(blockers.join("; ")));
+        }
+        t.proven_at.get_or_insert_with(now);
+        t.residue = residue.clone();
+        write_tomb(dir, &t)?;
+        if residue.is_empty() {
+            crate::audit::record("teardown.proven", "agent", &t.id, "deleted", t.vmid.map(|v| v.to_string()).as_deref());
+            Ok(Gone::Proven)
+        } else {
+            crate::audit::record("teardown.proven", "agent", &t.id, "residue", Some(&residue.join(" ")));
+            Ok(Gone::Residue(residue))
+        }
+    }
+
+    /// Whether a volume a destroyed machine's config named is still in its
+    /// storage, after asking it to go once more if no configuration names it.
+    async fn volume_left(&self, node: &str, volid: &str) -> anyhow::Result<bool> {
+        let Some((storage, _)) = volid.split_once(':') else { return Ok(false) };
+        let content_path = format!("/nodes/{node}/storage/{storage}/content");
+        let present = |listed: &[serde_json::Value]| listed.iter().any(|c| c["volid"].as_str() == Some(volid));
+        let listed: Vec<serde_json::Value> = self.get_json(&content_path).await?;
+        if !present(&listed) {
+            return Ok(false);
+        }
+        // Referenced by any configuration on this node: not ours to take.
+        #[derive(serde::Deserialize)]
+        struct OnNode {
+            node: String,
+            vmid: u32,
+        }
+        let guests: Vec<OnNode> = self.get_json("/cluster/resources?type=vm").await?;
+        for g in guests.iter().filter(|g| g.node == node) {
+            let config: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{}/config", g.vmid)).await?;
+            if disk_volids(&config).iter().any(|v| v == volid) {
+                eprintln!("{volid}: vm {} names it now; it is not removed, and it stays a residue", g.vmid);
+                return Ok(true);
+            }
+        }
+        let asked: anyhow::Result<serde_json::Value> =
+            self.delete_task(&format!("{content_path}/{}", crate::proxmox::urlencode(volid))).await;
+        match asked {
+            Ok(serde_json::Value::String(upid)) => {
+                if let Err(e) = self.wait_task(node, &upid).await {
+                    eprintln!("{volid}: its removal failed: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("{volid}: could not be removed: {e}"),
+        }
+        let again: Vec<serde_json::Value> = self.get_json(&content_path).await?;
+        Ok(present(&again))
+    }
+
+    /// **Residues are retried every pass** (RC9), whether or not Core still
+    /// sends the machine: once Core ended the compute claim on a residue, the
+    /// machine leaves the view, and nothing else would look again. Answers a
+    /// self-check naming what is left, so the provider's board shows it.
+    pub(crate) async fn retry_residues(&self, snippet_dir: &str) -> Option<omnuv_protocol::SelfCheck> {
+        use omnuv_protocol::{CheckKind, CheckResult, SelfCheck};
+        let dir = tombstones(snippet_dir);
+        let mut left = Vec::new();
+        for mut t in list_tombs(&dir).into_iter().filter(|t| !t.residue.is_empty()) {
+            let Some(node) = t.node.clone() else { continue };
+            let mut still = Vec::new();
+            for volid in &t.residue {
+                match self.volume_left(&node, volid).await {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => still.push(volid.clone()),
+                }
+            }
+            if still != t.residue {
+                t.residue = still.clone();
+                if let Err(e) = write_tomb(&dir, &t) {
+                    eprintln!("tombstone {}: {e}", t.id);
+                }
+            }
+            left.extend(still.into_iter().map(|v| format!("{v} (machine {})", t.id)));
+        }
+        Some(SelfCheck {
+            name: "teardown.residue".into(),
+            kind: CheckKind::Presence,
+            result: if left.is_empty() { CheckResult::Pass } else { CheckResult::Fail },
+            detail: (!left.is_empty()).then(|| format!("volumes left by deleted machines: {}", left.join(", "))),
+            subject: None,
+        })
     }
 }
 
@@ -336,5 +688,199 @@ mod tests {
         alone.client().delete_instance("n1", ID, &dir, &[], yes()).await.expect("the machine is destroyed");
         assert_eq!(destroyed(&alone), vec!["/nodes/n1/qemu/9006?purge=1&destroy-unreferenced-disks=0".to_string()]);
         let _ = std::fs::remove_dir_all(&snippets);
+    }
+
+    /// A host whose guests and volumes change as the agent acts: what a
+    /// destroy removes, what it leaves (Proxmox drops a config even when
+    /// freeing a disk fails), whether a volume's removal is refused, and
+    /// whether the node answers.
+    #[derive(Default)]
+    struct Host {
+        /// vmid, tags, description, the volumes its config names.
+        guests: Vec<(u32, String, String, Vec<String>)>,
+        volumes: Vec<String>,
+        offline: bool,
+        destroy_leaves_disks: bool,
+        volume_delete_fails: bool,
+    }
+
+    async fn stateful(host: std::sync::Arc<std::sync::Mutex<Host>>) -> crate::pvemock::Mock {
+        crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(ok) = crate::pvemock::task_ok(path) {
+                return ok;
+            }
+            let mut h = host.lock().unwrap();
+            let listed = |h: &Host| {
+                serde_json::json!(h.guests.iter().map(|g| serde_json::json!({"node": "n1", "vmid": g.0, "tags": g.1, "status": "stopped"})).collect::<Vec<_>>())
+            };
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, listed(&h)),
+                ("GET", "/nodes/n1/qemu") => (200, listed(&h)),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": if h.offline { "offline" } else { "online" }}])),
+                ("GET", "/nodes/n1/tasks?source=active") | ("GET", "/cluster/ha/resources") => (200, serde_json::json!([])),
+                ("GET", p) if p.starts_with("/nodes/n1/qemu/") && p.ends_with("/config") => {
+                    let vmid: u32 = p.split('/').nth(4).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    match h.guests.iter().find(|g| g.0 == vmid) {
+                        Some(g) => {
+                            let mut c = serde_json::json!({"description": g.2});
+                            for (i, v) in g.3.iter().enumerate() {
+                                c[format!("scsi{i}")] = serde_json::json!(format!("{v},size=8G"));
+                            }
+                            (200, c)
+                        }
+                        None => (500, serde_json::Value::Null),
+                    }
+                }
+                ("DELETE", p) if p.starts_with("/nodes/n1/qemu/") => {
+                    let vmid: u32 = p.split('/').nth(4).and_then(|v| v.split('?').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    if let Some(i) = h.guests.iter().position(|g| g.0 == vmid) {
+                        let g = h.guests.remove(i);
+                        if !h.destroy_leaves_disks {
+                            h.volumes.retain(|v| !g.3.contains(v));
+                        }
+                    }
+                    (200, serde_json::json!("UPID:n1:destroy"))
+                }
+                ("GET", p) if p.starts_with("/nodes/n1/storage/") && p.ends_with("/content") => {
+                    let storage = p.split('/').nth(4).unwrap_or_default().to_string();
+                    let here: Vec<serde_json::Value> = h
+                        .volumes
+                        .iter()
+                        .filter(|v| v.starts_with(&format!("{storage}:")))
+                        .map(|v| serde_json::json!({"volid": v}))
+                        .collect();
+                    (200, serde_json::json!(here))
+                }
+                ("DELETE", p) if p.starts_with("/nodes/n1/storage/") => {
+                    if h.volume_delete_fails {
+                        return (500, serde_json::Value::Null);
+                    }
+                    let volid = p.rsplit('/').next().unwrap_or_default().replace("%3A", ":");
+                    h.volumes.retain(|v| *v != volid);
+                    (200, serde_json::Value::Null)
+                }
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await
+    }
+
+    const DISK: &str = "local-lvm:vm-9101-disk-0";
+    const CLOUDINIT: &str = "local-lvm:vm-9101-cloudinit";
+    /// A volume at the machine's VMID that its config never named: somebody
+    /// else's, which no delete of this machine may take.
+    const FOREIGN: &str = "local-lvm:vm-9101-disk-7";
+
+    fn machine() -> std::sync::Arc<std::sync::Mutex<Host>> {
+        let (vmid, tags, stamp) = ours(9101, ID);
+        std::sync::Arc::new(std::sync::Mutex::new(Host {
+            guests: vec![(vmid, tags, stamp, vec![DISK.to_string(), CLOUDINIT.to_string()])],
+            volumes: vec![DISK.to_string(), CLOUDINIT.to_string(), FOREIGN.to_string()],
+            ..Default::default()
+        }))
+    }
+
+    fn state_dir(name: &str) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("onv-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("snippets");
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir.to_string_lossy().to_string())
+    }
+
+    async fn pass(mock: &crate::pvemock::Mock, dir: &str) -> Gone {
+        mock.client().delete_instance("n1", ID, dir, &[], async { Ok(true) }).await.expect("a pass")
+    }
+
+    fn deletes(mock: &crate::pvemock::Mock) -> Vec<String> {
+        destroyed(mock)
+    }
+
+    /// **A delete is proven one listing later** (RC1, TD3). The pass that
+    /// destroys says only that; the next pass's complete listing says
+    /// `deleted`; every pass after says it again and destroys nothing. The
+    /// volume at the machine's VMID that its config never named survives.
+    #[tokio::test]
+    async fn a_delete_is_proven_one_listing_later() {
+        let (root, dir) = state_dir("proven-later");
+        let host = machine();
+        let mock = stateful(host.clone()).await;
+
+        let first = pass(&mock, &dir).await;
+        assert!(matches!(&first, Gone::NotYet(why) if why.contains("was destroyed")), "{first:?}");
+        assert_ne!(said(&first), "deleted", "the destroy's own pass said deleted");
+        assert_eq!(deletes(&mock), vec!["/nodes/n1/qemu/9101?purge=1&destroy-unreferenced-disks=0".to_string()]);
+
+        assert_eq!(pass(&mock, &dir).await, Gone::Proven);
+        assert_eq!(said(&Gone::Proven), "deleted");
+        assert_eq!(pass(&mock, &dir).await, Gone::Proven, "a proof said again changed");
+        assert_eq!(deletes(&mock).len(), 1, "something else was deleted: {:?}", deletes(&mock));
+        assert_eq!(host.lock().unwrap().volumes, vec![FOREIGN.to_string()], "a volume the config never named was taken");
+        assert!(built_again(&dir, ID).is_some(), "a proven machine may be built again under its id");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A left volume gives a residue** (the roadmap's pass for row 7). The
+    /// destroy finishes OK and leaves both disks; asked to go, they refuse.
+    /// The proof names them — never `deleted` — and they are retried every
+    /// pass until they go, the provider's board saying so meanwhile.
+    #[tokio::test]
+    async fn a_left_volume_is_a_residue() {
+        let (root, dir) = state_dir("residue");
+        let host = machine();
+        {
+            let mut h = host.lock().unwrap();
+            h.destroy_leaves_disks = true;
+            h.volume_delete_fails = true;
+        }
+        let mock = stateful(host.clone()).await;
+        assert!(matches!(pass(&mock, &dir).await, Gone::NotYet(_)));
+        let second = pass(&mock, &dir).await;
+        assert_eq!(second, Gone::Residue(vec![CLOUDINIT.to_string(), DISK.to_string()]));
+        assert_eq!(said(&second), format!("deleted; residue {CLOUDINIT} {DISK}"));
+        assert!(
+            mock.calls.lock().unwrap().iter().any(|c| c.method == "DELETE" && c.path.contains("/storage/local-lvm/content/")),
+            "the left volumes were never asked to go"
+        );
+        let check = mock.client().retry_residues(&dir).await.expect("a check");
+        assert_eq!(check.result, omnuv_protocol::CheckResult::Fail);
+        assert!(check.detail.as_deref().unwrap_or_default().contains(DISK), "{check:?}");
+
+        // They go when they can: the residue closes, and the board says so.
+        host.lock().unwrap().volume_delete_fails = false;
+        let check = mock.client().retry_residues(&dir).await.expect("a check");
+        assert_eq!(check.result, omnuv_protocol::CheckResult::Pass, "{check:?}");
+        assert_eq!(host.lock().unwrap().volumes, vec![FOREIGN.to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An offline node holding k's disk blocks k** (the roadmap's cost for
+    /// row 7): nothing on it can be listed, so nothing is proven, and the
+    /// claim stays held until it answers.
+    #[tokio::test]
+    async fn an_offline_node_holding_the_disk_blocks_the_proof() {
+        let (root, dir) = state_dir("offline-node");
+        let host = machine();
+        let mock = stateful(host.clone()).await;
+        assert!(matches!(pass(&mock, &dir).await, Gone::NotYet(_)));
+        host.lock().unwrap().offline = true;
+        let blocked = pass(&mock, &dir).await;
+        assert!(matches!(&blocked, Gone::NotYet(why) if why.contains("does not answer")), "{blocked:?}");
+        host.lock().unwrap().offline = false;
+        assert_eq!(pass(&mock, &dir).await, Gone::Proven);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Nothing ever built here: the pass's own complete listing proves it,
+    /// and the answer is remembered like a destroy's.
+    #[tokio::test]
+    async fn a_machine_never_built_here_is_proven_by_one_listing() {
+        let (root, dir) = state_dir("never-built");
+        let host = std::sync::Arc::new(std::sync::Mutex::new(Host::default()));
+        let mock = stateful(host).await;
+        assert_eq!(pass(&mock, &dir).await, Gone::Proven);
+        assert!(deletes(&mock).is_empty());
+        assert!(built_again(&dir, ID).is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

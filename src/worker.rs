@@ -691,7 +691,7 @@ impl Client {
         snippet_dir: &str,
         live_tags: &[String],
         reread: impl std::future::Future<Output = anyhow::Result<bool>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::teardown::Gone> {
         // **Nothing carrying the claim is not nothing there** (gap 2, as
         // `delete_instance`): a clone is untagged until the create claims it,
         // and a rollback that failed leaves a shell. Core releases the card on
@@ -733,20 +733,11 @@ impl Client {
         // And what its Workload Agent last said, which is keyed by the same id.
         self.workload.forget(worker_id);
 
-        let doomed = match self.licence(TAG, worker_id, live_tags).await? {
-            crate::teardown::Licence::Nothing => return Ok(()),
-            crate::teardown::Licence::Destroy(d) => d,
-        };
-        if !reread.await? {
-            return Err(crate::teardown::Refused(format!(
-                "vm {}: Core's view, read again just before the destroy, no longer names this worker Absent",
-                doomed.vmid
-            ))
-            .into());
-        }
-        self.destroy(&doomed).await?;
-        crate::audit::record("worker.delete", "core", worker_id, "ok", Some(&doomed.vmid.to_string()));
-        Ok(())
+        let snippets: Vec<String> = [crate::names::snippet_worker(worker_id), crate::names::snippet_worker_legacy(worker_id)]
+            .iter()
+            .map(|name| format!("{snippet_dir}/{name}"))
+            .collect();
+        self.tear_down(TAG, worker_id, snippet_dir, &snippets, live_tags, reread).await
     }
 
     /// Reads what the Workload Agent inside the machine last wrote.

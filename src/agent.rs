@@ -1749,18 +1749,23 @@ async fn reconcile_workers(
             Lifecycle::Absent => driver
                 .delete_inference_worker(&spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
                 .await
-                .map(|_| WorkerStatus {
+                .map(|gone| WorkerStatus {
                     id: spec.id.clone(),
                     state: WorkerState::Offline,
                     retryable: None,
-                    waiting_on: None,
+                    waiting_on: waiting_on(&gone),
                     local_id: None,
                     endpoint: None,
                     adapters: Vec::new(),
                     diagnostics: None,
-                    message: Some("deleted".into()),
+                    message: Some(crate::teardown::said(&gone)),
                     telemetry: None,
                 }),
+            // **Never built again under an id this agent tore down** (the
+            // model's G_agentTomb, lifecycle phase 7).
+            _ if crate::teardown::built_again(&cfg.proxmox.snippet_dir, &spec.id).is_some() => {
+                Err(anyhow::anyhow!(crate::teardown::built_again(&cfg.proxmox.snippet_dir, &spec.id).unwrap_or_default()))
+            }
             _ => {
                 driver
                     .ensure_inference_worker(
@@ -1880,21 +1885,28 @@ async fn reconcile_workers(
             Lifecycle::Absent => driver
                 .delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
                 .await
-                .map(|_| InstanceStatus {
+                .map(|gone| InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Stopped,
                 retryable: None,
-                waiting_on: None,
+                waiting_on: waiting_on(&gone),
                 local_id: None,
                 node: None,
                 console_password_generation: None,
                 private_ip: None,
                 adapters: Vec::new(),
                 diagnostics: None,
-                message: Some("deleted".into()),
+                message: Some(crate::teardown::said(&gone)),
                 recipe_progress: None,
             }),
+            // **Never built again under an id this agent tore down** (the
+            // model's G_agentTomb, lifecycle phase 7): a view that names it
+            // again — a restore by hand, a stale answer — builds nothing.
+            _ if crate::teardown::built_again(&cfg.proxmox.snippet_dir, &spec.id).is_some() => Err(anyhow::Error::from(
+                crate::instance::Unplaceable { waiting_on: "a machine with a new id" },
+            )
+            .context(crate::teardown::built_again(&cfg.proxmox.snippet_dir, &spec.id).unwrap_or_default())),
             // The image names a template this provider must have. Refusing
             // here, with the reason reported, is what keeps the scheduler's
             // provider_images honest: Core only places images we said we offer.
@@ -2001,6 +2013,10 @@ async fn reconcile_workers(
     // nothing else until 26 September 2026 (gap 4). After the loop, because
     // that is what fills it.
     checks.extend(driver.refreshes.drain());
+    // **Residues, retried every pass and reported** (lifecycle phase 7, RC9):
+    // volumes a deleted machine left, which Core no longer sends once it ended
+    // the compute claim on them.
+    checks.extend(driver.retry_residues(&cfg.proxmox.snippet_dir).await);
     for c in checks.iter().filter(|c| c.name == "instance.cloud_init") {
         eprintln!("  warning: {}", c.detail.as_deref().unwrap_or("a machine's cloud-init was not refreshed"));
     }
@@ -2062,6 +2078,16 @@ async fn reconcile_workers(
         anyhow::bail!("core rejected status report: {}", res.status());
     }
     Ok(())
+}
+
+/// What a delete's report says it is waiting on: nothing once proven; the
+/// operator, for a residue; a listing, otherwise.
+fn waiting_on(gone: &crate::teardown::Gone) -> Option<String> {
+    match gone {
+        crate::teardown::Gone::Proven => None,
+        crate::teardown::Gone::Residue(_) => Some("the provider to remove the volumes it left".into()),
+        crate::teardown::Gone::NotYet(_) => Some("a complete listing that proves it gone".into()),
+    }
 }
 
 /// **Core's view, read again just before a destroy** (lifecycle phase 7:
