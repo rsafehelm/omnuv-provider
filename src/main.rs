@@ -23,6 +23,7 @@ mod survey;
 mod workload;
 mod poison;
 mod session;
+mod teardown;
 mod dur;
 mod timings;
 mod workload_config;

@@ -1731,12 +1731,23 @@ async fn reconcile_workers(
         eprintln!("  warning: {}", c.detail.as_deref().unwrap_or("a claimed guest Core did not ask about"));
     }
 
+    // **What a delete may not take** (lifecycle phase 7, licence (a)): the id
+    // tags of everything this view still wants, workers and machines alike.
+    let live_tags: Vec<String> = desired
+        .instances
+        .iter()
+        .filter(|s| s.intent != Lifecycle::Absent)
+        .map(|s| s.id.as_str())
+        .chain(desired.inference_workers.iter().filter(|s| s.intent != Lifecycle::Absent).map(|s| s.id.as_str()))
+        .map(crate::names::short_tag)
+        .collect();
+
     let mut statuses = Vec::new();
     let mut unobserved_workers = 0usize;
     for spec in &desired.inference_workers {
         let result = match spec.intent {
             Lifecycle::Absent => driver
-                .delete_inference_worker(&spec.id, &cfg.proxmox.snippet_dir)
+                .delete_inference_worker(&spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
                 .await
                 .map(|_| WorkerStatus {
                     id: spec.id.clone(),
@@ -1866,7 +1877,10 @@ async fn reconcile_workers(
     let mut unobserved_instances = 0usize;
     for spec in &desired.instances {
         let result = match spec.intent {
-            Lifecycle::Absent => driver.delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir).await.map(|_| InstanceStatus {
+            Lifecycle::Absent => driver
+                .delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
+                .await
+                .map(|_| InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
                 state: InstanceState::Stopped,
@@ -2048,6 +2062,41 @@ async fn reconcile_workers(
         anyhow::bail!("core rejected status report: {}", res.status());
     }
     Ok(())
+}
+
+/// **Core's view, read again just before a destroy** (lifecycle phase 7:
+/// the model's G_reread and G_viewMonotone; S8, RC4).
+///
+/// A pass acts on the view it fetched at its start, and a destroy late in a
+/// pass acted on a view up to a pass old: the buyer's Absent could have been
+/// withdrawn since, or the machine's claim ended and its row gone. So the
+/// view is asked again (`?known=`, so an unchanged one costs a short answer),
+/// and the destroy goes ahead only if that view still names this id Absent.
+///
+/// **Never on a view older than the one held.** A full answer whose revision
+/// is below the one this agent holds is a reordered answer or a restore; it
+/// licenses no destroy (the model's G_viewMonotone, kept beside the re-read:
+/// their pair was never model-checked, TODO.md). Could not ask is not yes.
+async fn still_absent(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<bool> {
+    let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
+    let fetched: DesiredState = core.get_json(&format!("/provider/v1/desired-state?known={known}")).await?;
+    let view = if fetched.unchanged {
+        match crate::poison::lock(held, "held desired state").clone() {
+            Some(d) => d,
+            None => return Ok(false),
+        }
+    } else if fetched.version < known {
+        eprintln!(
+            "the view read again before a destroy is revision {}, older than the {known} this agent holds; nothing is destroyed on it",
+            fetched.version
+        );
+        return Ok(false);
+    } else {
+        *crate::poison::lock(held, "held desired state") = Some(fetched.clone());
+        fetched
+    };
+    Ok(view.instances.iter().any(|s| s.id == id && s.intent == Lifecycle::Absent)
+        || view.inference_workers.iter().any(|s| s.id == id && s.intent == Lifecycle::Absent))
 }
 
 #[cfg(test)]

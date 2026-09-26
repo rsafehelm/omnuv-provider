@@ -16,7 +16,7 @@ pub const TAG: &str = crate::names::TAG_WORKER;
 /// Typed empty form body for endpoints that take no parameters.
 const NO_FORM: &[(String, String)] = &[];
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct VmRef {
     pub(crate) vmid: u32,
     #[serde(default)]
@@ -683,10 +683,14 @@ impl Client {
     /// handed and returned `Ok` when it found nothing there, so a worker on
     /// another node of a cluster kept running, and kept its GPU, while the
     /// agent reported it deleted and Core freed the card.
+    /// Deletes one worker under licence (a), as `delete_instance` deletes a
+    /// machine (lifecycle phase 7: a worker is an attempt like a machine's).
     pub async fn delete_inference_worker(
         &self,
         worker_id: &str,
         snippet_dir: &str,
+        live_tags: &[String],
+        reread: impl std::future::Future<Output = anyhow::Result<bool>>,
     ) -> anyhow::Result<()> {
         // **Nothing carrying the claim is not nothing there** (gap 2, as
         // `delete_instance`): a clone is untagged until the create claims it,
@@ -729,17 +733,19 @@ impl Client {
         // And what its Workload Agent last said, which is keyed by the same id.
         self.workload.forget(worker_id);
 
-        let Some((node, vm)) = self.find_tagged_vm_anywhere(TAG, &short_tag(worker_id)).await? else {
-            return Ok(());
+        let doomed = match self.licence(TAG, worker_id, live_tags).await? {
+            crate::teardown::Licence::Nothing => return Ok(()),
+            crate::teardown::Licence::Destroy(d) => d,
         };
-        let node = node.as_str();
-        if vm.status.as_deref() == Some("running") {
-            let upid: String =
-                self.post_form(&format!("/nodes/{node}/qemu/{}/status/stop", vm.vmid), NO_FORM).await?;
-            self.wait_task(node, &upid).await?;
+        if !reread.await? {
+            return Err(crate::teardown::Refused(format!(
+                "vm {}: Core's view, read again just before the destroy, no longer names this worker Absent",
+                doomed.vmid
+            ))
+            .into());
         }
-        let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
-        self.wait_task(node, &upid).await?;
+        self.destroy(&doomed).await?;
+        crate::audit::record("worker.delete", "core", worker_id, "ok", Some(&doomed.vmid.to_string()));
         Ok(())
     }
 
@@ -920,16 +926,22 @@ mod tests {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
                     {"node": "n2", "vmid": 321, "tags": tags, "status": "running"}])),
                 ("POST", "/nodes/n2/qemu/321/status/stop") => (200, serde_json::json!("UPID:n2:stop")),
-                ("DELETE", "/nodes/n2/qemu/321") => (200, serde_json::json!("UPID:n2:del")),
+                ("GET", "/nodes/n2/qemu/321/config") => {
+                    (200, serde_json::json!({"description": crate::names::description(super::TAG, id)}))
+                }
+                ("DELETE", "/nodes/n2/qemu/321?purge=1&destroy-unreferenced-disks=0") => (200, serde_json::json!("UPID:n2:del")),
                 _ => (404, serde_json::Value::Null),
             }
         })
         .await;
         let dir = std::env::temp_dir().join(format!("onv-wdel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        mock.client().delete_inference_worker(id, dir.to_str().unwrap()).await.expect("delete");
+        mock.client().delete_inference_worker(id, dir.to_str().unwrap(), &[], async { Ok(true) }).await.expect("delete");
         assert!(mock.called("POST", "/nodes/n2/qemu/321/status/stop"), "the running worker was not stopped");
-        assert!(mock.called("DELETE", "/nodes/n2/qemu/321"), "the worker on another node was not deleted");
+        assert!(
+            mock.called("DELETE", "/nodes/n2/qemu/321?purge=1&destroy-unreferenced-disks=0"),
+            "the worker on another node was not deleted"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     use super::*;

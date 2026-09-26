@@ -1697,11 +1697,18 @@ impl Client {
         }
     }
 
+    /// **Deletes one machine, under licence (a)** (lifecycle phase 7, RC4,
+    /// TD8; see `teardown`). `live_tags` are the id tags of everything Core's
+    /// view still wants; `reread` asks Core's view again, just before the
+    /// destroy, whether this machine is still Absent (G_reread), and is not
+    /// asked at all when there is nothing to destroy.
     pub async fn delete_instance(
         &self,
-        node: &str,
+        _node: &str,
         id: &str,
         snippet_dir: &str,
+        live_tags: &[String],
+        reread: impl std::future::Future<Output = anyhow::Result<bool>>,
     ) -> anyhow::Result<()> {
         // **Nothing carrying the claim is not nothing there** (gap 2, 25
         // September 2026). A clone is untagged from the moment it exists until
@@ -1756,24 +1763,23 @@ impl Client {
         // the card, and the machine keeps running on hardware nobody believes is
         // in use. The node the caller named is where a *new* machine would go,
         // never where an existing one is.
-        let (found_node, found_vm) = match self.find_tagged_vm_anywhere(TAG, &short_tag(id)).await?
-        {
-            Some((n, v)) => (n, Some(v)),
-            None => (node.to_string(), None),
+        //
+        // **And only the one guest licence (a) names** (lifecycle phase 7):
+        // every guest carrying the claim is listed, and a copy, a twelve-digit
+        // twin or a tag a live machine shares is refused rather than taken.
+        let doomed = match self.licence(TAG, id, live_tags).await? {
+            crate::teardown::Licence::Nothing => return Ok(()),
+            crate::teardown::Licence::Destroy(d) => d,
         };
-        let node = found_node.as_str();
-        let Some(vm) = found_vm else {
-            return Ok(());
-        };
-        if vm.status.as_deref() == Some("running") {
-            let upid: String = self
-                .post_form(&format!("/nodes/{node}/qemu/{}/status/stop", vm.vmid), NO_FORM)
-                .await?;
-            self.wait_task(node, &upid).await?;
+        if !reread.await? {
+            return Err(crate::teardown::Refused(format!(
+                "vm {}: Core's view, read again just before the destroy, no longer names this machine Absent",
+                doomed.vmid
+            ))
+            .into());
         }
-        let upid: String = self.delete_task(&format!("/nodes/{node}/qemu/{}", vm.vmid)).await?;
-        self.wait_task(node, &upid).await?;
-        audit::record("instance.delete", "core", id, "ok", Some(&vm.vmid.to_string()));
+        self.destroy(&doomed).await?;
+        audit::record("instance.delete", "core", id, "ok", Some(&doomed.vmid.to_string()));
         Ok(())
     }
 }
@@ -2200,6 +2206,7 @@ mod tests {
         sp.console_password_generation = 1;
         sp.console_password_hash = Some("$6$rounds=10000$saltsaltsaltsalt$hashhashhashhash".into());
         let key = short_tag(&sp.id);
+        let stamp_id = sp.id.clone();
         let answering = Arc::new(AtomicBool::new(false));
         let ga = answering.clone();
         let mock = Mock::start(move |method, path, _| {
@@ -2211,13 +2218,17 @@ mod tests {
                     {"node": "n1", "vmid": 700, "status": "running", "tags": format!("{TAG};{key}")}
                 ])),
                 ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 60})),
+                // Its stamp, which licence (a) reads before a destroy.
+                ("GET", "/nodes/n1/qemu/700/config") => {
+                    (200, serde_json::json!({"description": crate::names::description(TAG, &stamp_id)}))
+                }
                 ("GET", "/nodes/n1/qemu/700/agent/network-get-interfaces") if ga.load(Ordering::SeqCst) => {
                     (200, serde_json::json!({"result": [{"name": "eth0", "ip-addresses": [
                         {"ip-address": "192.0.2.7", "ip-address-type": "ipv4"}]}]}))
                 }
                 ("GET", "/nodes/n1/qemu/700/agent/network-get-interfaces") => (500, serde_json::Value::Null),
                 ("POST", "/nodes/n1/qemu/700/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
-                ("DELETE", "/nodes/n1/qemu/700") => (200, serde_json::json!("UPID:n1:del")),
+                ("DELETE", "/nodes/n1/qemu/700?purge=1&destroy-unreferenced-disks=0") => (200, serde_json::json!("UPID:n1:del")),
                 ("GET", _) => (200, serde_json::json!({})),
                 _ => (200, serde_json::Value::Null),
             }
@@ -2261,7 +2272,7 @@ mod tests {
         // Deleted: the record goes with the machine.
         let journal = crate::passwords::dir(&dir);
         assert_eq!(crate::passwords::applied(&journal, &sp.id), 2);
-        mock.client().delete_instance("n1", &sp.id, &dir).await.expect("the delete");
+        mock.client().delete_instance("n1", &sp.id, &dir, &[], async { Ok(true) }).await.expect("the delete");
         assert_eq!(crate::passwords::applied(&journal, &sp.id), 0, "a deleted machine's record was left behind");
 
         // An image that manages its own password: no number, and no call.
@@ -2852,13 +2863,16 @@ mod tests {
         .unwrap();
         let e = mock
             .client()
-            .delete_instance("n1", "i-being-cloned", &dir)
+            .delete_instance("n1", "i-being-cloned", &dir, &[], async { Ok(true) })
             .await
             .expect_err("a machine whose clone is still in flight was reported gone");
         assert!(format!("{e:#}").contains("not gone"), "{e:#}");
         // And it does report gone once nothing is owed.
         crate::pending::remove(&journal, 123);
-        mock.client().delete_instance("n1", "i-being-cloned", &dir).await.expect("nothing owed, nothing there");
+        mock.client()
+            .delete_instance("n1", "i-being-cloned", &dir, &[], async { Ok(true) })
+            .await
+            .expect("nothing owed, nothing there");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
