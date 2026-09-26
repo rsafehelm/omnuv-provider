@@ -925,7 +925,11 @@ mod tests {
             }
         })
         .await;
-        let dir = std::env::temp_dir().join(format!("onv-wdel-{}", std::process::id()));
+        // Snippets one level down, so the tombstone beside them stays in this
+        // test's own directory.
+        let root = std::env::temp_dir().join(format!("onv-wdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("snippets");
         std::fs::create_dir_all(&dir).unwrap();
         mock.client().delete_inference_worker(id, dir.to_str().unwrap(), &[], async { Ok(true) }).await.expect("delete");
         assert!(mock.called("POST", "/nodes/n2/qemu/321/status/stop"), "the running worker was not stopped");
@@ -933,7 +937,7 @@ mod tests {
             mock.called("DELETE", "/nodes/n2/qemu/321?purge=1&destroy-unreferenced-disks=0"),
             "the worker on another node was not deleted"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
     use super::*;
 

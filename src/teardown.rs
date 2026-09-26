@@ -883,4 +883,27 @@ mod tests {
         assert!(built_again(&dir, ID).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// **A worker is an attempt as a machine is** (lifecycle phase 7): its
+    /// delete goes through the same licence, the same tombstone and the same
+    /// proof one listing later, a left volume included.
+    #[tokio::test]
+    async fn a_worker_delete_is_proven_one_listing_later() {
+        let (root, dir) = state_dir("worker-proven");
+        let tags = crate::names::tags(crate::names::TAG_WORKER, ID, Some("test"));
+        let stamp = crate::names::description(crate::names::TAG_WORKER, ID);
+        let host = std::sync::Arc::new(std::sync::Mutex::new(Host {
+            guests: vec![(9101, tags, stamp, vec![DISK.to_string()])],
+            volumes: vec![DISK.to_string()],
+            destroy_leaves_disks: true,
+            volume_delete_fails: true,
+            ..Default::default()
+        }));
+        let mock = stateful(host.clone()).await;
+        let pass = || async { mock.client().delete_inference_worker(ID, &dir, &[], async { Ok(true) }).await.expect("a pass") };
+        assert!(matches!(pass().await, Gone::NotYet(_)), "the destroy's own pass proved the worker gone");
+        assert_eq!(pass().await, Gone::Residue(vec![DISK.to_string()]));
+        assert!(built_again(&dir, ID).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
