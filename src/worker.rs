@@ -909,14 +909,22 @@ mod tests {
         use crate::pvemock::{task_ok, Mock};
         let id = "2f8a1c0d-dead-beef-0000-000000000000";
         let tags = format!("{};{}", super::TAG, crate::names::short_tag(id));
+        // Running on its node until the delete's stop.
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halted = stopped.clone();
         let mock = Mock::start(move |method, path, _| {
             if let Some(r) = task_ok(path) {
                 return r;
             }
+            let now = if halted.load(std::sync::atomic::Ordering::SeqCst) { "stopped" } else { "running" };
             match (method, path) {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
                     {"node": "n2", "vmid": 321, "tags": tags, "status": "running"}])),
-                ("POST", "/nodes/n2/qemu/321/status/stop") => (200, serde_json::json!("UPID:n2:stop")),
+                ("GET", "/nodes/n2/qemu/321/status/current") => (200, serde_json::json!({"status": now})),
+                ("POST", "/nodes/n2/qemu/321/status/stop") => {
+                    halted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    (200, serde_json::json!("UPID:n2:stop"))
+                }
                 ("GET", "/nodes/n2/qemu/321/config") => {
                     (200, serde_json::json!({"description": crate::names::description(super::TAG, id)}))
                 }
@@ -1297,6 +1305,10 @@ mod a_worker_is_claimed_before_it_can_fail {
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("321")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
                 ("POST", "/nodes/n1/qemu/321/config") => (200, serde_json::Value::Null),
+                // What the clone call wrote: the stamp the rollback reads.
+                ("GET", "/nodes/n1/qemu/321/config") => {
+                    (200, serde_json::json!({"description": crate::names::description(super::TAG, &spec().id)}))
+                }
                 ("PUT", "/nodes/n1/qemu/321/resize") => (500, serde_json::Value::Null),
                 ("POST", "/nodes/n1/qemu/321/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
                 ("DELETE", "/nodes/n1/qemu/321") => (200, serde_json::json!("UPID:n1:del")),

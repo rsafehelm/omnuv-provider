@@ -1670,6 +1670,33 @@ impl Client {
             // be written is a reason to try harder, never to leave a shell.
             eprintln!("instance {id}: the rollback of {vmid} could not be written down: {e:#}");
         }
+        // **Only the clone this record names** (the lifecycle phase 7
+        // regression review, 26 September; RC4, H3). Phase 1 put the stamp
+        // check on a clone's record, and the rollback's still destroyed
+        // whatever sat at its VMID: a record left owed across a restart, the
+        // shell removed by somebody else, and the VMID given to the host
+        // owner's next VM, stopped and destroyed as this clone. Asked of the
+        // node's own configuration, which the clone call wrote the stamp into,
+        // never of the cluster listing, which lags. A configuration that
+        // cannot be read decides nothing: the rollback stays owed.
+        let config: serde_json::Value = match self.get_json(&format!("/nodes/{node}/qemu/{vmid}/config")).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("instance {id}: vm {vmid}'s configuration cannot be read, so its rollback stays owed: {e:#}");
+                return false;
+            }
+        };
+        let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
+        if first != Some(crate::names::stamped(&entry.claim, id).as_str()) {
+            eprintln!(
+                "instance {id}: vm {vmid} does not carry this clone's stamp (it reads {:?}), so it is not this \
+                 agent's to take; left for the operator, and the record goes",
+                first.unwrap_or("")
+            );
+            audit::record(&format!("{event}.create"), "core", id, "unproven vm left", Some(&vmid.to_string()));
+            crate::pending::remove(journal, vmid);
+            return false;
+        }
         // Stopped before it is destroyed, and the stop waited for, so the
         // destroy does not meet the stop's lock (the same race as the start).
         if let Ok(answer) = self
@@ -1890,6 +1917,10 @@ mod tests {
                 ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
                 ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
                 ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
+                // What the clone call wrote: the stamp the rollback reads.
+                ("GET", "/nodes/n1/qemu/123/config") => {
+                    (200, serde_json::json!({"description": crate::names::description(TAG, &spec().id)}))
+                }
                 ("PUT", "/nodes/n1/qemu/123/resize") => (500, serde_json::Value::Null),
                 ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
                 ("DELETE", "/nodes/n1/qemu/123") => (200, serde_json::json!("UPID:n1:del")),
@@ -1981,7 +2012,8 @@ mod tests {
                 }),
                 ("GET", p) if p.ends_with("/qemu/800/config") => (200, serde_json::json!({"hostpci0": "mapping=onv-gpu-a,pcie=1"})),
                 ("GET", "/nodes/n1/qemu/123/config") => (200, serde_json::json!({
-                    "net1": "virtio=02:00:00:00:00:01,bridge=onvseg1", "hostpci0": "mapping=onv-gpu-a,pcie=1,rombar=0"})),
+                    "net1": "virtio=02:00:00:00:00:01,bridge=onvseg1", "hostpci0": "mapping=onv-gpu-a,pcie=1,rombar=0",
+                    "description": crate::names::description(TAG, &spec().id)})),
                 ("GET", "/nodes/n1/tasks?source=active") => (200, serde_json::json!([])),
                 ("GET", "/cluster/sdn/vnets") => (200, serde_json::json!([{"vnet": "onvseg1", "zone": "onv"}])),
                 ("GET", "/nodes/n1/sdn/zones/onv/content") => (200, serde_json::json!([
@@ -2211,6 +2243,9 @@ mod tests {
         let stamp_id = sp.id.clone();
         let answering = Arc::new(AtomicBool::new(false));
         let ga = answering.clone();
+        // Running until the delete's stop: the node's own status follows it.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let halted = stopped.clone();
         let mock = Mock::start(move |method, path, _| {
             if let Some(ok) = task_ok(path) {
                 return ok;
@@ -2219,6 +2254,9 @@ mod tests {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
                     {"node": "n1", "vmid": 700, "status": "running", "tags": format!("{TAG};{key}")}
                 ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") if halted.load(Ordering::SeqCst) => {
+                    (200, serde_json::json!({"status": "stopped"}))
+                }
                 ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 60})),
                 // Its stamp, which licence (a) reads before a destroy.
                 ("GET", "/nodes/n1/qemu/700/config") => {
@@ -2229,7 +2267,10 @@ mod tests {
                         {"ip-address": "192.0.2.7", "ip-address-type": "ipv4"}]}]}))
                 }
                 ("GET", "/nodes/n1/qemu/700/agent/network-get-interfaces") => (500, serde_json::Value::Null),
-                ("POST", "/nodes/n1/qemu/700/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("POST", "/nodes/n1/qemu/700/status/stop") => {
+                    halted.store(true, Ordering::SeqCst);
+                    (200, serde_json::json!("UPID:n1:stop"))
+                }
                 ("DELETE", "/nodes/n1/qemu/700?purge=1&destroy-unreferenced-disks=0") => (200, serde_json::json!("UPID:n1:del")),
                 ("GET", _) => (200, serde_json::json!({})),
                 _ => (200, serde_json::Value::Null),
@@ -2276,6 +2317,8 @@ mod tests {
         assert_eq!(crate::passwords::applied(&journal, &sp.id), 2);
         mock.client().delete_instance("n1", &sp.id, &dir, &[], async { Ok(true) }).await.expect("the delete");
         assert_eq!(crate::passwords::applied(&journal, &sp.id), 0, "a deleted machine's record was left behind");
+        // The fixture's machine runs on for the pass below.
+        stopped.store(false, Ordering::SeqCst);
 
         // An image that manages its own password: no number, and no call.
         let mut own = sp.clone();
@@ -2887,6 +2930,9 @@ mod tests {
                     } else {
                         (200, serde_json::json!([]))
                     }
+                }
+                ("GET", "/nodes/n1/qemu/123/config") => {
+                    (200, serde_json::json!({"description": crate::names::description(TAG, "i-abandoned")}))
                 }
                 ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
                 ("DELETE", "/nodes/n1/qemu/123") => (500, serde_json::Value::Null),

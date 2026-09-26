@@ -66,11 +66,17 @@ pub(crate) struct Claimed {
 
 /// The one guest licence (a) allows a delete to destroy, and the volumes its
 /// own configuration names — the only disks that go with it.
+///
+/// **No power state here.** It carried the cluster listing's `status` until
+/// the regression of 26 September: that listing is pvestatd's cache, a guest
+/// started a moment ago reads `stopped` in it, the stop was skipped on that
+/// word, and Proxmox refused to destroy a running guest. Whether to stop is
+/// asked of the node when the destroy is made (`Client::destroy`), so nothing
+/// that reads this can trust a stale one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Doomed {
     pub node: String,
     pub vmid: u32,
-    pub running: bool,
     pub volids: Vec<String>,
 }
 
@@ -106,6 +112,22 @@ pub(crate) fn disk_volids(config: &serde_json::Value) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// **The VMID a volume's name carries**, as Proxmox names what it allocates:
+/// `vm-<id>-…`, `base-<id>-…`, `subvol-<id>-…`, `basevol-<id>-…`, and a
+/// directory storage's `<id>/vm-<id>-disk-0.qcow2`. None for a name that
+/// carries none (an ISO, an import).
+pub(crate) fn volume_vmid(volid: &str) -> Option<u32> {
+    let name = volid.split_once(':').map(|(_, n)| n).unwrap_or(volid);
+    if let Some((dir, _)) = name.split_once('/') {
+        return dir.parse().ok();
+    }
+    ["vm-", "base-", "subvol-", "basevol-"].iter().find_map(|prefix| {
+        let rest = name.strip_prefix(prefix)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        (!digits.is_empty() && rest[digits.len()..].starts_with('-')).then(|| digits.parse().ok()).flatten()
+    })
 }
 
 /// Every volume a guest's configuration names, a container's included
@@ -219,23 +241,40 @@ impl Client {
             ))
             .into());
         }
-        Ok(Licence::Destroy(Doomed {
-            node: one.node,
-            vmid: one.vm.vmid,
-            running: one.vm.status.as_deref() == Some("running"),
-            volids: disk_volids(&config),
-        }))
+        Ok(Licence::Destroy(Doomed { node: one.node, vmid: one.vm.vmid, volids: disk_volids(&config) }))
     }
 
-    /// **The destroy licence (a) allowed**: stopped first and the stop waited
-    /// for, then destroyed with `purge=1` (backup jobs, replication and HA
-    /// entries go with it) and `destroy-unreferenced-disks=0`, said rather
-    /// than left to a default, so no volume goes for carrying the VMID.
+    /// **A guest's power state as its node says it now**: `status/current`,
+    /// which asks qemu-server whether the process runs — the same check
+    /// Proxmox's own destroy makes before it refuses. Never the cluster
+    /// listing's `status`, which lags a start by up to pvestatd's interval.
+    /// A paused guest reads `running`, and is stopped like one.
+    pub(crate) async fn live_status(&self, node: &str, vmid: u32) -> anyhow::Result<String> {
+        let now: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/status/current")).await?;
+        now.get("status")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("vm {vmid} on {node}: its node gave no power state, so it is not destroyed"))
+    }
+
+    /// **The destroy licence (a) allowed**: stopped first if its node says it
+    /// is not stopped now, the stop waited for and the node asked again, then
+    /// destroyed with `purge=1` (backup jobs, replication and HA entries go
+    /// with it) and `destroy-unreferenced-disks=0`, said rather than left to a
+    /// default, so no volume goes for carrying the VMID. A guest its node
+    /// still calls running after the stop is not destroyed on this pass.
     pub(crate) async fn destroy(&self, d: &Doomed) -> anyhow::Result<()> {
         let (node, vmid) = (d.node.as_str(), d.vmid);
-        if d.running {
+        if self.live_status(node, vmid).await? != "stopped" {
             let upid: String = self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/stop"), NO_FORM).await?;
             self.wait_task(node, &upid).await?;
+            let after = self.live_status(node, vmid).await?;
+            if after != "stopped" {
+                return Err(Refused(format!(
+                    "vm {vmid} on {node} is still {after} after its stop; it is not destroyed on this pass"
+                ))
+                .into());
+            }
         }
         let upid: String = self
             .delete_task(&format!("/nodes/{node}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=0"))
@@ -545,6 +584,21 @@ impl Client {
             kind: Option<String>,
         }
         let guests: Vec<Guest> = self.get_json("/cluster/resources?type=vm").await?;
+        // **A number some guest holds now is not ours to judge** (the
+        // regression review of 26 September). A volume's name carries the
+        // VMID it was made for, and a VMID is the lowest free number: once
+        // the machine was destroyed, the next clone takes it and makes its
+        // disks under the same names — and a full clone writes them into its
+        // configuration only when the copy ends. So a volume named for a VMID
+        // a guest holds is never removed, whether or not a configuration names
+        // it yet; it stays a residue for the operator.
+        if let Some(held) = volume_vmid(volid).and_then(|n| guests.iter().find(|g| g.vmid == n)) {
+            eprintln!(
+                "{volid}: its number is vm {}'s on {} now, so whose it is cannot be told; it is not removed",
+                held.vmid, held.node
+            );
+            return Ok(true);
+        }
         for g in &guests {
             let kind = if g.kind.as_deref() == Some("lxc") { "lxc" } else { "qemu" };
             let config: serde_json::Value = match self.get_json(&format!("/nodes/{}/{kind}/{}/config", g.node, g.vmid)).await {
@@ -677,6 +731,20 @@ mod tests {
         );
     }
 
+    /// The number a volume's name carries, and the nearest names that carry
+    /// none.
+    #[test]
+    fn a_volume_says_which_number_it_was_made_for() {
+        assert_eq!(volume_vmid("local-lvm:vm-9101-disk-0"), Some(9101));
+        assert_eq!(volume_vmid("local-lvm:vm-9101-cloudinit"), Some(9101));
+        assert_eq!(volume_vmid("zfs:base-9000-disk-1"), Some(9000));
+        assert_eq!(volume_vmid("local-zfs:subvol-300-disk-0"), Some(300));
+        assert_eq!(volume_vmid("local:9101/vm-9101-disk-0.qcow2"), Some(9101));
+        for none in ["local:iso/ubuntu.iso", "local:import/onv-x.qcow2", "local-lvm:vm-disk-0", "local-lvm:vm-12x-disk-0", "vm9101"] {
+            assert_eq!(volume_vmid(none), None, "{none}");
+        }
+    }
+
     /// A container's volumes are named too, so a leftover one of ours that a
     /// container mounts is never removed.
     #[test]
@@ -709,6 +777,7 @@ mod tests {
                 ),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
                 ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", p) if p.ends_with("/status/current") => (200, serde_json::json!({"status": "stopped"})),
                 ("DELETE", _) => (200, serde_json::json!("UPID:n1:destroy")),
                 ("GET", p) if p.ends_with("/config") => {
                     let vmid: u32 = p.split('/').nth(4).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -802,6 +871,13 @@ mod tests {
                 ("GET", "/nodes/n1/qemu") => (200, listed(&h)),
                 ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": if h.offline { "offline" } else { "online" }}])),
                 ("GET", "/nodes/n1/tasks?source=active") | ("GET", "/cluster/ha/resources") => (200, serde_json::json!([])),
+                ("GET", p) if p.starts_with("/nodes/n1/qemu/") && p.ends_with("/status/current") => {
+                    let vmid: u32 = p.split('/').nth(4).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    match h.guests.iter().any(|g| g.0 == vmid) {
+                        true => (200, serde_json::json!({"status": "stopped"})),
+                        false => (500, crate::pvemock::refusal(&format!("Configuration file 'nodes/n1/qemu-server/{vmid}.conf' does not exist"))),
+                    }
+                }
                 ("GET", p) if p.starts_with("/nodes/n1/qemu/") && p.ends_with("/config") => {
                     let vmid: u32 = p.split('/').nth(4).and_then(|v| v.parse().ok()).unwrap_or(0);
                     match h.guests.iter().find(|g| g.0 == vmid) {
