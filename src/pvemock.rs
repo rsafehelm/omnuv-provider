@@ -78,6 +78,11 @@ impl Mock {
     }
 
     /// A client for this mock. The fingerprint is never used over plain HTTP.
+    ///
+    /// **The start gate is short here**: two looks 50 ms apart, because under
+    /// test nothing becomes ready by waiting. A test value, kept in the test
+    /// code: it was a `#[cfg(test)]` constant in `proxmox.rs` until the gate
+    /// became `timings.startGate*`, and a test value is not a configuration.
     pub fn client(&self) -> crate::proxmox::Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
         crate::proxmox::Client::new(
@@ -93,6 +98,11 @@ impl Mock {
             false,
         )
         .expect("client")
+        .with_timings(crate::timings::Timings {
+            start_gate_looks: 2,
+            start_gate_every: crate::dur::Dur::millis(50),
+            ..Default::default()
+        })
     }
 
     /// The body of the first call with this method and path.

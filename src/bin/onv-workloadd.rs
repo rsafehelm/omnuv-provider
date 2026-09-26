@@ -41,8 +41,18 @@ use omnuv_protocol::{
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-/// Faster than the Provider Agent reads, so a read never finds nothing new.
-const INTERVAL: Duration = Duration::from_secs(15);
+// **What this machine is told, and how a time is written**: shared with the
+// Provider Agent, which writes `/etc/onv/workload.yaml` into this machine's
+// first boot. The crate has no library, so the two programs include the same
+// files; each uses its own half, which is why dead code is allowed here.
+#[allow(dead_code)]
+#[path = "../dur.rs"]
+mod dur;
+#[allow(dead_code)]
+#[path = "../workload_config.rs"]
+mod workload_config;
+
+use workload_config::WorkloadConfig;
 
 /// On `tmpfs`, deliberately: a reboot must not leave yesterday's report behind
 /// looking current, and this is state about *now* that should not survive the
@@ -54,10 +64,32 @@ const INTERVAL: Duration = Duration::from_secs(15);
 /// holds the two equal.
 const STATUS_PATH: &str = "/run/onv/workload.json";
 
-/// Beyond this, a worker that answers is still not somewhere to send traffic.
-/// The number is deliberately generous — `/v1/models` is a trivial handler, so
-/// two seconds means the event loop is starved, not that the model is large.
-const DEGRADED_ABOVE: Duration = Duration::from_millis(2000);
+/// `/etc/onv/workload.yaml` (`--config` elsewhere), or the defaults when there
+/// is none. **Absent is the defaults, never a refusal**: a machine built before
+/// the file existed has none, and so does every worker whose Provider Agent
+/// runs the defaults, because the file is written only when a value differs.
+/// Present and wrong is a refusal naming the key: the service then restarts
+/// and says so every ten seconds, and the machine still serves, because this
+/// process only describes it.
+fn load_config(path: &str) -> anyhow::Result<(WorkloadConfig, bool)> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => WorkloadConfig::parse(&raw)
+            .map(|c| (c, true))
+            .map_err(|bad| anyhow::anyhow!("{path} refused:\n  {}", bad.join("\n  "))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((WorkloadConfig::default(), false)),
+        Err(e) => Err(anyhow::anyhow!("{path}: {e}")),
+    }
+}
+
+/// The configuration in force, as the journal shows it at start.
+fn describe(path: &str, cfg: &WorkloadConfig, from_file: bool) -> String {
+    format!(
+        "onv-workloadd: configuration reportEvery={} degradedAbove={} ({})",
+        cfg.report_every,
+        cfg.degraded_above,
+        if from_file { format!("from {path}") } else { format!("the defaults: no {path}") }
+    )
+}
 
 struct Config {
     workload_id: String,
@@ -167,12 +199,13 @@ fn parse_vllm_metrics(body: &str) -> Option<ServingStats> {
 ///
 /// The distinction an HTTP 200 cannot make is the point of this whole type: a
 /// worker answering slowly is worse than one that is honestly still loading,
-/// because the loading one is not in the routing table.
-fn classify_health(reachable: bool, ok: bool, elapsed: Duration) -> WorkloadHealth {
+/// because the loading one is not in the routing table. Slow is
+/// `degradedAbove`, two seconds unless this machine was told otherwise.
+fn classify_health(reachable: bool, ok: bool, elapsed: Duration, degraded_above: Duration) -> WorkloadHealth {
     match (reachable, ok) {
         (false, _) => WorkloadHealth::Down,
         (true, false) => WorkloadHealth::Starting,
-        (true, true) if elapsed > DEGRADED_ABOVE => WorkloadHealth::Degraded,
+        (true, true) if elapsed > degraded_above => WorkloadHealth::Degraded,
         (true, true) => WorkloadHealth::Serving,
     }
 }
@@ -231,10 +264,10 @@ fn read_gpus() -> Vec<GpuTelemetry> {
     }
 }
 
-async fn probe(client: &reqwest::Client, vllm_url: &str) -> (WorkloadHealth, Option<ServingStats>) {
+async fn probe(client: &reqwest::Client, vllm_url: &str, degraded_above: Duration) -> (WorkloadHealth, Option<ServingStats>) {
     let started = Instant::now();
     let health = match client.get(format!("{vllm_url}/v1/models")).send().await {
-        Ok(r) => classify_health(true, r.status().is_success(), started.elapsed()),
+        Ok(r) => classify_health(true, r.status().is_success(), started.elapsed(), degraded_above),
         Err(_) => WorkloadHealth::Down,
     };
     let serving = match client.get(format!("{vllm_url}/metrics")).send().await {
@@ -357,22 +390,35 @@ async fn main() -> anyhow::Result<()> {
     // cannot ship in a state where starting it panics.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let args: Vec<String> = std::env::args().collect();
+    let path = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| workload_config::PATH.to_string());
+    // Before anything else, and in `--check` too: a file this machine was
+    // given that does not pass is said at start, naming the key.
+    let (settings, from_file) = load_config(&path)?;
+
     // A start-up self-check, in the spirit of every other agent here: prove the
     // things that panic or exit at start, at a moment when a person is
     // watching, rather than at 3am inside a guest nobody can see.
-    if std::env::args().any(|a| a == "--check") {
+    if args.iter().any(|a| a == "--check") {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
             .map_err(|e| anyhow::anyhow!("http client: {e}"))?;
         println!("onv-workloadd: ok");
+        eprintln!("{}", describe(&path, &settings, from_file));
         return Ok(());
     }
 
     let cfg = Config::from_env()?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(workload_config::PROBE_TIMEOUT.std())
         .build()?;
+    eprintln!("{}", describe(&path, &settings, from_file));
     let started = Instant::now();
     // The port a buyer's traffic actually arrives on, which is the only one
     // worth watching for arrivals.
@@ -388,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("onv-workloadd: {} reporting to {STATUS_PATH}", cfg.workload_id);
 
     loop {
-        let (health, serving) = probe(&client, &cfg.vllm_url).await;
+        let (health, serving) = probe(&client, &cfg.vllm_url, settings.degraded_above.std()).await;
         let bytes = dir_bytes(&cfg.cache_dir);
         let delta = bytes.saturating_sub(last_bytes);
         last_bytes = bytes;
@@ -423,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("onv-workloadd: health {last_health:?} -> {health:?}");
             last_health = Some(health);
         }
-        tokio::time::sleep(INTERVAL).await;
+        tokio::time::sleep(settings.report_every.std()).await;
     }
 }
 
@@ -487,11 +533,44 @@ python_gc_objects_collected_total{generation=\"0\"} 9999.0
     fn health_separates_slow_from_healthy_and_from_still_loading() {
         let quick = Duration::from_millis(20);
         let slow = Duration::from_secs(9);
-        assert_eq!(classify_health(true, true, quick), WorkloadHealth::Serving);
-        assert_eq!(classify_health(true, true, slow), WorkloadHealth::Degraded);
+        let two = WorkloadConfig::default().degraded_above.std();
+        assert_eq!(classify_health(true, true, quick, two), WorkloadHealth::Serving);
+        assert_eq!(classify_health(true, true, slow, two), WorkloadHealth::Degraded);
         // Connected but not serving: vLLM is up and still loading weights.
-        assert_eq!(classify_health(true, false, quick), WorkloadHealth::Starting);
-        assert_eq!(classify_health(false, false, quick), WorkloadHealth::Down);
+        assert_eq!(classify_health(true, false, quick, two), WorkloadHealth::Starting);
+        assert_eq!(classify_health(false, false, quick, two), WorkloadHealth::Down);
+    }
+
+    /// **Slow is this machine's file's to say** (`degradedAbove`, a constant
+    /// until 26 September 2026): a second is serving at the default two and
+    /// degraded at half a second.
+    #[test]
+    fn the_degraded_threshold_is_the_one_configured() {
+        let second = Duration::from_secs(1);
+        assert_eq!(classify_health(true, true, second, Duration::from_secs(2)), WorkloadHealth::Serving);
+        assert_eq!(classify_health(true, true, second, Duration::from_millis(500)), WorkloadHealth::Degraded);
+    }
+
+    /// **The file, or the defaults when there is none**; a file that does not
+    /// pass stops the start, naming the key.
+    #[test]
+    fn the_configuration_is_the_file_or_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workload.yaml");
+        let p = path.to_str().unwrap();
+
+        let (absent, from_file) = load_config(p).expect("an absent file is the defaults");
+        assert_eq!((absent, from_file), (WorkloadConfig::default(), false));
+
+        std::fs::write(&path, "reportEvery: 5s\ndegradedAbove: 500ms\n").unwrap();
+        let (told, from_file) = load_config(p).expect("a good file loads");
+        assert!(from_file);
+        assert_eq!((told.report_every.std(), told.degraded_above.std()), (Duration::from_secs(5), Duration::from_millis(500)));
+
+        std::fs::write(&path, "reportEvery: 5s\ndegradedAbove: 20s\n").unwrap();
+        let e = load_config(p).expect_err("a threshold past the probe's timeout loaded").to_string();
+        assert!(e.contains("degradedAbove is 20s"), "{e}");
+        assert!(describe(p, &told, true).contains("reportEvery=5s degradedAbove=500ms"));
     }
 
     #[test]

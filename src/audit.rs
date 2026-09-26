@@ -36,8 +36,28 @@ static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static PENDING: Mutex<std::collections::VecDeque<omnuv_protocol::AuditEntry>> =
     Mutex::new(std::collections::VecDeque::new());
 
-/// How many unsent records the agent will hold.
-const PENDING_MAX: usize = 500;
+/// How many unsent records the agent will hold: `timings.auditBacklog`, set
+/// once at start. Its default until then, so a record made before the
+/// configuration is read — a failed start — is held like any other.
+static BACKLOG: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(crate::timings::defaults::AUDIT_BACKLOG as usize);
+
+/// Puts `timings.auditBacklog` in force.
+pub fn set_backlog(n: usize) {
+    BACKLOG.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Appends to a bounded queue, dropping the oldest first.
+fn push_bounded(
+    q: &mut std::collections::VecDeque<omnuv_protocol::AuditEntry>,
+    entry: omnuv_protocol::AuditEntry,
+    max: usize,
+) {
+    while q.len() >= max.max(1) {
+        q.pop_front();
+    }
+    q.push_back(entry);
+}
 
 #[derive(Serialize)]
 struct Record<'a> {
@@ -92,17 +112,15 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
 
     {
         let mut q = crate::poison::lock(&PENDING, "audit queue");
-        while q.len() >= PENDING_MAX {
-            q.pop_front();
-        }
-        q.push_back(omnuv_protocol::AuditEntry {
+        let entry = omnuv_protocol::AuditEntry {
             at: ts,
             action: action.to_string(),
             actor: actor.to_string(),
             subject: subject.to_string(),
             outcome: outcome.to_string(),
             detail: detail.map(str::to_string),
-        });
+        };
+        push_bounded(&mut q, entry, BACKLOG.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 
@@ -129,3 +147,39 @@ pub fn drain(max: usize) -> Vec<omnuv_protocol::AuditEntry> {
 /// semi-trusted, and writing tenant payloads to their filesystem by default
 /// would be a privacy failure, not transparency.
 pub const REDACTION_POLICY: &str = "metadata only; no secrets, no buyer payloads";
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// **The backlog is `timings.auditBacklog`**, and past it the oldest record
+    /// goes first. It was a constant, 500, until 26 September 2026.
+    #[test]
+    fn the_backlog_holds_what_it_was_set_to_and_drops_the_oldest() {
+        let entry = |n: u32| omnuv_protocol::AuditEntry {
+            at: String::new(),
+            action: format!("a{n}"),
+            actor: "agent".into(),
+            subject: "s".into(),
+            outcome: "ok".into(),
+            detail: None,
+        };
+        let mut q = std::collections::VecDeque::new();
+        for n in 0..5 {
+            super::push_bounded(&mut q, entry(n), 3);
+        }
+        assert_eq!(q.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), ["a2", "a3", "a4"]);
+
+        assert_eq!(super::BACKLOG.load(Relaxed), 500, "the default, before the configuration is read");
+        // What start sets is what `record` keeps. The queue is the process's,
+        // shared with every test that records, so the assertion is a bound:
+        // whatever else was recorded or drained meanwhile, never more than 3.
+        super::set_backlog(3);
+        for n in 0..10 {
+            super::record("test.backlog", "agent", &format!("s{n}"), "ok", None);
+        }
+        let held = super::drain(1000).len();
+        super::set_backlog(crate::timings::defaults::AUDIT_BACKLOG as usize);
+        assert!(held <= 3, "{held} records held with a backlog of 3");
+    }
+}

@@ -187,6 +187,10 @@ pub struct Client {
     /// arguments; and empty is a working default, meaning a provider that
     /// offers no images and reports holding none.
     images: std::collections::BTreeMap<String, u32>,
+    /// `timings` in `agent.yaml`: the start gate, the clone budget's cap, and
+    /// what workers are told. The defaults until `with_timings`, which are the
+    /// values these were compiled in as.
+    pub(crate) timings: crate::timings::Timings,
 }
 
 impl ComputeDriver for Client {
@@ -381,7 +385,16 @@ impl Client {
             workload: crate::workload::Store::new(),
             showall,
             images: Default::default(),
+            timings: Default::default(),
         })
+    }
+
+    /// The agent's `timings`. The Workload Agents' store is rebuilt with the
+    /// configured count: it holds nothing yet when this is called, at start.
+    pub fn with_timings(mut self, timings: crate::timings::Timings) -> Self {
+        self.workload = crate::workload::Store::stuck_after(timings.workload_stuck_after_reads);
+        self.timings = timings;
+        self
     }
 
     /// Which deployment this agent belongs to; see `names::tags`.
@@ -543,13 +556,15 @@ impl Client {
     /// ask" means something may. Transient reads are tolerated here; only
     /// `Ended` is an answer.
     /// How many one-second polls a create may spend on its clone: Core's
-    /// remaining budget when it sent one, never more than thirty minutes and
-    /// never none (PROVIDER-18). The budget was sent and never read, so a
-    /// clone Core had already given up on held the reconcile loop for the full
-    /// thirty. Running out is not failure: the clone stays journalled and the
-    /// next create settles it.
-    pub(crate) fn clone_polls(budget_secs: Option<u64>) -> u32 {
-        budget_secs.map_or(1800, |b| b.clamp(1, 1800) as u32)
+    /// remaining budget when it sent one, never more than `max`
+    /// (`timings.cloneBudgetMax`, thirty minutes unless the file says
+    /// otherwise) and never none (PROVIDER-18). The budget was sent and never
+    /// read, so a clone Core had already given up on held the reconcile loop
+    /// for the full thirty. Running out is not failure: the clone stays
+    /// journalled and the next create settles it.
+    pub(crate) fn clone_polls(budget_secs: Option<u64>, max: crate::dur::Dur) -> u32 {
+        let cap = max.as_secs().clamp(1, u64::from(u32::MAX));
+        budget_secs.map_or(cap, |b| b.clamp(1, cap)) as u32
     }
 
     pub(crate) async fn task_end(&self, node: &str, upid: &str, polls: u32) -> TaskEnd {
@@ -697,18 +712,20 @@ impl Client {
     }
 
     /// **Starts the machine once nothing blocks it**, and waits for the start.
-    /// Polls `start_blockers` every 2 s for up to 60 s (ceiling: a resize takes
-    /// milliseconds, a network reload a few seconds, and a card is released
-    /// when the machine before it is destroyed, measured at under 10 s on
-    /// Pluto); after that it answers `NotReady`, starts nothing, and leaves the
-    /// machine built: the next pass starts it through this same gate.
+    /// Polls `start_blockers` `timings.startGateEvery` apart, at most
+    /// `timings.startGateLooks` times: every 2 s for up to 60 s unless the
+    /// agent's file says otherwise (ceiling: a resize takes milliseconds, a
+    /// network reload a few seconds, and a card is released when the machine
+    /// before it is destroyed, measured at under 10 s on Pluto); after that it
+    /// answers `NotReady`, starts nothing, and leaves the machine built: the
+    /// next pass starts it through this same gate.
     pub(crate) async fn start_when_ready(&self, node: &str, vmid: u32) -> anyhow::Result<()> {
         let mut blockers = self.start_blockers(node, vmid).await?;
-        for _ in 0..START_GATE_LOOKS {
+        for _ in 0..self.timings.start_gate_looks {
             if blockers.is_empty() {
                 break;
             }
-            tokio::time::sleep(START_GATE_EVERY).await;
+            tokio::time::sleep(self.timings.start_gate_every.std()).await;
             blockers = self.start_blockers(node, vmid).await?;
         }
         if !blockers.is_empty() {
@@ -1785,17 +1802,6 @@ mod first_boot_files_reach_the_node {
     }
 }
 
-/// How long the start gate waits: 30 looks 2 s apart (see `start_when_ready`
-/// for the ceiling). Short under test, where nothing becomes ready by waiting.
-#[cfg(not(test))]
-const START_GATE_LOOKS: u32 = 30;
-#[cfg(test)]
-const START_GATE_LOOKS: u32 = 2;
-#[cfg(not(test))]
-const START_GATE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(test)]
-const START_GATE_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// A machine that may not be started yet, and why: its inputs are not all
 /// ready (`Client::start_when_ready`). Not a failure of the machine: it stays
 /// built and is started on a later pass.
@@ -1809,3 +1815,33 @@ impl std::fmt::Display for NotReady {
 }
 
 impl std::error::Error for NotReady {}
+
+#[cfg(test)]
+mod the_start_gate_is_configured {
+    use crate::pvemock::{Mock, gate_clear};
+
+    /// **The gate looks `timings.startGateLooks` times, `timings.
+    /// startGateEvery` apart** (constants until 26 September 2026): a blocker
+    /// that never clears is looked at once and then three more times, and the
+    /// machine is left built rather than started.
+    #[tokio::test]
+    async fn the_start_gate_looks_as_often_as_it_is_told() {
+        let mock = Mock::start(|method, path, _| {
+            if method == "GET" && path == "/nodes/n1/tasks?source=active" {
+                return (200, serde_json::json!([{"id": "901", "type": "qmclone"}]));
+            }
+            gate_clear(method, path).unwrap_or((404, serde_json::Value::Null))
+        })
+        .await;
+        let client = mock.client().with_timings(crate::timings::Timings {
+            start_gate_looks: 3,
+            start_gate_every: crate::dur::Dur::millis(10),
+            ..Default::default()
+        });
+        let e = client.start_when_ready("n1", 901).await.expect_err("started past a blocker");
+        assert!(e.downcast_ref::<super::NotReady>().is_some(), "{e:#}");
+        let looks = mock.calls.lock().unwrap().iter().filter(|c| c.path == "/nodes/n1/tasks?source=active").count();
+        assert_eq!(looks, 4, "one look, then as many more as the file says");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/901/status/start"), "started a blocked machine");
+    }
+}

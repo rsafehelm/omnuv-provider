@@ -1149,7 +1149,7 @@ impl Client {
         // unanswered status read is not an ending. Only Proxmox's own answer
         // decides: a failed clone is rolled back now; one whose end could not
         // be seen stays recorded, and a later create settles it.
-        match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs)).await {
+        match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs, self.timings.clone_budget_max)).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 self.abandon_clone(node, vmid, &spec.id, "instance").await;
@@ -2294,9 +2294,16 @@ mod tests {
         let journal = crate::pending::dir(&dir);
         assert!(std::fs::read_dir(&journal).map(|d| d.count() > 0).unwrap_or(false), "the unfinished clone was not left journalled");
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(crate::proxmox::Client::clone_polls(None), 1800);
-        assert_eq!(crate::proxmox::Client::clone_polls(Some(0)), 1, "no budget left still looks once");
-        assert_eq!(crate::proxmox::Client::clone_polls(Some(86_400)), 1800);
+        let thirty = crate::timings::defaults::CLONE_BUDGET_MAX;
+        assert_eq!(crate::proxmox::Client::clone_polls(None, thirty), 1800);
+        assert_eq!(crate::proxmox::Client::clone_polls(Some(0), thirty), 1, "no budget left still looks once");
+        assert_eq!(crate::proxmox::Client::clone_polls(Some(86_400), thirty), 1800);
+        // The cap is `timings.cloneBudgetMax`; it was a constant, 1800 polls,
+        // until 26 September 2026. A budget under it is still Core's.
+        let ten = crate::dur::Dur::mins(10);
+        assert_eq!(crate::proxmox::Client::clone_polls(None, ten), 600, "no budget: the cap");
+        assert_eq!(crate::proxmox::Client::clone_polls(Some(86_400), ten), 600, "a budget past it: the cap");
+        assert_eq!(crate::proxmox::Client::clone_polls(Some(90), ten), 90, "a budget under it: Core's");
     }
 
     /// PROVIDER-1: a clone whose end could not be seen stays recorded, and is

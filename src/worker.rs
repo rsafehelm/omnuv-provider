@@ -70,7 +70,33 @@ fn workloadd_check(sha256: Option<&str>) -> String {
     }
 }
 
+/// `cloud_init_with`, the Workload Agent told the defaults.
+#[cfg(test)]
 fn cloud_init(spec: &InferenceWorkerSpec, core_url: &str) -> String {
+    cloud_init_with(spec, core_url, &crate::workload_config::WorkloadConfig::default())
+}
+
+/// The `write_files` entry for `/etc/onv/workload.yaml`: what this agent's
+/// `timings.workload` tells the machine's Workload Agent.
+///
+/// **Only when a value differs from its default**, and empty otherwise. A
+/// worker whose first-boot configuration changes is rebooted to apply it
+/// (PROVIDER-31), so writing the file into every worker's snippet would have
+/// rebooted every running worker on the release that introduced it, to tell
+/// it values it already runs. Absent, the Workload Agent runs its defaults,
+/// which are these same values, from the same definition.
+fn workload_file(workload: &crate::workload_config::WorkloadConfig) -> String {
+    if *workload == crate::workload_config::WorkloadConfig::default() {
+        return String::new();
+    }
+    let content: String = workload.to_yaml().lines().map(|l| format!("      {l}\n")).collect();
+    format!(
+        "  - path: {}\n    permissions: '0644'\n    content: |\n{content}",
+        crate::workload_config::PATH
+    )
+}
+
+fn cloud_init_with(spec: &InferenceWorkerSpec, core_url: &str, workload: &crate::workload_config::WorkloadConfig) -> String {
     // One argument per line, base64-encoded into the bootcmd.
     //
     // Shell-quoting these was wrong twice over: `$(cat file)` does not perform
@@ -108,7 +134,7 @@ bootcmd:
   - [ bash, -c, "echo {args_b64} | base64 -d > /etc/onv/vllm.args" ]
   - [ bash, -c, "echo {image_b64} | base64 -d > /etc/onv/vllm.image" ]
 write_files:
-  - path: /usr/local/bin/onv-serve
+{workload_file}  - path: /usr/local/bin/onv-serve
     permissions: '0755'
     content: |
       #!/bin/bash
@@ -214,6 +240,7 @@ runcmd:
         verify = workloadd_check(WORKLOADD_SHA256),
         args_b64 = args_b64,
         image_b64 = base64::engine::general_purpose::STANDARD.encode(&spec.image),
+        workload_file = workload_file(workload),
     )
 }
 
@@ -393,7 +420,7 @@ impl Client {
                         vm.vmid,
                         snippet_dir,
                         &crate::names::snippet_worker(&spec.id),
-                        &cloud_init(spec, core_url),
+                        &cloud_init_with(spec, core_url, &self.timings.workload),
                     )
                     .await
                 {
@@ -456,7 +483,11 @@ impl Client {
         // Snippet must exist before the VM references it.
         let file = crate::names::snippet_worker(&spec.id);
         // 0600: a worker's user data carries its credentials to Core.
-        crate::names::write_private(&format!("{snippet_dir}/{file}"), cloud_init(spec, core_url).as_bytes(), 0o600)
+        crate::names::write_private(
+            &format!("{snippet_dir}/{file}"),
+            cloud_init_with(spec, core_url, &self.timings.workload).as_bytes(),
+            0o600,
+        )
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
 
         // **Queued and serialized, and every node asked** — the same gate and the
@@ -535,7 +566,7 @@ impl Client {
             .await?;
         pending.upid = Some(upid.clone());
         crate::pending::write(&journal, &pending)?;
-        match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs)).await {
+        match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs, self.timings.clone_budget_max)).await {
             crate::proxmox::TaskEnd::Ended(Ok(())) => {}
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 self.abandon_clone(node, vmid, &spec.id, "worker").await;
@@ -947,6 +978,54 @@ mod workload_agent_tests {
             port: 8000,
             budget_secs: None,
         }
+    }
+
+    /// **The release that adds `workload.yaml` reboots no worker.** With the
+    /// defaults a worker's first-boot configuration is byte for byte what it
+    /// was before the file existed: this SHA-256 was taken from the code
+    /// before the change, on 26 September 2026. A snippet that does not change
+    /// is not rewritten, and a worker whose snippet is unchanged is not
+    /// rebooted (PROVIDER-31). The digest is of a build without a Workload
+    /// Agent digest compiled in, which is what `cargo test` is.
+    #[test]
+    fn with_the_defaults_a_worker_s_first_boot_is_unchanged() {
+        use sha2::Digest as _;
+        let ci = super::cloud_init(&spec(), "https://api.omnuv.com/");
+        assert!(!ci.contains("workload.yaml"), "the defaults were written into every worker's first boot");
+        if super::WORKLOADD_SHA256.is_none() {
+            let digest: String = sha2::Sha256::digest(ci.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                digest, "a4e94e76cc6c5d8081c82d498b2ce5a7b0adeb9123df49ce22f9ecb50671adc0",
+                "a worker's first boot changed with nothing configured: every running worker would be rebooted"
+            );
+        }
+    }
+
+    /// **A value that differs reaches the worker** in `/etc/onv/workload.yaml`,
+    /// in the words the Workload Agent reads, and nothing else about the
+    /// machine's first boot changes with it.
+    #[test]
+    fn a_changed_value_is_written_for_the_workload_agent() {
+        use crate::workload_config::WorkloadConfig;
+        let told = WorkloadConfig {
+            report_every: crate::dur::Dur::secs(5),
+            degraded_above: crate::dur::Dur::millis(1500),
+        };
+        let ci = super::cloud_init_with(&spec(), "https://api.omnuv.com/", &told);
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("the cloud-config still parses");
+        let file = doc["write_files"]
+            .as_sequence()
+            .expect("write_files")
+            .iter()
+            .find(|f| f["path"].as_str() == Some("/etc/onv/workload.yaml"))
+            .expect("workload.yaml is written");
+        assert_eq!(file["permissions"].as_str(), Some("0644"));
+        assert_eq!(WorkloadConfig::parse(file["content"].as_str().expect("content")), Ok(told));
+        assert_eq!(
+            ci.replace(&super::workload_file(&told), ""),
+            super::cloud_init(&spec(), "https://api.omnuv.com/"),
+            "something besides the file moved"
+        );
     }
 
     #[test]

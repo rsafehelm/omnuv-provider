@@ -32,17 +32,26 @@ use std::sync::{Arc, Mutex};
 /// so a reboot cannot leave yesterday's report behind looking current.
 pub const WORKLOAD_STATUS: &str = "/run/onv/workload.json";
 
-/// Reads with no advance in `uptime_s` before the reporter is presumed dead.
+/// What each worker's Workload Agent last said, and for how many reads it has
+/// said the same thing.
 ///
-/// Staleness is measured by the guest's own uptime rather than by a clock or a
-/// timestamp in the file: a stopped reporter leaves a perfectly well-formed
-/// file behind, and the only thing that distinguishes it from a live one is
-/// that the number stops moving. Nothing here trusts the guest's wall clock.
-const STUCK_AFTER_READS: u32 = 3;
-
-#[derive(Clone, Default)]
+/// A reporter is presumed dead after `stuck_after_reads` reads with no advance
+/// in `uptime_s`: `timings.workloadStuckAfterReads`, 3 unless the agent's file
+/// says otherwise. Staleness is measured by the guest's own uptime rather than
+/// by a clock or a timestamp in the file: a stopped reporter leaves a
+/// perfectly well-formed file behind, and the only thing that distinguishes it
+/// from a live one is that the number stops moving. Nothing here trusts the
+/// guest's wall clock.
+#[derive(Clone)]
 pub struct Store {
     inner: Arc<Mutex<HashMap<String, Seen>>>,
+    stuck_after_reads: u32,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::stuck_after(crate::timings::defaults::WORKLOAD_STUCK_AFTER_READS)
+    }
 }
 
 #[derive(Clone)]
@@ -54,6 +63,12 @@ struct Seen {
 impl Store {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store that presumes a reporter dead after `reads` reads without
+    /// progress.
+    pub fn stuck_after(reads: u32) -> Self {
+        Self { inner: Arc::default(), stuck_after_reads: reads }
     }
 
     /// Records a freshly read report and says whether to believe it.
@@ -87,7 +102,7 @@ impl Store {
             seen.unchanged_reads += 1;
         }
 
-        (seen.unchanged_reads < STUCK_AFTER_READS).then_some(report)
+        (seen.unchanged_reads < self.stuck_after_reads).then_some(report)
     }
 
     /// Forgets a workload, so a deleted worker's last words do not sit in
@@ -156,6 +171,21 @@ mod tests {
         assert!(s.observe(report("w1", 100)).is_some(), "two is still not death");
         assert!(s.observe(report("w1", 100)).is_none(), "three unchanged: gone");
         assert!(s.observe(report("w1", 100)).is_none(), "and it stays gone");
+    }
+
+    /// **How many reads is the agent's file's to say** (`timings.
+    /// workloadStuckAfterReads`); it was a constant, 3, until 26 September.
+    #[test]
+    fn the_number_of_reads_before_a_reporter_is_dead_is_configured() {
+        let s = Store::stuck_after(1);
+        assert!(s.observe(report("w1", 100)).is_some(), "first sight");
+        assert!(s.observe(report("w1", 100)).is_none(), "one unchanged read is death at 1");
+        let s = Store::stuck_after(5);
+        s.observe(report("w1", 100));
+        for n in 1..5 {
+            assert!(s.observe(report("w1", 100)).is_some(), "{n} unchanged is not death at 5");
+        }
+        assert!(s.observe(report("w1", 100)).is_none(), "five is");
     }
 
     /// A restarted machine reports a *smaller* uptime. That is a live reporter,

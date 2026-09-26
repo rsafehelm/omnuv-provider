@@ -297,40 +297,10 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let config = format!(
-        r#"# Written by `onv-provider join`. Contains this machine's own Proxmox
-# credentials; they are never sent to Omnuv.
-core:
-  url: "{core}"
-  token: "{token}"
+    let config = config_file(&a.core, &node, &fingerprint, &storage, a.cpu_cores, a.memory_mib, a.disk_gib, &gpus)?;
+    let secrets = secrets_file(&a.token, &secret);
 
-inventoryEverySecs: 300
-
-proxmox:
-  apiUrl: "https://127.0.0.1:8006"
-  node: "{node}"
-  tlsFingerprintSha256: "{fingerprint}"
-  tokenId: "onv@pve!agent"
-  tokenSecret: "{secret}"
-  templateVmid: 9000
-  snippetDir: /var/lib/onv/snippets
-  contribute:
-    cpuCores: {cpu}
-    memoryMib: {mem}
-    diskGib: {disk}
-    storage: ["{storage}"]
-    gpus:
-{gpus}
-"#,
-        core = a.core,
-        token = a.token.expose(),
-        cpu = a.cpu_cores,
-        mem = a.memory_mib,
-        disk = a.disk_gib,
-        gpus = if gpus.is_empty() { "      []".to_string() } else { gpus },
-    );
-
-    println!("\nWriting /etc/onv/agent.yaml (0640 root:onv)");
+    println!("\nWriting /etc/onv/agent.yaml (0640 root:onv) and /etc/onv/{} (0600 onv:onv)", crate::config::SECRETS_FILE);
     if !a.dry_run {
         std::fs::create_dir_all("/etc/onv")?;
         // Checked and created under the *same* name. This asked for `omnuv`
@@ -343,10 +313,16 @@ proxmox:
             u = crate::names::PREFIX,
             var = crate::names::VAR
         ))?;
-        // Created 0640, never wider: `fs::write` then `chmod` left the file
-        // world-readable, with both credentials in it, between the two.
+        // Created with their modes, never wider: `fs::write` then `chmod` left
+        // the file world-readable, with both credentials in it, between the
+        // two. The credentials are in their own file now, readable by the
+        // agent's account alone, and the agent refuses one anybody else can
+        // read.
         crate::names::write_private("/etc/onv/agent.yaml", config.as_bytes(), 0o640)?;
         sh("chgrp onv /etc/onv/agent.yaml")?;
+        let secrets_path = format!("/etc/onv/{}", crate::config::SECRETS_FILE);
+        crate::names::write_private(&secrets_path, secrets.as_bytes(), 0o600)?;
+        sh(&format!("chown onv:onv {secrets_path}"))?;
         sh("install -d -o onv -g onv /var/lib/onv/snippets /var/log/onv")?;
         // **And the audit log inside it.** `main` opened it before this ran,
         // as root, so it was root:root 0644 and the agent (`User=onv`) could
@@ -387,6 +363,65 @@ proxmox:
 }
 
 const PACKAGED_UNIT: &str = "/lib/systemd/system/onv-provider.service";
+
+/// `agent.yaml` as `join` writes it: no credential in it, and every timing at
+/// the value this build ships with, so the file on the host is the whole
+/// configuration, as `deploy-agent.yml` writes it.
+#[allow(clippy::too_many_arguments)] // One per line of the file it writes.
+fn config_file(
+    core: &str,
+    node: &str,
+    fingerprint: &str,
+    storage: &str,
+    cpu: u32,
+    memory_mib: u64,
+    disk_gib: u64,
+    gpus: &str,
+) -> anyhow::Result<String> {
+    let timings: String = serde_yaml_ng::to_string(&crate::timings::Timings::default())?
+        .lines()
+        .map(|l| format!("  {l}\n"))
+        .collect();
+    Ok(format!(
+        r#"# Written by `onv-provider join`. This machine's own credentials are in
+# {secrets} beside it, mode 0600; they are never sent to Omnuv.
+core:
+  url: "{core}"
+
+proxmox:
+  apiUrl: "https://127.0.0.1:8006"
+  node: "{node}"
+  tlsFingerprintSha256: "{fingerprint}"
+  tokenId: "onv@pve!agent"
+  templateVmid: 9000
+  snippetDir: /var/lib/onv/snippets
+  contribute:
+    cpuCores: {cpu}
+    memoryMib: {memory_mib}
+    diskGib: {disk_gib}
+    storage: ["{storage}"]
+    gpus:
+{gpus}
+
+# How long, how often, how many: every key, at the values this build ships
+# with. `onv-provider check-config` checks a change before a restart.
+timings:
+{timings}"#,
+        secrets = crate::config::SECRETS_FILE,
+        gpus = if gpus.is_empty() { "      []" } else { gpus },
+    ))
+}
+
+/// `agent-secrets.yaml` as `join` writes it. Each value is written as a JSON
+/// string, which is a YAML one, so no character in a credential can end it.
+fn secrets_file(core_token: &omnuv_protocol::Redacted, pve_secret: &str) -> String {
+    format!(
+        "# Written by `onv-provider join`: this provider's two credentials, mode 0600.\n\
+         coreToken: {}\nproxmoxTokenSecret: {}\n",
+        serde_json::Value::from(core_token.expose()),
+        serde_json::Value::from(pve_secret)
+    )
+}
 
 /// Removes everything `join` created. A provider must be able to leave as
 /// easily as they joined, without asking us.
@@ -485,7 +520,7 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
         ("remove acl", "pveum acl delete / -token 'onv@pve!agent' -role OnvAgent 2>/dev/null || true; pveum acl delete / -user onv@pve -role OnvAgent 2>/dev/null || true"),
         ("remove user", "pveum user delete onv@pve 2>/dev/null || true"),
         ("remove role", "pveum role delete OnvAgent 2>/dev/null || true"),
-        ("remove config", "rm -f /etc/onv/agent.yaml"),
+        ("remove config", "rm -f /etc/onv/agent.yaml /etc/onv/agent-secrets.yaml"),
         ("remove storage", "pvesm remove onv-snippets 2>/dev/null || true"),
         ("remove pools", "pveum pool delete onv-buyers 2>/dev/null || true; pveum pool delete onv 2>/dev/null || true"),
         // **Two older generations, and they are not optional.** `join` created
@@ -602,6 +637,33 @@ mod tests {
         for needed in ["VM.Allocate", "VM.Clone", "VM.PowerMgmt", "Mapping.Use", "SDN.Use"] {
             assert!(ROLE_PRIVS.contains(needed), "role is missing {needed}");
         }
+    }
+
+    /// **What `join` writes is what the agent loads**: the credentials in their
+    /// own file, mode 0600, and nowhere else; every timing written out at its
+    /// default; and a credential with a quote in it still one value.
+    #[test]
+    fn what_join_writes_the_agent_loads() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let gpus = "      - \"0000:21:00.0\"";
+        let config = config_file("https://api.omnuv.com", "n1", "AB:CD", "local", 8, 16_384, 200, gpus).unwrap();
+        let secrets = secrets_file(&"prov_x_\"quoted\"".into(), "pve-SEKRET");
+        assert!(!config.contains("prov_x") && !config.contains("SEKRET"), "a credential in agent.yaml: {config}");
+        assert!(config.contains("  tunnelPing: 20s\n"), "the timings are not written out: {config}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(&path, &config).unwrap();
+        let secrets_path = dir.path().join(crate::config::SECRETS_FILE);
+        std::fs::write(&secrets_path, &secrets).unwrap();
+        std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cfg = crate::config::load_agent(path.to_str().unwrap()).expect("join's own files load");
+        assert_eq!(cfg.core.token.expose(), "prov_x_\"quoted\"");
+        assert_eq!(cfg.proxmox.token_secret.expose(), "pve-SEKRET");
+        assert_eq!(cfg.timings, crate::timings::Timings::default());
+        assert_eq!(cfg.proxmox.contribute.gpus, vec!["0000:21:00.0"]);
+        assert!(matches!(cfg.credentials, crate::config::CredentialSource::SecretsFile(_)));
     }
 
     /// Eight characters is the Proxmox limit for a vnet name. Exceeding it

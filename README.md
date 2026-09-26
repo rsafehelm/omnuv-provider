@@ -64,6 +64,16 @@ What kind of host this is, is a question for `join`, not for the packager.
 Your configuration is not a packaged file. `join` writes it, which means an
 upgrade can never ask you what to do about a file you did not edit.
 
+It is two files. `/etc/onv/agent.yaml` holds everything but the two
+credentials, including a `timings` section with every interval, timeout and
+limit the agent keeps (`onv-provider print-config` prints their defaults).
+`/etc/onv/agent-secrets.yaml`, mode 0600, holds the credentials alone, and the
+agent refuses one anybody but its owner can read. After an edit,
+`onv-provider check-config` loads both as the agent would, prints the hash the
+agent will report with every heartbeat, and names any key it refuses; a change
+takes effect when the service restarts. An `agent.yaml` from before the split,
+credentials inside, still loads, with a warning.
+
 Removing the package takes away the software. Purging takes the configuration
 too. Neither touches `/var/log/omnuv`: that is your record of what this
 marketplace did on your hardware, and it is not ours to delete.

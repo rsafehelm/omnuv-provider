@@ -218,6 +218,7 @@ impl Core {
         &self,
         a: &omnuv_protocol::ImageArtefact,
         dest: &std::path::Path,
+        idle: std::time::Duration,
     ) -> anyhow::Result<()> {
         use futures_util::StreamExt as _;
         use sha2::Digest as _;
@@ -322,14 +323,16 @@ impl Core {
         //
         // Each chunk gets its own deadline instead. Bytes must keep arriving;
         // a longer gap is a dead transfer, and the right thing to do with one
-        // is abort so the next tick can start again.
-        const IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+        // is abort so the next tick can start again. The gap is
+        // `timings.imageTransferIdle`, two minutes unless the agent's file
+        // says otherwise: how long a pause is on a provider's uplink is a
+        // fact about that uplink.
         let outcome: anyhow::Result<()> = async {
             loop {
-                match tokio::time::timeout(IDLE, stream.next()).await {
+                match tokio::time::timeout(idle, stream.next()).await {
                     Err(_) => anyhow::bail!(
                         "no bytes for {}s after {written} of {}; the transfer is dead",
-                        IDLE.as_secs(),
+                        idle.as_secs(),
                         a.bytes
                     ),
                     Ok(None) => break,
@@ -421,8 +424,19 @@ async fn startup_checks(
     let mut out: Vec<String> = runtime_checks(cfg, driver).await.iter().map(check_line).collect();
     // Core, over TLS. Not the overlay — by design nothing here may depend on
     // it, and this check exists partly to keep that honest.
-    out.insert(1, core_check(core, &cfg.core.url).await);
+    out.insert(1, core_check(core, &cfg.core.url, &cfg.timings.hash()).await);
     out
+}
+
+/// What every heartbeat says (`omnuv_protocol::Heartbeat`): which tunables this
+/// agent runs, as the hash `check-config` printed for its file. So the play
+/// that wrote the file can prove the running agent took it, and two agents
+/// can be compared. **The self-check's heartbeat says it too**: a heartbeat
+/// without it would tell Core this agent reports none, for the moment until
+/// the next one.
+fn heartbeat_body(config_hash: &str) -> serde_json::Value {
+    serde_json::to_value(omnuv_protocol::Heartbeat { config_hash: Some(config_hash.to_string()) })
+        .expect("a heartbeat serialises")
 }
 
 /// **What this agent can say about its own footing, on every report
@@ -485,8 +499,8 @@ fn check_line(c: &omnuv_protocol::SelfCheck) -> String {
 /// server at all. The heartbeat is the smallest call Core authenticates: a
 /// 2xx is Core accepting this token, a 401 or 403 is Core refusing it, and
 /// anything else is not an answer from Core about this agent.
-async fn core_check(core: &Core, url: &str) -> String {
-    match core.post("/provider/v1/heartbeat", None).await {
+async fn core_check(core: &Core, url: &str, config_hash: &str) -> String {
+    match core.post("/provider/v1/heartbeat", Some(heartbeat_body(config_hash))).await {
         Ok(r) if r.status().is_success() => format!("selfcheck: core reachable over tls at {url}, and accepts this agent"),
         Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
             format!("SELFCHECK FAILED: core at {url} refused this agent's token ({})", r.status())
@@ -518,8 +532,12 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         cfg.proxmox.showall,
     )?
     .with_images(cfg.proxmox.image_map())
-    .with_environment(cfg.environment.clone()));
+    .with_environment(cfg.environment.clone())
+    .with_timings(cfg.timings.clone()));
     let core = Core::new(&cfg.core.url, &cfg.core.token)?;
+    // What every heartbeat says this agent runs, computed once: the file does
+    // not change under a running agent, because a change is a restart (D34).
+    let config_hash = cfg.timings.hash();
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
     // without Core ever learning this provider's addressing.
@@ -558,13 +576,14 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         let consoles: Arc<dyn crate::console::ConsoleOpener> = Arc::new(crate::console::DriverConsoles {
             driver: driver.clone(),
         });
+        let keepalive = crate::tunnel::Keepalive::from(&cfg.timings);
         tokio::spawn(async move {
             let resolve: crate::tunnel::ResolveWorker = Arc::new(move |worker_id: &str| {
                 // Blocking lock inside a sync closure: the map is tiny and
                 // contended only by the reconcile loop.
                 crate::poison::lock(&map, "worker endpoints").get(worker_id).cloned()
             });
-            crate::tunnel::run(&url, &token, resolve, nudge_tx, consoles).await;
+            crate::tunnel::run(&url, &token, resolve, nudge_tx, consoles, keepalive).await;
         });
     }
     // The desired state the agent already holds. Keeping it lets the agent ask
@@ -634,11 +653,19 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         core.clone(),
         driver.clone(),
         std::time::Duration::from_secs(heartbeat_secs),
+        config_hash,
     );
-    let mut inventory = tokio::time::interval(std::time::Duration::from_secs(cfg.inventory_every_secs));
+    let mut inventory = tokio::time::interval(cfg.timings.inventory_every.std());
     // Reconciliation is push-driven; this interval is only the fallback for a
     // provider with no live tunnel.
-    let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(120));
+    //
+    // **Its period is Core's** (D33): Core builds how fresh a report must be,
+    // and how long a check nobody repeats stays a fact, on this number, so it
+    // is sent with every view (`poll_interval_secs`) and this agent keeps what
+    // the last answer said. Until one says anything, and from a Core that
+    // predates the field, the 120 s this always was.
+    let mut core_poll: Option<u64> = None;
+    let mut reconcile = tokio::time::interval(crate::timings::poll(core_poll));
     // Push for latency, pull for truth (CLAUDE.md, *The Three Tiers*): Core
     // pushes a nudge when something changes, this interval is what makes a
     // lost nudge cost latency rather than correctness.
@@ -649,7 +676,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 anyhow::bail!("heartbeat task ended unexpectedly: {ended:?}");
             }
             _ = nudge.notified() => {
-                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick, &mut core_poll).await {
                     match refusal(&e) {
                         Refusal::Final => stop_for_good(&e),
                         Refusal::Renegotiate => {
@@ -666,7 +693,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 }
             }
             _ = reconcile.tick() => {
-                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick).await {
+                if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick, &mut core_poll).await {
                     match refusal(&e) {
                         Refusal::Final => stop_for_good(&e),
                         Refusal::Renegotiate => {
@@ -691,7 +718,20 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 }
             }
         }
+        // Re-armed, not restarted, when Core's poll moved: the first look at
+        // the new period is one period away, so a change costs no extra pass.
+        if let Some(period) = repoll(reconcile.period(), core_poll) {
+            println!("poll: every {}s, as Core asks (was {}s)", period.as_secs(), reconcile.period().as_secs());
+            reconcile = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        }
     }
+}
+
+/// The reconcile interval to keep, given what Core's last answer said; `None`
+/// when the one running is already it.
+fn repoll(current: std::time::Duration, said: Option<u64>) -> Option<std::time::Duration> {
+    let wanted = crate::timings::poll(said);
+    (wanted != current).then_some(wanted)
 }
 
 /// The heartbeat period Core asked for, in seconds.
@@ -712,13 +752,15 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     core: Core,
     driver: Arc<D>,
     period: std::time::Duration,
+    config_hash: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let body = heartbeat_body(&config_hash);
         loop {
             tick.tick().await;
-            match core.post("/provider/v1/heartbeat", None).await {
+            match core.post("/provider/v1/heartbeat", Some(body.clone())).await {
                 // **426 is renegotiated, not obeyed (PROVIDER-23).** Core's
                 // floor rose past the version agreed last time; a new
                 // handshake finds the highest version both still speak, and
@@ -910,9 +952,41 @@ mod handshake_tests {
     /// passes; a 401 says the token was refused; a 404 — a server that does
     /// not know the route, which is what every answer to the old ping was —
     /// fails. And the request is the authenticated heartbeat.
+    /// One HTTP request off a socket, head and body. **The body too**, since
+    /// the heartbeat carries one: a server that answers and closes with bytes
+    /// still unread makes the kernel reset the connection, and the client
+    /// then reads the reset instead of the answer.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        loop {
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(n > 0 && request.len() + n < 65_536, "the client closed or sent too much");
+            request.extend_from_slice(&bytes[..n]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    return request;
+                }
+            }
+        }
+    }
+
+    /// The body of a request `read_request` returned.
+    fn body_of(request: &[u8]) -> String {
+        let text = String::from_utf8_lossy(request);
+        text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+    }
+
     #[tokio::test]
     async fn the_self_check_passes_only_when_core_accepts_the_token() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let _ = rustls::crypto::ring::default_provider().install_default();
         for (status, verdict) in [
             ("204 No Content", "accepts this agent"),
@@ -923,19 +997,13 @@ mod handshake_tests {
             let base = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let mut bytes = [0; 1024];
-                    let n = socket.read(&mut bytes).await.unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&bytes[..n]);
-                }
+                let request = read_request(&mut socket).await;
                 let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
             let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into() };
-            let said = core_check(&core, &base).await;
+            let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
             assert!(request.to_lowercase().contains("authorization: bearer fixture"), "the check sent no token");
@@ -950,7 +1018,7 @@ mod handshake_tests {
     /// Even a rejected request does not end the task or wait for reconciliation.
     #[tokio::test]
     async fn heartbeat_progresses_during_a_pending_runtime_operation() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -963,13 +1031,7 @@ mod handshake_tests {
         let server = tokio::spawn(async move {
             for i in 0..3 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let mut bytes = [0; 1024];
-                    let n = socket.read(&mut bytes).await.unwrap();
-                    assert!(n > 0 && request.len() + n < 8192);
-                    request.extend_from_slice(&bytes[..n]);
-                }
+                let request = read_request(&mut socket).await;
                 assert!(request.starts_with(b"POST /provider/v1/heartbeat HTTP/1.1\r\n"));
                 let status = if i == 0 { "500 Internal Server Error" } else { "204 No Content" };
                 let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -982,6 +1044,7 @@ mod handshake_tests {
             core,
             Arc::new(HeartbeatDriver),
             std::time::Duration::from_millis(20),
+            "0123456789ab".into(),
         );
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
         let mut runtime_operation = tokio::spawn(async move { finish_rx.await.unwrap() });
@@ -1002,6 +1065,110 @@ mod handshake_tests {
         finish_tx.send(()).unwrap();
         runtime_operation.await.unwrap();
         assert!(result.is_ok(), "heartbeats stopped behind runtime work");
+    }
+
+    /// A Core that answers the view with `view` and everything else with 204,
+    /// on as many connections as it is asked on, handing each request's
+    /// first line and body to the test.
+    async fn core_stub(view: serde_json::Value) -> (String, tokio::sync::mpsc::UnboundedReceiver<(String, String)>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let (view, tx) = (view.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let request = read_request(&mut socket).await;
+                    let line = String::from_utf8_lossy(&request).lines().next().unwrap_or_default().to_string();
+                    let (status, body) = if line.starts_with("GET /provider/v1/desired-state") {
+                        ("200 OK", view.to_string())
+                    } else {
+                        ("204 No Content", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = tx.send((line, body_of(&request)));
+                });
+            }
+        });
+        (base, rx)
+    }
+
+    /// **Every heartbeat says which tunables this agent runs**, the self-check's
+    /// included: the hash `check-config` printed, as `Heartbeat::config_hash`.
+    /// Before 26 September 2026 the heartbeat had no body at all.
+    #[tokio::test]
+    async fn every_heartbeat_says_which_tunables_it_runs() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (base, mut heard) = core_stub(serde_json::Value::Null).await;
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into() };
+        let said = |(line, body): (String, String)| -> Option<String> {
+            assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
+            serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
+        };
+
+        assert!(core_check(&core, &base, "0123456789ab").await.contains("accepts this agent"));
+        assert_eq!(said(heard.recv().await.unwrap()), Some("0123456789ab".into()), "the self-check");
+
+        let beating = spawn_heartbeat(core, Arc::new(HeartbeatDriver), std::time::Duration::from_millis(20), "0123456789ab".into());
+        for n in 0..2 {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(3), heard.recv()).await.expect("a heartbeat").unwrap();
+            assert_eq!(said(got), Some("0123456789ab".into()), "heartbeat {n}");
+        }
+        beating.abort();
+    }
+
+    /// **The poll Core sends is the one kept** (D33), from a real pass: Core's
+    /// view says 45 s, and the loop is re-armed to it. Before 26 September
+    /// 2026 the agent polled every 120 s whatever Core wanted.
+    #[tokio::test]
+    async fn the_poll_core_sends_is_the_one_kept() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let view = serde_json::json!({
+            "protocol_version": omnuv_protocol::PROTOCOL_VERSION,
+            "version": 1,
+            "poll_interval_secs": 45,
+        });
+        let (base, _heard) = core_stub(view).await;
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into() };
+        let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let snippets = tempfile::tempdir().unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippets.path().display()
+        ))
+        .expect("config");
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        // Whether the rest of the pass succeeds against a mock that knows one
+        // route is not the question: the poll is kept from the answer first.
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        assert_eq!(core_poll, Some(45), "the view's poll was not kept");
+        assert_eq!(repoll(std::time::Duration::from_secs(120), core_poll), Some(std::time::Duration::from_secs(45)));
+    }
+
+    /// The loop is re-armed when Core's poll moved, and only then.
+    #[test]
+    fn the_loop_is_re_armed_only_when_core_s_poll_moved() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(repoll(secs(120), None), None, "nothing said, the default kept");
+        assert_eq!(repoll(secs(120), Some(60)), Some(secs(60)));
+        assert_eq!(repoll(secs(60), Some(60)), None, "the thousandth identical answer changes nothing");
+        assert_eq!(repoll(secs(60), Some(0)), Some(secs(120)), "zero is not said");
+        assert_eq!(repoll(secs(60), Some(1)), Some(secs(10)), "held to Core's own floor");
     }
 
     /// The agent offers every version it can speak, not only the newest.
@@ -1175,7 +1342,7 @@ async fn mirror_images(
             crate::audit::record("image.mirror", "core", &artefact.id, "staged", None);
         } else {
             crate::audit::record("image.mirror", "core", &artefact.id, "fetching", None);
-            if let Err(e) = core.download_artefact(artefact, &dest).await {
+            if let Err(e) = core.download_artefact(artefact, &dest, cfg.timings.image_transfer_idle.std()).await {
                 crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
                 eprintln!("image {}: {e}", artefact.id);
                 continue;
@@ -1229,6 +1396,9 @@ async fn mirror_images(
 /// Converges the provider toward Core's desired state, then reports what is
 /// actually true. This runs on every tick rather than on an event, so a missed
 /// message or an agent restart cannot leave the two sides diverged.
+// Eight, each a different piece of the loop's own state that `run` holds: a
+// struct of them would be built once, at the one call site, and read here.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_workers(
     core: &Core,
     driver: &proxmox::Client,
@@ -1240,6 +1410,9 @@ async fn reconcile_workers(
     // task, for the reason written where that task is spawned.
     mirror_wanted: &Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>>,
     mirror_kick: &Arc<tokio::sync::Notify>,
+    // Core's poll, as its last answer said it: written here, read by `run`,
+    // which re-arms its interval when it moved.
+    core_poll: &mut Option<u64>,
 ) -> anyhow::Result<()> {
     // **A node, never an empty name (PROVIDER-7).** Unset used to become `""`,
     // and every node-scoped call below built `/nodes//…` and failed. Unset means
@@ -1309,6 +1482,10 @@ async fn reconcile_workers(
             omnuv_protocol::PROTOCOL_VERSION
         );
     }
+    // **From the answer, before anything below can fail**, and from this
+    // answer even when it is `unchanged`: the poll describes the answer, not
+    // the collections, so the copy in hand is not where it comes from.
+    *core_poll = fetched.poll_interval_secs;
 
     // `unchanged` saves the transfer, never the work: reconciliation runs every
     // tick against the copy in hand, because drift on the hypervisor is exactly

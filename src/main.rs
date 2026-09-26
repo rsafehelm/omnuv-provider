@@ -21,6 +21,9 @@ mod reboots;
 mod survey;
 mod workload;
 mod poison;
+mod dur;
+mod timings;
+mod workload_config;
 #[cfg(test)]
 mod pvemock;
 
@@ -30,8 +33,17 @@ onv-provider - Omnuv Provider Agent
 USAGE:
     onv-provider join  --core <url> --token <token> [options]
     onv-provider leave [--dry-run] [--without-core] [--config PATH]
-    onv-provider agent [--config /etc/onv/agent.yaml]
+    onv-provider agent [--config /etc/onv/agent.yaml] [--secrets PATH]
+    onv-provider check-config [--config /etc/onv/agent.yaml] [--secrets PATH]
+    onv-provider print-config
     onv-provider discover --provider <id> [--config <path>]
+
+CONFIGURATION:
+    --secrets defaults to agent-secrets.yaml beside --config: this provider's
+    two credentials, mode 0600. `check-config` loads both files as `agent`
+    would, prints the hash of the timings in force on stdout and the whole
+    configuration, credentials redacted, on stderr; it exits 2 on a file that
+    does not pass, naming the key. `print-config` prints the default timings.
 
 JOIN OPTIONS:
     --region <name>       marketplace region                 (default eu-west)
@@ -60,6 +72,20 @@ Prints a normalized InventoryReport as JSON on stdout. Pipe it into core:
 
 Credentials come from the environment, named by the provider's tokenEnv entry.
 ";
+
+/// The configuration in force, as the journal shows it at start: the hash every
+/// heartbeat carries, then every value with the credentials redacted, and a
+/// warning while the credentials are still where `join` used to put them.
+fn describe(cfg: &config::AgentConfig) -> String {
+    let mut said = format!("configuration {}: {}", cfg.timings.hash(), cfg.effective());
+    if cfg.credentials == config::CredentialSource::AgentYaml {
+        said.push_str(
+            "\nwarning: this provider's credentials are in agent.yaml; they belong in agent-secrets.yaml \
+             beside it, mode 0600, which deploy-agent.yml and join now write",
+        );
+    }
+    said
+}
 
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
@@ -115,13 +141,44 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    // The defaults of every timing, from this binary: `deploy-agent.yml` writes
+    // them out with the inventory's overrides, so the defaults live in one
+    // place and the file on the host still carries every key.
+    if command == "print-config" {
+        #[derive(serde::Serialize)]
+        struct Defaults {
+            timings: timings::Timings,
+        }
+        print!("{}", serde_yaml_ng::to_string(&Defaults { timings: timings::Timings::default() })?);
+        return Ok(());
+    }
+
+    let path = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
+    let secrets = arg("--secrets").unwrap_or_else(|| config::secrets_beside(&path));
+
+    // What `deploy-agent.yml` runs on the files it is about to install, before
+    // anything restarts. stdout is the result and nothing else — the hash the
+    // running agent will report — and stderr is everything a person reads.
+    if command == "check-config" {
+        match config::load_agent_with(&path, &secrets) {
+            Ok(cfg) => {
+                eprintln!("{}", describe(&cfg));
+                println!("{}", cfg.timings.hash());
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("check-config: {e:#}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if command == "agent" {
-        let path = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
         // Audit before anything else, so even a failed start is on the record.
         // It came after the config load until 24 September 2026, so the one
         // failure this line promises to record, a bad configuration, never was.
         audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
-        let cfg = match config::load_agent(&path) {
+        let cfg = match config::load_agent_with(&path, &secrets) {
             Ok(cfg) => cfg,
             Err(e) => {
                 // The reason goes to the journal with the returned error, not
@@ -131,7 +188,9 @@ async fn main() -> anyhow::Result<()> {
                 return Err(e);
             }
         };
+        audit::set_backlog(cfg.timings.audit_backlog as usize);
         eprintln!("onv-provider agent starting (config {path})");
+        eprintln!("{}", describe(&cfg));
         eprintln!("audit log policy: {}", audit::REDACTION_POLICY);
         return agent::run(cfg).await;
     }

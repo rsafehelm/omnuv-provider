@@ -42,12 +42,38 @@ async fn track(
     map.insert(key, handle);
 }
 
+/// The tunnel's two clocks: `timings.tunnelPing` and `timings.tunnelSilence`
+/// in the agent's file. `timings.rs` holds them to Core's own: a ping at most
+/// every 20 s, because Core leaves a tunnel it has heard nothing on for its
+/// `tunnel.silence`, at least a minute, and needs three pings in it; and a
+/// silence of at least three pings, because Core answers each one.
+#[derive(Clone, Copy, Debug)]
+pub struct Keepalive {
+    /// How often this agent pings Core.
+    pub ping: std::time::Duration,
+    /// How long Core may say nothing before the tunnel is taken as gone.
+    pub silence: std::time::Duration,
+}
+
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self::from(&crate::timings::Timings::default())
+    }
+}
+
+impl From<&crate::timings::Timings> for Keepalive {
+    fn from(t: &crate::timings::Timings) -> Self {
+        Self { ping: t.tunnel_ping.std(), silence: t.tunnel_silence.std() }
+    }
+}
+
 pub async fn run(
     core_url: &str,
     token: &omnuv_protocol::Redacted,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
+    keepalive: Keepalive,
 ) {
     let ws_url = core_url
         .replacen("https://", "wss://", 1)
@@ -56,7 +82,7 @@ pub async fn run(
 
     let mut backoff = 2u64;
     loop {
-        match connect(&ws_url, token, resolve.clone(), nudge.clone(), consoles.clone()).await {
+        match connect(&ws_url, token, resolve.clone(), nudge.clone(), consoles.clone(), keepalive).await {
             Ok(()) => {
                 audit::record("tunnel.closed", "agent", "core", "ok", None);
                 backoff = 2;
@@ -163,8 +189,9 @@ async fn connect(
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
+    keepalive: Keepalive,
 ) -> anyhow::Result<()> {
-    connect_with(ws_url, token, resolve, nudge, consoles, Tables::default()).await
+    connect_with(ws_url, token, resolve, nudge, consoles, Tables::default(), keepalive).await
 }
 
 async fn connect_with(
@@ -174,6 +201,7 @@ async fn connect_with(
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
     tables: Tables,
+    keepalive: Keepalive,
 ) -> anyhow::Result<()> {
     let mut request = ws_url.into_client_request()?;
     request
@@ -193,23 +221,23 @@ async fn connect_with(
     let (socket, _) = tokio_tungstenite::client_async_tls(request, stream).await?;
     audit::record("tunnel.open", "agent", "core", "ok", None);
     println!("tunnel connected to core");
-    serve_socket(socket, resolve, nudge, consoles, tables).await
+    serve_socket(socket, resolve, nudge, consoles, tables, keepalive).await
 }
-
-/// How long Core may say nothing before its tunnel is taken as gone. Core
-/// answers each of this agent's 20-second pings, so a minute with no frame is
-/// three answers missed.
-const SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Serves one connection to Core until it closes, fails or goes silent.
 /// Generic over the transport, so a simulated network can carry it
 /// (`mod partition`).
+///
+/// Core may say nothing for `keepalive.silence` before its tunnel is taken as
+/// gone. Core answers each of this agent's pings, so the default minute with
+/// no frame is three answers missed to the default 20-second pings.
 async fn serve_socket<S>(
     socket: tokio_tungstenite::WebSocketStream<S>,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
     tables: Tables,
+    keepalive: Keepalive,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -223,7 +251,7 @@ where
     {
         let ping = out_tx.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+            let mut tick = tokio::time::interval(keepalive.ping);
             loop {
                 tick.tick().await;
                 if ping.send(TunnelFrame::Ping).await.is_err() {
@@ -247,12 +275,12 @@ where
     // up, about fifteen minutes, while Core could reach nothing on this host.
     // An error sends `run` back to reconnect.
     loop {
-        let msg = match tokio::time::timeout(SILENCE, stream.next()).await {
+        let msg = match tokio::time::timeout(keepalive.silence, stream.next()).await {
             Ok(Some(msg)) => msg?,
             Ok(None) => break,
             Err(_) => {
                 writer.abort();
-                anyhow::bail!("Core said nothing for {} s; reconnecting", SILENCE.as_secs());
+                anyhow::bail!("Core said nothing for {} s; reconnecting", keepalive.silence.as_secs());
             }
         };
         let text = match msg {
@@ -696,7 +724,7 @@ mod stalled_console {
         let held = tables.clone();
         let agent = tokio::spawn(async move {
             let token: omnuv_protocol::Redacted = "t".to_string().into();
-            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables).await
+            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables, Keepalive::default()).await
         });
         let (pong, ended) = core.await.unwrap();
         assert!(pong, "a stalled console stopped the tunnel: Core's Ping was not answered in 3 s");
@@ -769,7 +797,7 @@ mod stalled_console {
         let consoles: Arc<dyn ConsoleOpener> = opener;
         let agent = tokio::spawn(async move {
             let token: omnuv_protocol::Redacted = "t".to_string().into();
-            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables).await
+            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables, Keepalive::default()).await
         });
         let seen = core.await.unwrap();
         agent.abort();
@@ -799,7 +827,10 @@ mod partition {
 
     /// The agent's side: connects, serves until the connection ends, and
     /// reports how long that took and whether it ended in an error.
-    fn run(core: impl Fn() -> BoxFuture<'static, turmoil::Result> + 'static) -> (Duration, Result<(), String>) {
+    fn run(
+        core: impl Fn() -> BoxFuture<'static, turmoil::Result> + 'static,
+        keepalive: Keepalive,
+    ) -> (Duration, Result<(), String>) {
         let mut sim = turmoil::Builder::new().simulation_duration(Duration::from_secs(1200)).build();
         sim.host("core", core);
         let (told, heard) = std::sync::mpsc::channel();
@@ -809,7 +840,14 @@ mod partition {
             let started = tokio::time::Instant::now();
             let ended = tokio::time::timeout(
                 Duration::from_secs(900),
-                serve_socket(ws, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), Arc::new(NoConsoles), Tables::default()),
+                serve_socket(
+                    ws,
+                    Arc::new(|_: &str| None),
+                    Arc::new(tokio::sync::Notify::new()),
+                    Arc::new(NoConsoles),
+                    Tables::default(),
+                    keepalive,
+                ),
             )
             .await;
             let _ = told.send((started.elapsed(), match ended {
@@ -852,16 +890,31 @@ mod partition {
     /// simulation ran.
     #[test]
     fn a_silent_core_is_left_within_a_minute_and_a_half() {
-        let (after, ended) = run(core(Duration::from_secs(30), false));
+        let (after, ended) = run(core(Duration::from_secs(30), false), Keepalive::default());
         assert!(ended.is_err(), "the agent did not leave a silent Core: {ended:?} after {after:?}");
         assert!(after <= Duration::from_secs(120), "it took {after:?}");
+    }
+
+    /// **The silence and the ping are the agent's file's to set**
+    /// (`timings.tunnelSilence`, `timings.tunnelPing`; constants until 26
+    /// September 2026). Pinging every 10 s and leaving after 30 s of silence,
+    /// a Core cut off after 30 s of answers is left at about 50 s; the default
+    /// minute, measured beside it, leaves at about 80.
+    #[test]
+    fn a_configured_silence_is_the_one_kept() {
+        let quick = Keepalive { ping: Duration::from_secs(10), silence: Duration::from_secs(30) };
+        let (after, ended) = run(core(Duration::from_secs(30), false), quick);
+        assert!(ended.is_err(), "the agent did not leave a silent Core: {ended:?} after {after:?}");
+        assert!(after <= Duration::from_secs(65), "a 30 s silence took {after:?}");
+        let (after, _) = run(core(Duration::from_secs(30), false), Keepalive::default());
+        assert!(after > Duration::from_secs(65), "the default silence is not a minute: {after:?}");
     }
 
     /// The control: a Core that answers every ping for five minutes is kept,
     /// and a close ends the connection cleanly.
     #[test]
     fn a_core_that_answers_is_kept() {
-        let (after, ended) = run(core(Duration::from_secs(300), true));
+        let (after, ended) = run(core(Duration::from_secs(300), true), Keepalive::default());
         assert!(ended.is_ok(), "a healthy connection ended in an error: {ended:?}");
         // The two clocks start a handshake apart; the point is "well past a minute".
         assert!(after >= Duration::from_secs(290), "it ended early: {after:?}");
