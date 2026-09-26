@@ -22,6 +22,7 @@ mod reboots;
 mod survey;
 mod workload;
 mod poison;
+mod session;
 mod dur;
 mod timings;
 mod workload_config;

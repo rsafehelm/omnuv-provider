@@ -70,6 +70,7 @@ impl From<&crate::timings::Timings> for Keepalive {
 pub async fn run(
     core_url: &str,
     token: &omnuv_protocol::Redacted,
+    session: crate::session::Session,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -82,7 +83,7 @@ pub async fn run(
 
     let mut backoff = 2u64;
     loop {
-        match connect(&ws_url, token, resolve.clone(), nudge.clone(), consoles.clone(), keepalive).await {
+        match connect(&ws_url, token, &session, resolve.clone(), nudge.clone(), consoles.clone(), keepalive).await {
             Ok(()) => {
                 audit::record("tunnel.closed", "agent", "core", "ok", None);
                 backoff = 2;
@@ -186,17 +187,20 @@ impl Tables {
 async fn connect(
     ws_url: &str,
     token: &omnuv_protocol::Redacted,
+    session: &crate::session::Session,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
     keepalive: Keepalive,
 ) -> anyhow::Result<()> {
-    connect_with(ws_url, token, resolve, nudge, consoles, Tables::default(), keepalive).await
+    connect_with(ws_url, token, session, resolve, nudge, consoles, Tables::default(), keepalive).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_with(
     ws_url: &str,
     token: &omnuv_protocol::Redacted,
+    session: &crate::session::Session,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -211,6 +215,11 @@ async fn connect_with(
         // perfectly well formed and that Core refuses — an agent reconnecting
         // into a 401 forever, with the reason redacted out of its own log.
         .insert("authorization", format!("Bearer {}", token.expose()).parse()?);
+    // The session, when Core minted one (lifecycle phase 7, RC12): the tunnel
+    // is a call like any other, and Core takes it only from the holder.
+    if let Some(s) = crate::session::current(session) {
+        request.headers_mut().insert(crate::session::HEADER, s.parse()?);
+    }
 
     let parts = url_lite::parse(ws_url)?;
     let proxy = proxy_for(ws_url);
@@ -724,7 +733,7 @@ mod stalled_console {
         let held = tables.clone();
         let agent = tokio::spawn(async move {
             let token: omnuv_protocol::Redacted = "t".to_string().into();
-            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables, Keepalive::default()).await
+            connect_with(&url, &token, &Default::default(), Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables, Keepalive::default()).await
         });
         let (pong, ended) = core.await.unwrap();
         assert!(pong, "a stalled console stopped the tunnel: Core's Ping was not answered in 3 s");
@@ -797,7 +806,7 @@ mod stalled_console {
         let consoles: Arc<dyn ConsoleOpener> = opener;
         let agent = tokio::spawn(async move {
             let token: omnuv_protocol::Redacted = "t".to_string().into();
-            connect_with(&url, &token, Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables, Keepalive::default()).await
+            connect_with(&url, &token, &Default::default(), Arc::new(|_: &str| None), Arc::new(tokio::sync::Notify::new()), consoles, tables, Keepalive::default()).await
         });
         let seen = core.await.unwrap();
         agent.abort();

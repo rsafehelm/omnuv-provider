@@ -60,6 +60,9 @@ struct Core {
     http: reqwest::Client,
     base: String,
     token: omnuv_protocol::Redacted,
+    /// The session Core minted at the last handshake, sent on every call
+    /// (lifecycle phase 7, RC12). Shared by every clone and by the tunnel.
+    session: crate::session::Session,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -140,6 +143,14 @@ pub fn refusal(e: &anyhow::Error) -> Refusal {
         None => Refusal::Unreachable,
         Some(a) => match a.status {
             401 | 426 if a.path == HANDSHAKE => Refusal::Final,
+            // **Superseded is final** (lifecycle phase 7, RC12): another
+            // agent's handshake took this provider over after this one fell
+            // silent past the takeover lease, and Core refuses this session
+            // on every call. At the handshake, 409 is the other half — this
+            // provider is held by an agent Core still hears — and is waited
+            // out by the handshake's own loop, never final: the holder may be
+            // this agent's previous process, whose session lapses in a lease.
+            409 if a.path != HANDSHAKE => Refusal::Final,
             426 => Refusal::Renegotiate,
             401 | 403 => Refusal::Refused,
             429 | 500..=599 => Refusal::Unreachable,
@@ -186,14 +197,22 @@ impl Core {
             .https_only(!base.starts_with("http://"))
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http, base, token: token.clone() })
+        Ok(Self { http, base, token: token.clone(), session: Default::default() })
+    }
+
+    /// The credential and, when Core minted one, the session: what every call
+    /// to Core carries. A Core that minted none is sent no header, as before.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.bearer_auth(self.token.expose());
+        match crate::session::current(&self.session) {
+            Some(s) => req.header(crate::session::HEADER, s),
+            None => req,
+        }
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let res = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .bearer_auth(self.token.expose())
+            .authed(self.http.get(format!("{}{path}", self.base)))
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await?;
@@ -257,9 +276,7 @@ impl Core {
         }
 
         let mut req = self
-            .http
-            .get(&a.url)
-            .bearer_auth(self.token.expose())
+            .authed(self.http.get(&a.url))
             // Deliberately long, and not the 30 seconds every other call uses:
             // a 6 GB transfer over a provider's uplink is not a hung request,
             // and killing it at 30 seconds would mean no image ever arrives.
@@ -396,9 +413,7 @@ impl Core {
 
     async fn post(&self, path: &str, body: Option<serde_json::Value>) -> anyhow::Result<reqwest::Response> {
         let mut req = self
-            .http
-            .post(format!("{}{path}", self.base))
-            .bearer_auth(self.token.expose())
+            .authed(self.http.post(format!("{}{path}", self.base)))
             .timeout(std::time::Duration::from_secs(30));
         if let Some(b) = body {
             req = req.json(&b);
@@ -568,6 +583,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     {
         let url = cfg.core.url.clone();
         let token = cfg.core.token.clone();
+        let session = core.session.clone();
         let map = endpoints.clone();
         let nudge_tx = nudge.clone();
         // Consoles are opened by the driver on the node it manages; the
@@ -582,7 +598,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 // contended only by the reconcile loop.
                 crate::poison::lock(&map, "worker endpoints").get(worker_id).cloned()
             });
-            crate::tunnel::run(&url, &token, resolve, nudge_tx, consoles, keepalive).await;
+            crate::tunnel::run(&url, &token, session, resolve, nudge_tx, consoles, keepalive).await;
         });
     }
     // The desired state the agent already holds. Keeping it lets the agent ask
@@ -797,6 +813,14 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
                         eprintln!("heartbeat handshake failed: {e}");
                     }
                 }
+                // Superseded (RC12): another agent holds this provider now.
+                // Final, as on any other call.
+                Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+                    stop_for_good(&anyhow::Error::from(CoreAnswered {
+                        path: "/provider/v1/heartbeat".into(),
+                        status: 409,
+                    }).context("another agent's handshake superseded this agent's session"));
+                }
                 Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
                 Err(e) => eprintln!("heartbeat failed: {e}"),
                 _ => {}
@@ -893,6 +917,10 @@ mod handshake_tests {
             (426, HANDSHAKE, Refusal::Final),
             (404, "/provider/v1/desired-state", Refusal::Other),
             (401, HANDSHAKE, Refusal::Final),
+            // Lifecycle phase 7 (RC12): superseded is final; a provider held
+            // by another agent at the handshake is waited out, never final.
+            (409, "/provider/v1/desired-state", Refusal::Final),
+            (409, HANDSHAKE, Refusal::Other),
         ] {
             let mock = crate::pvemock::Mock::start(move |_, _, _| (status, serde_json::Value::Null)).await;
             // The mock serves under /api2/json; Core's paths are asked of its root.
@@ -999,6 +1027,105 @@ mod handshake_tests {
         }
     }
 
+    /// A Core that answers each call from `answer(line, handshakes so far)`
+    /// and hands every request's head and body to the test.
+    async fn session_stub(
+        answer: impl Fn(&str, usize) -> (&'static str, String) + Send + Sync + 'static,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<(String, String)>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = Arc::new(answer);
+        let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let (answer, tx, handshakes) = (answer.clone(), tx.clone(), handshakes.clone());
+                tokio::spawn(async move {
+                    let request = read_request(&mut socket).await;
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    let head = text.split("\r\n\r\n").next().unwrap_or_default().to_lowercase();
+                    let line = text.lines().next().unwrap_or_default().to_string();
+                    let n = if line.starts_with("POST /provider/v1/handshake") {
+                        handshakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    } else {
+                        handshakes.load(std::sync::atomic::Ordering::SeqCst)
+                    };
+                    let (status, body) = answer(&line, n);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = tx.send((head, body_of(&request)));
+                });
+            }
+        });
+        (base, rx)
+    }
+
+    /// **A held provider is waited for, and the session rides every call**
+    /// (lifecycle phase 7, RC12). The first handshake meets a provider held
+    /// by another agent (409) and is tried again rather than given up; the
+    /// second is answered with a session, and every later call — a view, a
+    /// heartbeat — carries it. The handshake advertised what this agent can do.
+    #[tokio::test]
+    async fn a_held_provider_is_waited_for_and_the_session_rides_every_call() {
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (base, mut rx) = session_stub(|line, handshakes| {
+            if line.starts_with("POST /provider/v1/handshake") {
+                if handshakes == 0 {
+                    return ("409 Conflict", "\"another agent holds this provider\"".into());
+                }
+                return ("200 OK", r#"{"provider_id":"p","protocol_version":6,"heartbeat_interval_secs":30,"session":"s-1"}"#.into());
+            }
+            ("200 OK", "{}".into())
+        })
+        .await;
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        handshake(&core, &HeartbeatDriver).await.expect("the second handshake is accepted");
+        let (first, body) = rx.recv().await.unwrap();
+        assert!(!first.contains("onv-session"), "a session was sent before Core minted one: {first}");
+        let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(said["capabilities"], serde_json::json!(crate::session::CAPABILITIES), "{body}");
+        assert!(crate::session::CAPABILITIES.contains(&"session"));
+        let (second, _) = rx.recv().await.unwrap();
+        assert!(second.starts_with("post /provider/v1/handshake"), "the held provider was not waited for: {second}");
+
+        core.get_json::<serde_json::Value>("/provider/v1/desired-state").await.expect("a view");
+        let (view, _) = rx.recv().await.unwrap();
+        assert!(view.contains("\r\nonv-session: s-1"), "the view was asked without the session: {view}");
+        core.post("/provider/v1/heartbeat", Some(heartbeat_body("abcdefabcdef"))).await.expect("a heartbeat");
+        let (beat, _) = rx.recv().await.unwrap();
+        assert!(beat.contains("\r\nonv-session: s-1"), "the heartbeat went without the session: {beat}");
+    }
+
+    /// **Against an old Core, no session is sent** (mixed versions). A Core
+    /// that predates sessions, or runs them switched off, answers the
+    /// handshake without one: this agent then calls exactly as it did before.
+    #[tokio::test]
+    async fn against_a_core_that_mints_no_session_none_is_sent() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (base, mut rx) = session_stub(|line, _| {
+            if line.starts_with("POST /provider/v1/handshake") {
+                return ("200 OK", r#"{"provider_id":"p","protocol_version":6,"heartbeat_interval_secs":30}"#.into());
+            }
+            ("200 OK", "{}".into())
+        })
+        .await;
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        handshake(&core, &HeartbeatDriver).await.expect("accepted");
+        let _ = rx.recv().await.unwrap();
+        core.get_json::<serde_json::Value>("/provider/v1/desired-state").await.expect("a view");
+        let (view, _) = rx.recv().await.unwrap();
+        assert!(!view.contains("onv-session"), "a session nobody minted was sent: {view}");
+    }
+
     /// The body of a request `read_request` returned.
     fn body_of(request: &[u8]) -> String {
         let text = String::from_utf8_lossy(request);
@@ -1023,7 +1150,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1047,6 +1174,7 @@ mod handshake_tests {
             http: reqwest::Client::new(),
             base: format!("http://{}", listener.local_addr().unwrap()),
             token: "heartbeat-fixture".into(),
+            session: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1127,7 +1255,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1156,7 +1284,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1245,6 +1373,10 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
             (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION)
                 .collect::<Vec<_>>(),
         "drivers": { "compute": [driver.kind().as_str()] },
+        // What this agent can do that an older one could not (lifecycle phase
+        // 7, S12). Core relies on none of it unless it is listed here, and a
+        // Core from before it reads none of it.
+        "capabilities": crate::session::CAPABILITIES,
     });
 
     // Core may simply not be up yet at boot; keep trying with a bounded backoff.
@@ -1254,11 +1386,15 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
             Ok(r) if r.status().is_success() => {
                 let v: serde_json::Value = r.json().await?;
                 let secs = heartbeat_secs(&v);
+                // The session this agent now holds its provider under, or
+                // none from a Core that mints none: then no header is sent.
+                let session = crate::session::take(&core.session, &v);
                 println!(
-                    "handshake ok: provider {} protocol v{} heartbeat {}s",
+                    "handshake ok: provider {} protocol v{} heartbeat {}s session {}",
                     v.get("provider_id").and_then(|x| x.as_str()).unwrap_or("?"),
                     v.get("protocol_version").and_then(|x| x.as_u64()).unwrap_or(0),
-                    secs
+                    secs,
+                    session.as_deref().unwrap_or("none")
                 );
                 return Ok(secs);
             }
