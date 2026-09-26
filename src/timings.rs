@@ -75,8 +75,11 @@ pub fn poll(said_secs: Option<u64>) -> std::time::Duration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Timings {
-    /// How often the full inventory is re-reported. Heartbeats are far more
-    /// frequent and are what decide online and offline.
+    /// How often the full inventory is re-reported, at most. Heartbeats are
+    /// far more frequent and are what decide online and offline. Never less
+    /// often than twice per Core poll, whatever this says: the inventory
+    /// carries the disclosure Core stops selling a node without
+    /// (`agent::inventory_period`).
     pub inventory_every: Dur,
     /// A download of an image that sends no bytes for this long is dead, and
     /// is dropped so the next pass can resume it.

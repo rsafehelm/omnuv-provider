@@ -654,7 +654,6 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         std::time::Duration::from_secs(heartbeat_secs),
         config_hash,
     );
-    let mut inventory = tokio::time::interval(cfg.timings.inventory_every.std());
     // Reconciliation is push-driven; this interval is only the fallback for a
     // provider with no live tunnel.
     //
@@ -665,6 +664,10 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // predates the field, the 120 s this always was.
     let mut core_poll: Option<u64> = None;
     let mut reconcile = tokio::time::interval(crate::timings::poll(core_poll));
+    // The inventory carries the disclosure, whose freshness is judged on
+    // Core's poll too: see `inventory_period`.
+    let mut inventory =
+        tokio::time::interval(inventory_period(cfg.timings.inventory_every.std(), crate::timings::poll(core_poll)));
     // Push for latency, pull for truth (CLAUDE.md, *The Three Tiers*): Core
     // pushes a nudge when something changes, this interval is what makes a
     // lost nudge cost latency rather than correctness.
@@ -723,7 +726,26 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             println!("poll: every {}s, as Core asks (was {}s)", period.as_secs(), reconcile.period().as_secs());
             reconcile = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         }
+        let every = inventory_period(cfg.timings.inventory_every.std(), crate::timings::poll(core_poll));
+        if every != inventory.period() {
+            println!("inventory: every {}s, twice per Core poll (was {}s)", every.as_secs(), inventory.period().as_secs());
+            inventory = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        }
     }
+}
+
+/// How often the inventory is reported: `timings.inventoryEvery`, and never
+/// less often than twice per Core poll.
+///
+/// **The inventory carries the node's disclosure**, and Core stops selling a
+/// node whose disclosure is two of its polls old (D10; Core's
+/// `inventory::disclosure_fresh_secs`). At the 300 s default against Core's
+/// 120 s poll, every node was unsellable for the last minute of every five.
+/// Twice per poll leaves one missed report still fresh, which is the tolerance
+/// Core's window was built for. Core owns the poll (D33), so this derives from
+/// it rather than keeping a second copy of the window.
+fn inventory_period(configured: std::time::Duration, core_poll: std::time::Duration) -> std::time::Duration {
+    configured.min(core_poll / 2)
 }
 
 /// The reconcile interval to keep, given what Core's last answer said; `None`
@@ -1157,6 +1179,22 @@ mod handshake_tests {
         let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
         assert_eq!(core_poll, Some(45), "the view's poll was not kept");
         assert_eq!(repoll(std::time::Duration::from_secs(120), core_poll), Some(std::time::Duration::from_secs(45)));
+    }
+
+    /// **A disclosure is never two of Core's polls old while the agent is
+    /// reporting** (D10): the inventory goes at least twice per poll, and the
+    /// configured interval still wins when it is the shorter.
+    #[test]
+    fn the_inventory_goes_at_least_twice_per_core_poll() {
+        let secs = std::time::Duration::from_secs;
+        // The shipped defaults: 300 s configured, Core's 120 s poll, whose
+        // window is 240 s. Five minutes between reports outlived it.
+        assert_eq!(inventory_period(secs(300), crate::timings::poll(None)), secs(60));
+        assert!(2 * inventory_period(secs(300), secs(120)) < 2 * secs(120), "one missed report went stale");
+        assert_eq!(inventory_period(secs(30), secs(120)), secs(30), "a shorter configured interval is kept");
+        assert_eq!(inventory_period(secs(300), crate::timings::poll(Some(1800))), secs(300));
+        assert!(inventory_period(secs(1), crate::timings::poll(Some(1))) > std::time::Duration::ZERO,
+                "a zero period panics the interval");
     }
 
     /// The loop is re-armed when Core's poll moved, and only then.
