@@ -28,6 +28,38 @@ Three refusals are as important as the work:
   machine that was meant to be running and has crashed, and creates or destroys
   nothing, because the instructions in hand are stale and may be wrong.
 
+## What it tells Omnuv about your own guests
+
+You contribute a slice of your host (`contribute` in `agent.yaml`) and keep the
+rest for yourself. Omnuv sells the slice, less whatever of it your own guests
+are using. So every inventory report says how far your guests reach into the
+slice, and nothing about them beyond that:
+
+```text
+committed = what your guests use beyond (host total − the slice), at most the slice
+```
+
+- **vCPU and memory** count your running and paused guests, VMs and containers,
+  at their configured size. A stopped guest holds neither, and is counted on
+  the next report after you start it.
+- **Disk** counts every guest's volumes on the storages you contribute, running
+  or not. Space already written is outside the free space the agent reports,
+  so what is counted is only size that can still grow into the slice.
+- **How many guests you have** is sent as a count. Never a name, an id or a
+  configuration.
+
+If your guests stay inside what you kept, the three figures are zero and the
+whole slice is sold. The agent records each figure it sends in your audit log as
+`host.usage.disclosed`, once, and again whenever it changes.
+
+This is not optional. A node that does not report it sells nothing (Omnuv's
+decision D10), because a slice nobody can check is one that may already be
+full. For the same reason, a report that could not read every guest sends no
+figure at all rather than a partial one. The last figure stands for two of
+Omnuv's polls; after that the node stops selling until a complete report
+arrives. The inventory is reported at least twice per poll, so one failed read
+costs nothing.
+
 ## The audit log
 
 `/var/log/omnuv/audit.log`, append-only JSON lines, written before an action is
