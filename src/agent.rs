@@ -161,6 +161,10 @@ pub fn refusal(e: &anyhow::Error) -> Refusal {
 
 const HANDSHAKE: &str = "/provider/v1/handshake";
 
+/// How often a handshake is tried again while another agent holds the
+/// provider: a poll of a condition Core answers at once, so five seconds.
+const HELD_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The one way this daemon ends on purpose: Core has said, finally, that it
 /// will not work with this agent. Code 3, beside `main`'s 2 for configuration.
 pub fn stop_for_good(e: &anyhow::Error) -> ! {
@@ -409,6 +413,14 @@ impl Core {
         tokio::fs::rename(&part, dest).await?;
         let _ = tokio::fs::remove_file(&stamp).await;
         Ok(())
+    }
+
+    async fn delete(&self, path: &str) -> anyhow::Result<reqwest::Response> {
+        Ok(self
+            .authed(self.http.delete(format!("{}{path}", self.base)))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?)
     }
 
     async fn post(&self, path: &str, body: Option<serde_json::Value>) -> anyhow::Result<reqwest::Response> {
@@ -688,8 +700,21 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // pushes a nudge when something changes, this interval is what makes a
     // lost nudge cost latency rather than correctness.
 
+    // **Stopped on purpose, it lets go** (lifecycle phase 7): a deploy's
+    // restart or an operator's stop releases this agent's session, so its
+    // successor is not made to wait out the takeover lease. Between passes
+    // only: a pass in flight finishes first.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
+            _ = terminate.recv() => {
+                release_session(&core).await;
+                return Ok(());
+            }
+            _ = tokio::signal::ctrl_c() => {
+                release_session(&core).await;
+                return Ok(());
+            }
             ended = &mut heartbeat => {
                 anyhow::bail!("heartbeat task ended unexpectedly: {ended:?}");
             }
@@ -1142,6 +1167,31 @@ mod handshake_tests {
         }
     }
 
+    /// **An agent that stops lets go** (lifecycle phase 7): with a session,
+    /// the release is a DELETE carrying it; without one, nothing is sent.
+    #[tokio::test]
+    async fn an_agent_that_stops_releases_its_session_and_only_its_own() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (base, mut rx) = session_stub(|line, _| {
+            if line.starts_with("POST /provider/v1/handshake") {
+                return ("200 OK", r#"{"provider_id":"p","protocol_version":6,"heartbeat_interval_secs":30,"session":"s-9"}"#.into());
+            }
+            ("204 No Content", String::new())
+        })
+        .await;
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        release_session(&core).await;
+        handshake(&core, &HeartbeatDriver).await.expect("accepted");
+        let (first, _) = rx.recv().await.unwrap();
+        assert!(first.starts_with("post /provider/v1/handshake"), "something was sent before the handshake: {first}");
+        release_session(&core).await;
+        let (release, _) = rx.recv().await.unwrap();
+        assert!(release.starts_with("delete /provider/v1/session"), "{release}");
+        assert!(release.contains("\r\nonv-session: s-9"), "the release did not name the session: {release}");
+    }
+
     /// **Against an old Core, no session is sent** (mixed versions). A Core
     /// that predates sessions, or runs them switched off, answers the
     /// handshake without one: this agent then calls exactly as it did before.
@@ -1448,6 +1498,14 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
                         } else {
                             "Core requires a newer protocol than this agent speaks"
                         }));
+                }
+                // **Held by another agent** (lifecycle phase 7): Core is up
+                // and answering, and the wait ends when the holder's lease
+                // does, so it is asked again every few seconds rather than on
+                // a back-off grown for an unreachable Core.
+                if status == reqwest::StatusCode::CONFLICT {
+                    tokio::time::sleep(HELD_RETRY).await;
+                    continue;
                 }
             }
             Err(e) => eprintln!("handshake failed: {e}"),
@@ -2130,6 +2188,21 @@ async fn reconcile_workers(
         anyhow::bail!("core rejected status report: {}", res.status());
     }
     Ok(())
+}
+
+/// **Lets go of the provider on the way out**: the session this agent holds,
+/// released, so the next agent's handshake is let in at once. Best-effort —
+/// an agent that cannot say so is waited out — and nothing when no session
+/// is held (a Core that mints none).
+async fn release_session(core: &Core) {
+    if crate::session::current(&core.session).is_none() {
+        return;
+    }
+    match core.delete("/provider/v1/session").await {
+        Ok(r) if r.status().is_success() => println!("stopping: released this agent's session"),
+        Ok(r) => eprintln!("stopping: the session was not released ({}); the next agent waits out its lease", r.status()),
+        Err(e) => eprintln!("stopping: the session was not released: {e}; the next agent waits out its lease"),
+    }
 }
 
 /// What a delete's report says it is waiting on: nothing once proven; the
