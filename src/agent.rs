@@ -1095,6 +1095,63 @@ mod handshake_tests {
         assert_eq!(find(&bad, "core.tls"), CheckResult::Fail, "a plaintext Core url passed");
     }
 
+    /// **The lease task runs while the handshake waits for Core** (lifecycle
+    /// phase 12): an agent restarted during a partition holds the lock the
+    /// host timer defers to, and its first pass writes back the lease its
+    /// predecessor left, rather than nothing. It was spawned after the
+    /// handshake until 27 September 2026, which waits as long as Core is
+    /// unreachable: a restart handed the leases to nobody.
+    #[tokio::test]
+    async fn the_lease_task_runs_while_the_handshake_waits_for_core() {
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pve = crate::pvemock::Mock::start(|_, path, _| match path {
+            "/version" => (200, serde_json::json!({"version": "9.2.20"})),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        // A port nothing listens on: every call to Core is refused.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("run-lease.json");
+        let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600;
+        std::fs::write(&file, serde_json::json!({"leases": [{"id": "m1", "until_unix": until}]}).to_string()).unwrap();
+        let before = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(before).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: https://127.0.0.1:{port}\n  token: t\nproxmox:\n  apiUrl: {}\n  tokenId: onv@pve!agent\n  \
+             tokenSecret: s\n  tlsFingerprintSha256: \"{}\"\n  snippetDir: {}\n",
+            pve.base,
+            "AB".repeat(32),
+            dir.path().join("snippets").display()
+        ))
+        .expect("config");
+        let agent = tokio::spawn(run(cfg));
+
+        let probe = crate::lease::open_lock(&crate::lease::lock_file(&file)).unwrap();
+        let (mut held, mut rewritten) = (false, false);
+        for _ in 0..500 {
+            if !held {
+                match probe.try_lock() {
+                    Err(std::fs::TryLockError::WouldBlock) => held = true,
+                    Ok(()) => probe.unlock().unwrap(),
+                    Err(std::fs::TryLockError::Error(e)) => panic!("the lock could not be tried: {e}"),
+                }
+            }
+            rewritten = std::fs::metadata(&file).unwrap().modified().unwrap() > before + Duration::from_secs(60);
+            if held && rewritten {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!agent.is_finished(), "the agent ended instead of waiting for Core");
+        agent.abort();
+        assert!(held, "no lease task held the lock while the handshake waited for Core");
+        assert!(rewritten, "no lease task wrote the file while the handshake waited for Core");
+        let leases = crate::lease::read_body(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(leases, [crate::lease::Written { id: "m1".into(), until_unix: until }], "the lease was not resumed");
+    }
+
     /// **PROVIDER-12: the self-check is Core accepting this token.** A 204
     /// passes; a 401 says the token was refused; a 404 — a server that does
     /// not know the route, which is what every answer to the old ping was —
