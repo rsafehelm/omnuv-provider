@@ -42,7 +42,7 @@ pub const HEADER: &str = "onv-session";
 ///                extend it, and lists and acts on nothing while in a restore
 ///                (`restore`, lifecycle phase 8)
 /// ```
-pub const CAPABILITIES: &[&str] = &["session", "proven-delete", crate::restore::CAPABILITY];
+pub const CAPABILITIES: &[&str] = &["session", "proven-delete", crate::restore::CAPABILITY, crate::lease::CAPABILITY];
 
 /// The session in force, if any.
 pub fn current(session: &Session) -> Option<String> {

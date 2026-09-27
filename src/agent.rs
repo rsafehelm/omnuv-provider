@@ -66,6 +66,9 @@ struct Core {
     /// This agent's head and restore mode (lifecycle phase 8, TD11): the
     /// evidence rides every call while Core has not named the restore back.
     restore: crate::restore::Shared,
+    /// The run lease (lifecycle phase 12, A9): what each view answer said
+    /// of it, and the leases held.
+    lease: crate::lease::Shared,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -204,7 +207,14 @@ impl Core {
             .https_only(!base.starts_with("http://"))
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http, base, token: token.clone(), session: Default::default(), restore: Default::default() })
+        Ok(Self {
+            http,
+            base,
+            token: token.clone(),
+            session: Default::default(),
+            restore: Default::default(),
+            lease: Default::default(),
+        })
     }
 
     /// The same client, keeping its head in `path` (lifecycle phase 8).
@@ -233,6 +243,9 @@ impl Core {
     /// `onv-restore` header, while Core holds this provider.
     async fn get_view(&self, known: u64) -> anyhow::Result<(DesiredState, Option<String>)> {
         let path = format!("/provider/v1/desired-state?known={known}");
+        // Before the request leaves: the lease counts from the ask
+        // (lifecycle phase 12, A9), so a slow answer never lengthens it.
+        let asked = crate::lease::Asked::now();
         let res = self
             .authed(self.http.get(format!("{}{path}", self.base)))
             .timeout(std::time::Duration::from_secs(30))
@@ -242,7 +255,10 @@ impl Core {
             return Err(CoreAnswered { path, status: res.status().as_u16() }.into());
         }
         let named = res.headers().get(crate::restore::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
-        Ok((res.json().await?, named))
+        let lease = res.headers().get(crate::lease::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let view = res.json().await?;
+        crate::lease::heard(&self.lease, asked, lease);
+        Ok((view, named))
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
@@ -618,6 +634,10 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 
     let heartbeat_secs = handshake(&core, &driver).await?;
+
+    // **The run lease's own task** (lifecycle phase 12, A9): beside the
+    // reconcile loop, because it must act exactly when Core is unreachable.
+    crate::lease::spawn(core.lease.clone(), driver.clone(), crate::lease::file(&cfg.proxmox.snippet_dir));
 
     // Woken by Core over the tunnel; the poll below is the safety net for when
     // no tunnel is up, so a push is never a correctness dependency.
@@ -1271,7 +1291,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1297,6 +1317,7 @@ mod handshake_tests {
             token: "heartbeat-fixture".into(),
             session: Default::default(),
             restore: Default::default(),
+            lease: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1377,7 +1398,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1406,7 +1427,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1868,6 +1889,11 @@ async fn reconcile_workers(
                 if specs.is_empty() {
                     return Err(e);
                 }
+                // Never a machine whose run lease ran out (lifecycle phase
+                // 12, A6): its copy may be running elsewhere by now.
+                let now = std::time::Instant::now();
+                let specs: Vec<_> =
+                    specs.into_iter().filter(|s| crate::lease::may_restart(&core.lease, &s.id, now)).collect();
                 match driver.maintain(&specs).await {
                     Ok(0) => {}
                     Ok(n) => println!("core unreachable; maintained {n} machine(s), decided nothing"),
@@ -1907,6 +1933,9 @@ async fn reconcile_workers(
         *crate::poison::lock(held, "held desired state") = Some(fetched.clone());
         fetched
     };
+    // The lease this answer told of, against the view it answered, before
+    // anything below can fail (lifecycle phase 12, A9).
+    crate::lease::renew(&core.lease, &desired);
 
     // An idle provider still prepares images and completes cleanup. Empty
     // desired state is a real observation, never a reason to skip the pass.

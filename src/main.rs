@@ -24,6 +24,7 @@ mod workload;
 mod poison;
 mod session;
 mod restore;
+mod lease;
 mod teardown;
 mod dur;
 mod timings;
