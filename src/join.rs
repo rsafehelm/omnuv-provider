@@ -499,17 +499,17 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
         Ok(cfg) => match crate::agent::leave_core(&cfg.core.url, &cfg.core.token, "the provider's operator ran onv-provider leave").await {
             Ok(crate::agent::CoreLeft::Removed(said)) => println!("  Core removed this provider: {said}"),
             Ok(crate::agent::CoreLeft::AlreadyForgotten) => println!("  Core no longer knows this provider's token; nothing to tell it"),
-            Err(e) if without_core => eprintln!("  could not tell Core ({e}); going on because --without-core was given. Core still lists this provider and accepts its token."),
+            Err(e) if without_core => eprintln!("  could not tell Core ({e:#}); going on because --without-core was given. Core still lists this provider and accepts its token."),
             Err(e) => anyhow::bail!(
-                "could not tell Core this provider is leaving: {e}. Nothing was removed, so the \
+                "could not tell Core this provider is leaving: {e:#}. Nothing was removed, so the \
                  token that can tell it is still here — run leave again once Core answers, or \
                  pass --without-core to leave Core listing a provider that has gone."
             ),
         },
-        Err(e) if without_core => eprintln!("  no agent configuration at {config} ({e}); Core was not told"),
+        Err(e) if without_core => eprintln!("  no agent configuration at {config} ({e:#}); Core was not told"),
         Err(e) => anyhow::bail!(
             "no agent configuration at {config}, so Core cannot be told this provider is leaving: \
-             {e}. Pass --without-core to leave anyway."
+             {e:#}. Pass --without-core to leave anyway."
         ),
     }
 

@@ -174,7 +174,7 @@ impl Log {
             .open(&self.own)
             .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
         if let Err(e) = written {
-            eprintln!("run-lease-expire: {} not written: {e}", self.own.display());
+            eprintln!("run-lease-expire: {} not written: {e:#}", self.own.display());
         }
     }
 }

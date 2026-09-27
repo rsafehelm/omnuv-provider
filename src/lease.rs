@@ -207,14 +207,14 @@ pub fn resume(book: &Shared, file: &std::path::Path) -> usize {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(e) => {
-            eprintln!("run lease: {} could not be read, so no lease is resumed: {e}", file.display());
+            eprintln!("run lease: {} could not be read, so no lease is resumed: {e:#}", file.display());
             return 0;
         }
     };
     let leases = match read_body(&body) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("run lease: {} refused, so no lease is resumed: {e}", file.display());
+            eprintln!("run lease: {} refused, so no lease is resumed: {e:#}", file.display());
             return 0;
         }
     };
@@ -308,7 +308,7 @@ pub async fn check(book: &Shared, driver: &Client, file: &std::path::Path) {
     let body = file_body(book).to_string();
     let tmp = file.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, file)) {
-        eprintln!("run lease: {} not written: {e}", file.display());
+        eprintln!("run lease: {} not written: {e:#}", file.display());
     }
 }
 
@@ -345,7 +345,7 @@ pub(crate) async fn take_lock(file: &std::path::Path) -> Option<std::fs::File> {
     let f = match open_lock(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("run lease: {} could not be opened ({e}); the lease task runs without it", path.display());
+            eprintln!("run lease: {} could not be opened ({e:#}); the lease task runs without it", path.display());
             return None;
         }
     };
@@ -355,18 +355,18 @@ pub(crate) async fn take_lock(file: &std::path::Path) -> Option<std::fs::File> {
             println!("run lease: the host timer holds {}; waiting for its pass to end", path.display());
         }
         Err(std::fs::TryLockError::Error(e)) => {
-            eprintln!("run lease: {} could not be locked ({e}); the lease task runs without it", path.display());
+            eprintln!("run lease: {} could not be locked ({e:#}); the lease task runs without it", path.display());
             return None;
         }
     }
     match tokio::task::spawn_blocking(move || f.lock().map(|()| f)).await {
         Ok(Ok(f)) => Some(f),
         Ok(Err(e)) => {
-            eprintln!("run lease: {} could not be locked ({e}); the lease task runs without it", path.display());
+            eprintln!("run lease: {} could not be locked ({e:#}); the lease task runs without it", path.display());
             None
         }
         Err(e) => {
-            eprintln!("run lease: waiting for {} failed ({e}); the lease task runs without it", path.display());
+            eprintln!("run lease: waiting for {} failed ({e:#}); the lease task runs without it", path.display());
             None
         }
     }

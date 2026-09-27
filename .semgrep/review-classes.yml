@@ -99,3 +99,117 @@ rules:
           async fn $F(..., $WS: WebSocketUpgrade, ..., CurrentUser($U): CurrentUser, ...) -> $R { ... }
       - pattern-not: |
           async fn $F(...) -> $R { ... <... crate::auth::credential(...) ...>; ... }
+  - id: an-error-logged-without-its-causes
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      An error is logged with `%` alone, which prints an anyhow error's outer
+      context and drops its causes. The port tier's first run on production
+      logged `forward failed … error=connecting to 10.210.55.251:22`, and the
+      socket's own reason was nowhere (27 September 2026). Log the chain:
+      `error = %format_args!("{e:#}")`.
+    # A regex, not a pattern: a tracing macro's arguments are a token tree,
+    # which semgrep's Rust patterns do not look inside.
+    pattern-regex: '\berror\s*=\s*%[A-Za-z_][A-Za-z0-9_.]*\s*[,)]'
+
+  # ---- The edge supervisor (the analysis of 27 September 2026) ----
+  #
+  # It holds the Docker socket, which is root on the host. Three shapes that
+  # would turn one careless line into a removal, a leak or an unbounded
+  # request, each proved against the defect and its fix in review-classes.rs.
+
+  - id: a-supervisor-removal-not-from-its-plan
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A Docker removal, stop, kill or restart whose target did not come from
+      the plan. The plan (supervise/plan.rs) is the only place a container is
+      matched against `onv.managed-by` by `claim()`, so a target taken from a
+      name, a raw listing or an error is one the label check never saw: a
+      container called `edge-t<network>` with no label, or somebody else's
+      under a name the supervisor wanted, goes with it. Take the target from
+      a `Converge` or `Remove` (its `edges`, `relays`, `volumes`), or from a
+      container this function just made.
+    # A search, not taint: the allowed sources are loops over the plan's
+    # fields and the id `create` returned, and a sink outside them is the
+    # finding. The receiver `.docker.` is the supervisor's alone in src.
+    patterns:
+      - pattern-either:
+          - pattern: $CTX.docker.remove($X, ...)
+          - pattern: $CTX.docker.remove_volume($X)
+          - pattern: $CTX.docker.restart($X, ...)
+          - pattern: $CTX.docker.stop($X, ...)
+          - pattern: $CTX.docker.kill($X, ...)
+      # The plan's own: every id there passed claim().
+      - pattern-not-inside: |
+          for $X in $P.relays.iter().chain(&$P.edges) { ... }
+      - pattern-not-inside: |
+          for $X in &$P.relays { ... }
+      - pattern-not-inside: |
+          for $X in &$P.edges { ... }
+      - pattern-not-inside: |
+          for $X in &$P.volumes { ... }
+      - pattern-not: $CTX.docker.restart(&$P.relays[0], ...)
+      # What this function just made, removed again when it could not start.
+      - pattern-not-inside: |
+          let $ID = $CTX.docker.create(...).await.map_err(...)?;
+          ...
+          <... $CTX.docker.remove(&$ID, ...) ...>;
+
+  - id: a-secret-reaching-a-log
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A token, a setup key or a secret named inside a log macro or an error
+      that will be logged. The supervisor holds its own Core token, mints
+      every tenant edge's token and every relay's setup key; a log line is
+      read by whoever reads the host's logs, and the file outlives the
+      container. Log the row id or the key's overlay id, never the credential
+      (`Hidden` has no Display for this reason).
+    # A regex: a macro's arguments are a token tree. The macro is matched
+    # whole, strings and nested parentheses included, and its arguments are
+    # then searched for a credential in a value position (`= %token,`,
+    # `?key.setup_key)`), `.expose()`, or an inline `{token}`. A word in a
+    # message ("edge token issued") is not a value position.
+    patterns:
+      - pattern-regex: '(?s)(?:\b(?:trace|debug|info|warn|error|println|eprintln|print|eprint|panic|anyhow|bail)!|\bErr\(\s*format!)\s*(?<ARGS>\((?:[^()"]++|"(?:[^"\\]++|\\.)*+"|(?&ARGS))*+\))'
+      - metavariable-regex:
+          metavariable: $ARGS
+          # Anchored at the start, as metavariable-regex is (measured with
+          # 1.177.0): hence the leading `.*?`.
+          regex: '(?s).*?(?:\.expose\(\)|[=,(]\s*[%?]?\s*&?\s*(?:[a-z_]+\.)*(?:token|setup_key|secret|password)\s*(?:[,)]|\.as_str\(\)|\.to_string\(\))|\{(?:token|setup_key|secret|password)(?::[^}]*)?\})'
+
+  - id: an-unbounded-value-in-a-docker-path
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A value Core answered with, or one not percent-encoded, in a Docker
+      Engine API path. The path is a URL the daemon reads whole: what goes in
+      it must be bounded and encoded. Names are the prefix (settings, 64
+      characters at most) and a network id `is_network_id` read; ids are the
+      daemon's own. A token row, a key id, a hostname or an address from Core
+      has no bound here, and belongs in the body if anywhere.
+    # Two regexes: the call site's path argument, and the path's own format
+    # in docker.rs, where every interpolation must be `percent(..)`, a label
+    # filter (itself percent-encoded) or a number of seconds. Scoped to the
+    # supervisor: `self.call(..)` is also the OVH client's (addresses/ovh.rs),
+    # whose paths are not the Docker daemon's. The fixture is included so
+    # `semgrep --test` still runs it.
+    paths:
+      include: ["src/edge/src/supervise/", ".semgrep/review-classes.rs"]
+    pattern-either:
+      - pattern-regex: '\.docker\.(?:started_at|create|put_archive|start|restart|remove|volume|volumes|containers|create_volume|remove_volume)\(\s*&?(?:[a-z_]+\.)*(?:key|row|token|edge_token|relay_key|hostname|setup_key|management_url|overlay_url|url|address)\b'
+      # an inline capture in the path: `format!("/containers/{id}/start")`
+      - pattern-regex: 'self\.call\([^;]*?&format!\("[^"]*\{[a-z_]'
+      # a positional argument that is none of the three bounded forms
+      - pattern-regex: 'self\.call\([^;]*?&format!\("[^"]*"(?:\s*,\s*(?:percent\([a-z_]+\)|label_filter\([^()]*\)|[a-z_]+\.as_secs\(\)))*\s*,\s*(?!percent\(|label_filter\(|[a-z_]+\.as_secs\(\))[^\s)]'
+  - id: an-error-printed-without-its-causes
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      `{e}` in a print macro prints an anyhow error's outer context and drops
+      its causes: the same class as an-error-logged-without-its-causes, in the
+      agent's own form (60 sites there, 27 September 2026). Print `{e:#}`.
+    # A regex over the macro's whole call, which may span lines: its
+    # arguments are a token tree semgrep's Rust patterns do not look inside.
+    pattern-regex: '\be?println!\((?:[^;]|\n)*?\{e\}'

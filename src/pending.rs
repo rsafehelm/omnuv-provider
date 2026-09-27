@@ -113,7 +113,7 @@ pub fn remove(dir: &Path, vmid: u32) {
     if let Err(e) = std::fs::remove_file(file(dir, vmid))
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("pending clone {vmid}: record not removed: {e}");
+        eprintln!("pending clone {vmid}: record not removed: {e:#}");
     }
 }
 

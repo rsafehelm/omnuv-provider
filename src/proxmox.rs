@@ -1044,7 +1044,7 @@ impl Client {
             // Without VM.Audit we cannot prove a device is free, so nothing is
             // offered. Failing closed is the only safe direction here.
             Err(e) => {
-                eprintln!("  warning: cannot enumerate guests ({e}); offering no GPUs");
+                eprintln!("  warning: cannot enumerate guests ({e:#}); offering no GPUs");
                 claims.complete = false;
                 claims.unlisted = Some(format!("the guest listing of {node} failed ({e})"));
                 return claims;
@@ -1057,7 +1057,7 @@ impl Client {
         let mappings: Vec<PciMapping> = match self.get("/cluster/mapping/pci").await {
             Ok(mappings) => mappings,
             Err(e) => {
-                eprintln!("  warning: cannot read PCI mappings ({e}); offering no GPUs");
+                eprintln!("  warning: cannot read PCI mappings ({e:#}); offering no GPUs");
                 claims.complete = false;
                 Vec::new()
             }
@@ -1074,7 +1074,7 @@ impl Client {
                     }
                 };
             if let Err(e) = claims.observe_vm(&vm, &cfg, node, &mappings, desired) {
-                eprintln!("  warning: cannot resolve PCI claims of vm {} ({e}); offering no GPUs", vm.vmid);
+                eprintln!("  warning: cannot resolve PCI claims of vm {} ({e:#}); offering no GPUs", vm.vmid);
             }
 
             // Anything the marketplace did not create is the provider's own,
@@ -1082,7 +1082,7 @@ impl Client {
             if !is_marketplace(vm.tags.as_deref())
                 && let Err(e) = owner.observe(vm.status.as_deref(), vm.cpus.as_ref(), vm.maxmem.as_ref(), &cfg)
             {
-                eprintln!("  warning: cannot size vm {} ({e}); disclosing nothing", vm.vmid);
+                eprintln!("  warning: cannot size vm {} ({e:#}); disclosing nothing", vm.vmid);
                 owner_seen = false;
             }
         }
@@ -1101,7 +1101,7 @@ impl Client {
         let listed: Vec<VmEntry> = match self.get(&format!("/nodes/{node}/lxc")).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("  warning: cannot enumerate containers ({e}); disclosing nothing");
+                eprintln!("  warning: cannot enumerate containers ({e:#}); disclosing nothing");
                 return Err(format!("the container listing of {node} failed ({e})"));
             }
         };
@@ -1112,7 +1112,7 @@ impl Client {
                 Err(e) => Err(e),
             };
             if let Err(e) = observed {
-                eprintln!("  warning: cannot size container {} ({e}); disclosing nothing", ct.vmid);
+                eprintln!("  warning: cannot size container {} ({e:#}); disclosing nothing", ct.vmid);
                 return Ok(None);
             }
         }

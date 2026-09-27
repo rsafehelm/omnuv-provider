@@ -851,7 +851,7 @@ impl Client {
                         )
                         .await;
                     if let Err(e) = &refreshed {
-                        eprintln!("instance {}: cloud-init not refreshed: {e}", spec.id);
+                        eprintln!("instance {}: cloud-init not refreshed: {e:#}", spec.id);
                     }
                     self.refreshes.record(&spec.id, refreshed.map(|_| ()).map_err(|e| format!("{e:#}")));
                 }
@@ -875,6 +875,9 @@ impl Client {
                                     audit::record("instance.reboot", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
                                     rebooted_token = Some(token.clone());
                                 } else {
+                                    // `token` is the reboot's identity (R3's verb with an
+                                    // identity), not a credential.
+                                    // nosemgrep: a-secret-reaching-a-log
                                     eprintln!(
                                         "instance {}: reboot {token} was asked for and not seen to happen; not asking again",
                                         spec.id
@@ -1349,7 +1352,7 @@ impl Client {
                 spec.console_password_generation,
             )
         {
-            eprintln!("instance {}: console password generation not written down: {e}", spec.id);
+            eprintln!("instance {}: console password generation not written down: {e:#}", spec.id);
         }
 
         Ok(InstanceStatus {
@@ -1640,7 +1643,7 @@ impl Client {
             // machine is not there.
             if entry.stage == crate::pending::Stage::Abandoned {
                 match self.vm_at(entry.vmid).await {
-                    Err(e) => eprintln!("pending clone {}: cannot list machines, its rollback is still owed: {e}", entry.vmid),
+                    Err(e) => eprintln!("pending clone {}: cannot list machines, its rollback is still owed: {e:#}", entry.vmid),
                     Ok(None) => {
                         audit::record(&format!("{event}.create"), "core", &entry.id, "rollback confirmed", Some(&entry.vmid.to_string()));
                         crate::pending::remove(&journal, entry.vmid);
@@ -1670,7 +1673,7 @@ impl Client {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("pending clone {}: cannot list machines, kept: {e}", entry.vmid);
+                    eprintln!("pending clone {}: cannot list machines, kept: {e:#}", entry.vmid);
                     continue;
                 }
             };
@@ -1708,7 +1711,7 @@ impl Client {
                 {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("pending clone {}: its config cannot be read, kept: {e}", entry.vmid);
+                        eprintln!("pending clone {}: its config cannot be read, kept: {e:#}", entry.vmid);
                         continue;
                     }
                 };
@@ -1739,7 +1742,7 @@ impl Client {
                 )
                 .await
             {
-                eprintln!("pending clone {}: could not claim it, kept: {e}", entry.vmid);
+                eprintln!("pending clone {}: could not claim it, kept: {e:#}", entry.vmid);
                 continue;
             }
             self.abandon_clone(&journal, &entry, event).await;
@@ -1826,7 +1829,7 @@ impl Client {
                 true
             }
             Err(e) => {
-                eprintln!("instance {id}: could not remove clone {vmid} after a failed create, and it stays recorded: {e}");
+                eprintln!("instance {id}: could not remove clone {vmid} after a failed create, and it stays recorded: {e:#}");
                 false
             }
         }
@@ -1888,7 +1891,7 @@ impl Client {
             if let Err(e) = std::fs::remove_file(&snippet)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                eprintln!("instance {id}: cloud-init snippet not removed: {e}");
+                eprintln!("instance {id}: cloud-init snippet not removed: {e:#}");
             }
         }
         // And the two journals beside them, which nothing else ever removes: a

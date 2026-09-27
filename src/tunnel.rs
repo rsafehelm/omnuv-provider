@@ -90,7 +90,7 @@ pub async fn run(
             }
             Err(e) => {
                 audit::record("tunnel.error", "agent", "core", "error", Some(&e.to_string()));
-                eprintln!("tunnel: {e}");
+                eprintln!("tunnel: {e:#}");
             }
         }
         // Bounded backoff: a provider that cannot reach Core must not spin, but

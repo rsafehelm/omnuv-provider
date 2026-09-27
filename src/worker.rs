@@ -569,7 +569,7 @@ impl Client {
                         crate::audit::record("worker.reconfigure", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("worker {}: cloud-init not refreshed: {e}", spec.id),
+                    Err(e) => eprintln!("worker {}: cloud-init not refreshed: {e:#}", spec.id),
                 }
             }
 
@@ -946,7 +946,7 @@ impl Client {
             if let Err(e) = std::fs::remove_file(&snippet)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                eprintln!("worker {worker_id}: cloud-init snippet not removed: {e}");
+                eprintln!("worker {worker_id}: cloud-init snippet not removed: {e:#}");
             }
         }
         // And what its Workload Agent last said, which is keyed by the same id.

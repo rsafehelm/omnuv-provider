@@ -483,7 +483,7 @@ pub(crate) fn read_tomb(dir: &std::path::Path, id: &str) -> Option<Tombstone> {
         Err(e) => {
             // Unreadable is not absent: the id is treated as tombstoned, so
             // nothing is built under it, and the operator is told.
-            eprintln!("tombstone for {id} unreadable, kept: {e}");
+            eprintln!("tombstone for {id} unreadable, kept: {e:#}");
             Some(Tombstone {
                 id: id.to_string(),
                 claim: String::new(),
@@ -731,7 +731,7 @@ impl Client {
             let config: serde_json::Value = match self.get_json(&format!("/nodes/{}/{kind}/{}/config", g.node, g.vmid)).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("{volid}: guest {} on {} could not be read, so it is not removed: {e}", g.vmid, g.node);
+                    eprintln!("{volid}: guest {} on {} could not be read, so it is not removed: {e:#}", g.vmid, g.node);
                     return Ok(true);
                 }
             };
@@ -745,11 +745,11 @@ impl Client {
         match asked {
             Ok(serde_json::Value::String(upid)) => {
                 if let Err(e) = self.wait_task(node, &upid).await {
-                    eprintln!("{volid}: its removal failed: {e}");
+                    eprintln!("{volid}: its removal failed: {e:#}");
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("{volid}: could not be removed: {e}"),
+            Err(e) => eprintln!("{volid}: could not be removed: {e:#}"),
         }
         let again: Vec<serde_json::Value> = self.get_json(&content_path).await?;
         Ok(present(&again))
@@ -771,7 +771,7 @@ impl Client {
             match self.claimed_guests(&t.claim, &t.id).await {
                 Ok(left) if left.is_empty() => {
                     if let Err(e) = std::fs::remove_file(tomb_file(&dir, &t.id)) {
-                        eprintln!("tombstone {}: not removed: {e}", t.id);
+                        eprintln!("tombstone {}: not removed: {e:#}", t.id);
                         continue;
                     }
                     crate::audit::record("teardown.tombstone", "agent", &t.id, "reaped", None);
@@ -782,7 +782,7 @@ impl Client {
                     t.id,
                     left.len()
                 ),
-                Err(e) => eprintln!("tombstone {}: past its horizon, and the listing failed; kept: {e}", t.id),
+                Err(e) => eprintln!("tombstone {}: past its horizon, and the listing failed; kept: {e:#}", t.id),
             }
         }
         reaped
@@ -825,7 +825,7 @@ impl Client {
                         }
                     }
                     if let Err(e) = write_tomb(&dir, &t) {
-                        eprintln!("tombstone {}: {e}", t.id);
+                        eprintln!("tombstone {}: {e:#}", t.id);
                     }
                 }
             }

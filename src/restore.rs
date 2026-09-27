@@ -89,7 +89,7 @@ pub fn head_file(snippet_dir: &str) -> PathBuf {
 pub fn load(path: PathBuf) -> Shared {
     let head = match std::fs::read(&path) {
         Ok(raw) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
-            eprintln!("restore head {} unreadable, held as a restore: {e}", path.display());
+            eprintln!("restore head {} unreadable, held as a restore: {e:#}", path.display());
             Head {
                 mode: Some(Mode { evidence: format!("this agent's restore head was unreadable: {e}"), core: None }),
                 ..Head::default()
@@ -108,7 +108,7 @@ fn save(s: &State) {
         .and_then(|b| std::fs::write(&tmp, b))
         .and_then(|()| std::fs::rename(&tmp, path));
     if let Err(e) = written {
-        eprintln!("restore head not saved to {}: {e}", path.display());
+        eprintln!("restore head not saved to {}: {e:#}", path.display());
     }
 }
 

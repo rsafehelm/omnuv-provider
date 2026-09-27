@@ -97,7 +97,7 @@ pub fn open(path: Option<&str>) -> Option<String> {
             // Not fatal: the journal still receives every event. But say so
             // loudly, because a provider who cannot read the file would
             // otherwise assume it exists.
-            eprintln!("warning: cannot open audit log at {path}: {e}. Events go to the journal only.");
+            eprintln!("warning: cannot open audit log at {path}: {e:#}. Events go to the journal only.");
             None
         }
     }

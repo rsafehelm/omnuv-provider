@@ -462,7 +462,7 @@ async fn main() -> anyhow::Result<()> {
             // process: the agent's own probe still decides the worker's state,
             // and a machine that stops reporting is a smaller problem than one
             // that stops running.
-            eprintln!("onv-workloadd: writing {STATUS_PATH}: {e}");
+            eprintln!("onv-workloadd: writing {STATUS_PATH}: {e:#}");
         }
 
         if last_health != Some(health) {

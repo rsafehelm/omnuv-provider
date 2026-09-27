@@ -246,7 +246,7 @@ impl Client {
                     crate::audit::record("segment.reap", "agent", v, "removed", None);
                     removed += 1;
                 }
-                Err(e) => eprintln!("segment {v}: not removed: {e}"),
+                Err(e) => eprintln!("segment {v}: not removed: {e:#}"),
             }
         }
         Ok(removed)

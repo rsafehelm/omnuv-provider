@@ -735,7 +735,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 let node = match driver.home_node(cfg.proxmox.node.as_deref()).await {
                     Ok(n) => n,
                     Err(e) => {
-                        eprintln!("image mirror: no node to mirror onto: {e}");
+                        eprintln!("image mirror: no node to mirror onto: {e:#}");
                         continue;
                     }
                 };
@@ -747,7 +747,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 // a provider with fewer things it can earn from, and this task
                 // exiting would mean it never tried again.
                 if let Err(e) = mirror_images(&core, &driver, &cfg, &node, &catalogue).await {
-                    eprintln!("image mirror: {e}");
+                    eprintln!("image mirror: {e:#}");
                 }
             }
         });
@@ -831,7 +831,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                     match refusal(&e) {
                         Refusal::Final => stop_for_good(&e),
                         Refusal::Renegotiate => {
-                            eprintln!("reconcile (pushed) failed: {e}; re-running handshake");
+                            eprintln!("reconcile (pushed) failed: {e:#}; re-running handshake");
                             if let Err(h) = handshake(&core, &driver).await {
                                 if refusal(&h) == Refusal::Final {
                                     stop_for_good(&h);
@@ -839,7 +839,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                                 eprintln!("handshake failed: {h}");
                             }
                         }
-                        _ => eprintln!("reconcile (pushed) failed: {e}"),
+                        _ => eprintln!("reconcile (pushed) failed: {e:#}"),
                     }
                 }
             }
@@ -848,7 +848,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                     match refusal(&e) {
                         Refusal::Final => stop_for_good(&e),
                         Refusal::Renegotiate => {
-                            eprintln!("reconcile failed: {e}; re-running handshake");
+                            eprintln!("reconcile failed: {e:#}; re-running handshake");
                             if let Err(h) = handshake(&core, &driver).await {
                                 if refusal(&h) == Refusal::Final {
                                     stop_for_good(&h);
@@ -856,7 +856,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                                 eprintln!("handshake failed: {h}");
                             }
                         }
-                        _ => eprintln!("reconcile failed: {e}"),
+                        _ => eprintln!("reconcile failed: {e:#}"),
                     }
                 }
             }
@@ -998,7 +998,7 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
                         if refusal(&e) == Refusal::Final {
                             stop_for_good(&e);
                         }
-                        eprintln!("heartbeat handshake failed: {e}");
+                        eprintln!("heartbeat handshake failed: {e:#}");
                     }
                 }
                 // Superseded (RC12): another agent holds this provider now.
@@ -1010,7 +1010,7 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
                     }).context("another agent's handshake superseded this agent's session"));
                 }
                 Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
-                Err(e) => eprintln!("heartbeat failed: {e}"),
+                Err(e) => eprintln!("heartbeat failed: {e:#}"),
                 _ => {}
             }
         }
@@ -2169,7 +2169,7 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
                     continue;
                 }
             }
-            Err(e) => eprintln!("handshake failed: {e}"),
+            Err(e) => eprintln!("handshake failed: {e:#}"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         delay = (delay * 2).min(60);
@@ -2275,7 +2275,7 @@ async fn mirror_images(
             crate::audit::record("image.mirror", "core", &artefact.id, "fetching", None);
             if let Err(e) = core.download_artefact(artefact, &dest, cfg.timings.image_transfer_idle.std()).await {
                 crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
-                eprintln!("image {}: {e}", artefact.id);
+                eprintln!("image {}: {e:#}", artefact.id);
                 continue;
             }
 
@@ -2290,7 +2290,7 @@ async fn mirror_images(
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("image {}: cannot read back what was written: {e}", artefact.id);
+                    eprintln!("image {}: cannot read back what was written: {e:#}", artefact.id);
                     continue;
                 }
             }
@@ -2317,7 +2317,7 @@ async fn mirror_images(
             }
             Err(e) => {
                 crate::audit::record("image.mirror", "core", &artefact.id, "failed", None);
-                eprintln!("image {}: import failed: {e}", artefact.id);
+                eprintln!("image {}: import failed: {e:#}", artefact.id);
             }
         }
     }
@@ -2368,7 +2368,7 @@ async fn reconcile_workers(
         Ok(_) => {}
         // A hypervisor we cannot list is a separate problem; the fetch below
         // will fail too and report it in its own words.
-        Err(e) => eprintln!("could not check for pre-rename machines: {e}"),
+        Err(e) => eprintln!("could not check for pre-rename machines: {e:#}"),
     }
 
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
@@ -2490,7 +2490,7 @@ async fn reconcile_workers(
     match driver.reap_unused_segments(node).await {
         Ok(0) => {}
         Ok(n) => eprintln!("removed {n} unused segment(s)"),
-        Err(e) => eprintln!("segment reap: {e}"),
+        Err(e) => eprintln!("segment reap: {e:#}"),
     }
 
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
@@ -2576,14 +2576,14 @@ async fn reconcile_workers(
             && e.downcast_ref::<crate::instance::NotLookedAt>().is_some()
         {
             unobserved_workers += 1;
-            eprintln!("worker {}: {e}", spec.id);
+            eprintln!("worker {}: {e:#}", spec.id);
             continue;
         }
         // A failure on one worker must not stop the others from converging, and
         // must be visible to the operator rather than retried in silence.
         statuses.push(result.unwrap_or_else(|e| {
             unobserved_workers += 1;
-            eprintln!("worker {}: {e}", spec.id);
+            eprintln!("worker {}: {e:#}", spec.id);
             WorkerStatus {
                 id: spec.id.clone(),
                 state: WorkerState::Error,
@@ -2630,7 +2630,7 @@ async fn reconcile_workers(
             Ok(live) => known.live = live,
             Err(e) => {
                 known.complete = false;
-                eprintln!("snippet ownership observation failed: {e}");
+                eprintln!("snippet ownership observation failed: {e:#}");
             }
         }
         let swept = crate::snippets::sweep(
@@ -2744,7 +2744,7 @@ async fn reconcile_workers(
                 // and `complete` goes false, which is what stops Core reading
                 // its absence as anything.
                 unobserved_instances += 1;
-                eprintln!("instance {}: {e}", spec.id);
+                eprintln!("instance {}: {e:#}", spec.id);
                 continue;
             }
             Err(e) => match e.downcast::<crate::instance::SeenThenFailed>() {
@@ -2772,7 +2772,7 @@ async fn reconcile_workers(
         };
         instances.push(result.unwrap_or_else(|e| {
             unobserved_instances += 1;
-            eprintln!("instance {}: {e}", spec.id);
+            eprintln!("instance {}: {e:#}", spec.id);
             let why = e.to_string();
             // Why, and whether trying again could plausibly work. Without this
             // Core has to poll to learn anything, and it will re-drive an
@@ -2958,7 +2958,7 @@ async fn release_session(core: &Core) {
     match core.delete("/provider/v1/session").await {
         Ok(r) if r.status().is_success() => println!("stopping: released this agent's session"),
         Ok(r) => eprintln!("stopping: the session was not released ({}); the next agent waits out its lease", r.status()),
-        Err(e) => eprintln!("stopping: the session was not released: {e}; the next agent waits out its lease"),
+        Err(e) => eprintln!("stopping: the session was not released: {e:#}; the next agent waits out its lease"),
     }
 }
 

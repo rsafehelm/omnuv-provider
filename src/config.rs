@@ -95,8 +95,10 @@ impl ProxmoxTarget {
     pub fn credentials(&self) -> anyhow::Result<(String, String)> {
         let id = std::env::var(&self.token_env.id)
             .map_err(|_| anyhow::anyhow!("{} is not set", self.token_env.id))?;
+        // `token_env.secret` is the *name* of the variable holding the secret,
+        // read on the line above; the message names the variable, never its value.
         let secret = std::env::var(&self.token_env.secret)
-            .map_err(|_| anyhow::anyhow!("{} is not set", self.token_env.secret))?;
+            .map_err(|_| anyhow::anyhow!("{} is not set", self.token_env.secret))?; // nosemgrep: a-secret-reaching-a-log
         Ok((id, secret))
     }
 }
