@@ -265,7 +265,20 @@ impl Client {
     /// still calls running after the stop is not destroyed on this pass.
     pub(crate) async fn destroy(&self, d: &Doomed) -> anyhow::Result<()> {
         let (node, vmid) = (d.node.as_str(), d.vmid);
-        if self.live_status(node, vmid).await? != "stopped" {
+        let running = self.live_status(node, vmid).await? != "stopped";
+        // **The hour's cap on destroying running machines** (lifecycle phase
+        // 8, TD9), whatever asked for it: a buyer, the marketplace, or a
+        // mistake that made many Absents at once. Past it this one waits, and
+        // is asked again on a later pass; nothing is stopped or destroyed.
+        if running && !self.started_destroy_allowed() {
+            return Err(Refused(format!(
+                "vm {vmid} on {node} is running, and this agent has destroyed {} running machines in the last \
+                 hour (timings.startedDestroysPerHour); it waits for a later pass",
+                self.timings.started_destroys_per_hour
+            ))
+            .into());
+        }
+        if running {
             let upid: String = self.post_form(&format!("/nodes/{node}/qemu/{vmid}/status/stop"), NO_FORM).await?;
             self.wait_task(node, &upid).await?;
             let after = self.live_status(node, vmid).await?;
@@ -279,7 +292,33 @@ impl Client {
         let upid: String = self
             .delete_task(&format!("/nodes/{node}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=0"))
             .await?;
-        self.wait_task(node, &upid).await
+        self.wait_task(node, &upid).await?;
+        // Counted once it is done: a destroy that failed took no place.
+        if running {
+            self.started_destroyed();
+        }
+        Ok(())
+    }
+
+    /// Whether the hour has room for one more destroy of a running machine.
+    fn started_destroy_allowed(&self) -> bool {
+        let cap = self.timings.started_destroys_per_hour as usize;
+        if cap == 0 {
+            return true;
+        }
+        let mut done = self.started_destroys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hour = std::time::Duration::from_secs(3600);
+        while done.front().is_some_and(|t| t.elapsed() >= hour) {
+            done.pop_front();
+        }
+        done.len() < cap
+    }
+
+    fn started_destroyed(&self) {
+        self.started_destroys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(std::time::Instant::now());
     }
 }
 
@@ -796,6 +835,47 @@ mod tests {
 
     fn destroyed(mock: &crate::pvemock::Mock) -> Vec<String> {
         mock.calls.lock().unwrap().iter().filter(|c| c.method == "DELETE").map(|c| c.path.clone()).collect()
+    }
+
+    /// **Destroys of running machines are capped per hour, whatever asked**
+    /// (lifecycle phase 8, TD9). With a cap of one: the first running machine
+    /// is stopped and destroyed, the second waits and is not touched, and a
+    /// stopped one is not counted. With no cap (0, the default) it goes.
+    #[tokio::test]
+    async fn destroys_of_running_machines_wait_past_the_hours_cap() {
+        let running = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::from([1u32, 2])));
+        let r = running.clone();
+        let mock = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(ok) = crate::pvemock::task_ok(path) {
+                return ok;
+            }
+            let vmid: u32 = path.split('/').nth(4).and_then(|v| v.split('?').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
+            match (method, path) {
+                ("GET", p) if p.ends_with("/status/current") => {
+                    let on = r.lock().unwrap().contains(&vmid);
+                    (200, serde_json::json!({"status": if on { "running" } else { "stopped" }}))
+                }
+                ("POST", p) if p.ends_with("/status/stop") => {
+                    r.lock().unwrap().remove(&vmid);
+                    (200, serde_json::json!("UPID:n1:stop"))
+                }
+                ("DELETE", _) => (200, serde_json::json!("UPID:n1:destroy")),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let mut c = mock.client();
+        c.timings.started_destroys_per_hour = 1;
+        let doomed = |vmid| Doomed { node: "n1".into(), vmid, volids: Vec::new() };
+        c.destroy(&doomed(1)).await.expect("the first running machine goes");
+        let e = c.destroy(&doomed(2)).await.expect_err("a second running machine within the hour");
+        assert!(e.downcast_ref::<Refused>().is_some() && e.to_string().contains("waits"), "{e}");
+        assert!(running.lock().unwrap().contains(&2), "the waiting machine was stopped");
+        assert!(!destroyed(&mock).iter().any(|p| p.contains("/qemu/2?")), "{:?}", destroyed(&mock));
+        c.destroy(&doomed(3)).await.expect("a stopped machine is not counted");
+        c.timings.started_destroys_per_hour = 0;
+        c.destroy(&doomed(2)).await.expect("no cap: it goes");
+        assert!(destroyed(&mock).iter().any(|p| p.contains("/qemu/2?")), "{:?}", destroyed(&mock));
     }
 
     /// **Decoys survive a delete** (the roadmap's pass for row 7). Each

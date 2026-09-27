@@ -112,6 +112,12 @@ pub struct Timings {
     /// (lifecycle phase 7; D13). Past it the tombstone goes, once a listing
     /// shows nothing carries the machine's claim.
     pub tombstone_keep: Dur,
+    /// The running machines this agent destroys in any hour, whatever asked
+    /// for it (lifecycle phase 8, TD9: "destroys of started machines capped
+    /// per provider-hour, whatever their origin"). Past it the rest wait,
+    /// oldest request first, reported as waiting. 0: no cap, the shipped
+    /// default until a number is measured.
+    pub started_destroys_per_hour: u32,
 }
 
 impl Default for Timings {
@@ -129,6 +135,7 @@ impl Default for Timings {
             clone_budget_max: CLONE_BUDGET_MAX,
             workload: WorkloadConfig::default(),
             tombstone_keep: TOMBSTONE_KEEP,
+            started_destroys_per_hour: 0,
         }
     }
 }
@@ -185,6 +192,13 @@ impl Timings {
         within(&mut bad, "tombstoneKeep", self.tombstone_keep, Dur::hours(24), Dur::hours(24 * 3650),
             "a tombstone is what stops a restored view rebuilding a machine this agent deleted, so it \
              outlives at least a day of backups");
+        if self.started_destroys_per_hour > 10_000 {
+            bad.push(format!(
+                "timings.startedDestroysPerHour ({}) is past 10000: a cap nothing can reach caps nothing; \
+                 0 says no cap",
+                self.started_destroys_per_hour
+            ));
+        }
         bad.extend(self.workload.check("timings.workload."));
         // A worker's report must move between the reads that could call it
         // stuck: a reporter slower than that reads as a dead one. Reads come
@@ -239,8 +253,10 @@ mod tests {
         // this. A change to a default or to the canonical form moves it on
         // every provider at once, so it moves here, on purpose, in that change.
         // Lifecycle phase 7 added `tombstoneKeep`: a57be9feb152 became
-        // 3cf6624da40e.
-        assert_eq!(t.hash(), "3cf6624da40e");
+        // 3cf6624da40e; phase 8 added `startedDestroysPerHour` (0, no cap):
+        // bac073f3123c.
+        assert_eq!(t.started_destroys_per_hour, 0, "lifecycle phase 8: a new key, shipped off");
+        assert_eq!(t.hash(), "bac073f3123c");
     }
 
     /// Core's poll is obeyed inside Core's own range, and zero or absent is

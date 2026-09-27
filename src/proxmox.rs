@@ -277,6 +277,10 @@ pub struct Client {
     /// What each machine's cloud-init refresh did this pass, for the checks
     /// the report carries. See `survey::Refreshes`.
     pub(crate) refreshes: crate::survey::Refreshes,
+    /// When this agent destroyed a running machine, within the last hour
+    /// (lifecycle phase 8, TD9; `timings.startedDestroysPerHour`). In memory:
+    /// a restart forgets it, which the cap's hour absorbs.
+    pub(crate) started_destroys: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>,
 }
 
 impl ComputeDriver for Client {
@@ -471,6 +475,7 @@ impl Client {
             images: Default::default(),
             timings: Default::default(),
             refreshes: Default::default(),
+            started_destroys: Default::default(),
         })
     }
 
