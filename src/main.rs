@@ -26,6 +26,7 @@ mod session;
 mod restore;
 mod lease;
 mod hosttimer;
+mod report;
 mod teardown;
 mod dur;
 mod timings;

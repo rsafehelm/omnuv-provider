@@ -214,6 +214,9 @@ pub(crate) struct PciClaims {
     /// False if enumeration failed. Nothing is offered when we cannot prove
     /// a device is free.
     pub(crate) complete: bool,
+    /// The node's guest listing failed, which is the host not answering, not
+    /// one guest (D35): the survey is incomplete and nothing is reported.
+    pub(crate) unlisted: Option<String>,
 }
 
 /// Where the agent writes machines' cloud-init. Created by `deploy-agent.yml`
@@ -1043,6 +1046,7 @@ impl Client {
             Err(e) => {
                 eprintln!("  warning: cannot enumerate guests ({e}); offering no GPUs");
                 claims.complete = false;
+                claims.unlisted = Some(format!("the guest listing of {node} failed ({e})"));
                 return claims;
             }
         };
@@ -1091,13 +1095,14 @@ impl Client {
     /// The owner's containers on `node`, which Proxmox lists apart from its
     /// VMs (gap 4b of the allocation report: the escrow was blind to them).
     /// The marketplace creates none, so every untagged one is the owner's.
-    /// `None` when the listing or any container could not be read.
-    async fn owner_containers(&self, node: &str) -> Option<crate::disclosure::OwnerUse> {
+    /// `None` when any container could not be read; `Err` when the listing
+    /// itself failed, which is the host not answering (D35).
+    async fn owner_containers(&self, node: &str) -> Result<Option<crate::disclosure::OwnerUse>, String> {
         let listed: Vec<VmEntry> = match self.get(&format!("/nodes/{node}/lxc")).await {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("  warning: cannot enumerate containers ({e}); disclosing nothing");
-                return None;
+                return Err(format!("the container listing of {node} failed ({e})"));
             }
         };
         let mut owner = crate::disclosure::OwnerUse::default();
@@ -1108,10 +1113,10 @@ impl Client {
             };
             if let Err(e) = observed {
                 eprintln!("  warning: cannot size container {} ({e}); disclosing nothing", ct.vmid);
-                return None;
+                return Ok(None);
             }
         }
-        Some(owner)
+        Ok(Some(owner))
     }
 
     pub async fn discover(
@@ -1130,6 +1135,16 @@ impl Client {
     ) -> anyhow::Result<InventoryReport> {
         let entries: Vec<NodeEntry> = self.get("/nodes").await?;
         let mut nodes = Vec::new();
+        // **A survey is complete when the host answered every listing it is
+        // asked for** (D35): each online node's storage, its devices, its
+        // guests and its containers. Any of them failing is the host not
+        // answering — a wedged pvestatd, a hung API — and nothing is
+        // reported, so Core reads the host as silent rather than as a host
+        // with no disk or no cards. One object that cannot be read — a
+        // guest's or a container's configuration, the cluster's PCI mappings
+        // — is that object's, and is fenced as it was: its cards are not
+        // offered, and the node discloses nothing (D10).
+        let mut unanswered: Vec<String> = Vec::new();
 
         for entry in entries {
             if want.is_some_and(|w| entry.node != w) {
@@ -1139,8 +1154,13 @@ impl Client {
                 continue;
             }
 
-            let storages: Vec<StorageEntry> =
-                self.get(&format!("/nodes/{}/storage", entry.node)).await.unwrap_or_default();
+            let storages: Vec<StorageEntry> = match self.get(&format!("/nodes/{}/storage", entry.node)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    unanswered.push(format!("the storage listing of {} failed ({e})", entry.node));
+                    Vec::new()
+                }
+            };
             let offered: Vec<&StorageEntry> = storages
                 .iter()
                 .filter(|s| s.active.unwrap_or(0) == 1)
@@ -1157,17 +1177,29 @@ impl Client {
             let total_gib: u64 = offered.iter().filter_map(|s| s.total).sum::<u64>() / (1024 * 1024 * 1024);
 
             let mut claims = self.claimed_pci(&entry.node, desired).await;
+            unanswered.extend(claims.unlisted.take());
             // The owner's containers are read only when their VMs were: one
             // unreadable guest already means nothing is disclosed.
             let owner = match claims.owner.take() {
-                Some(mut vms) => self.owner_containers(&entry.node).await.map(|cts| {
-                    vms.add(cts);
-                    vms
-                }),
+                Some(mut vms) => match self.owner_containers(&entry.node).await {
+                    Ok(cts) => cts.map(|cts| {
+                        vms.add(cts);
+                        vms
+                    }),
+                    Err(unlisted) => {
+                        unanswered.push(unlisted);
+                        None
+                    }
+                },
                 None => None,
             };
-            let pci: Vec<PciEntry> =
-                self.get(&format!("/nodes/{}/hardware/pci", entry.node)).await.unwrap_or_default();
+            let pci: Vec<PciEntry> = match self.get(&format!("/nodes/{}/hardware/pci", entry.node)).await {
+                Ok(p) => p,
+                Err(e) => {
+                    unanswered.push(format!("the device listing of {} failed ({e})", entry.node));
+                    Vec::new()
+                }
+            };
 
             let mut gpus = Vec::new();
             for d in pci {
@@ -1259,6 +1291,9 @@ impl Client {
             });
         }
 
+        if !unanswered.is_empty() {
+            anyhow::bail!("the survey is incomplete, so nothing is reported (D35): {}", unanswered.join("; "));
+        }
         if nodes.is_empty() {
             anyhow::bail!("no usable nodes found");
         }
