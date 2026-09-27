@@ -63,6 +63,9 @@ struct Core {
     /// The session Core minted at the last handshake, sent on every call
     /// (lifecycle phase 7, RC12). Shared by every clone and by the tunnel.
     session: crate::session::Session,
+    /// This agent's head and restore mode (lifecycle phase 8, TD11): the
+    /// evidence rides every call while Core has not named the restore back.
+    restore: crate::restore::Shared,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -201,17 +204,45 @@ impl Core {
             .https_only(!base.starts_with("http://"))
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http, base, token: token.clone(), session: Default::default() })
+        Ok(Self { http, base, token: token.clone(), session: Default::default(), restore: Default::default() })
+    }
+
+    /// The same client, keeping its head in `path` (lifecycle phase 8).
+    fn with_restore_head(mut self, path: std::path::PathBuf) -> Self {
+        self.restore = crate::restore::load(path);
+        self
     }
 
     /// The credential and, when Core minted one, the session: what every call
     /// to Core carries. A Core that minted none is sent no header, as before.
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let req = req.bearer_auth(self.token.expose());
-        match crate::session::current(&self.session) {
+        let req = match crate::session::current(&self.session) {
             Some(s) => req.header(crate::session::HEADER, s),
             None => req,
+        };
+        // A restore this agent detected and Core has not named back
+        // (lifecycle phase 8, TD11): said on every call until it is.
+        match crate::restore::to_tell(&self.restore) {
+            Some(evidence) => req.header(crate::restore::DETECTED_HEADER, evidence.replace(['\r', '\n'], " ")),
+            None => req,
         }
+    }
+
+    /// The view, with the restore Core names on it (lifecycle phase 8): the
+    /// `onv-restore` header, while Core holds this provider.
+    async fn get_view(&self, known: u64) -> anyhow::Result<(DesiredState, Option<String>)> {
+        let path = format!("/provider/v1/desired-state?known={known}");
+        let res = self
+            .authed(self.http.get(format!("{}{path}", self.base)))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            return Err(CoreAnswered { path, status: res.status().as_u16() }.into());
+        }
+        let named = res.headers().get(crate::restore::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        Ok((res.json().await?, named))
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
@@ -560,7 +591,8 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     .with_images(cfg.proxmox.image_map())
     .with_environment(cfg.environment.clone())
     .with_timings(cfg.timings.clone()));
-    let core = Core::new(&cfg.core.url, &cfg.core.token)?;
+    let core = Core::new(&cfg.core.url, &cfg.core.token)?
+        .with_restore_head(crate::restore::head_file(&cfg.proxmox.snippet_dir));
     // What every heartbeat says this agent runs, computed once: the file does
     // not change under a running agent, because a change is a restart (D34).
     let config_hash = cfg.timings.hash();
@@ -1239,7 +1271,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1264,6 +1296,7 @@ mod handshake_tests {
             base: format!("http://{}", listener.local_addr().unwrap()),
             token: "heartbeat-fixture".into(),
             session: Default::default(),
+            restore: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1344,7 +1377,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1373,7 +1406,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1396,6 +1429,95 @@ mod handshake_tests {
         let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
         assert_eq!(core_poll, Some(45), "the view's poll was not kept");
         assert_eq!(repoll(std::time::Duration::from_secs(120), core_poll), Some(std::time::Duration::from_secs(45)));
+    }
+
+    /// One pass against a Core serving `view`, with this agent's head at
+    /// `head` against a Core that holds restores. What the pass sent Core
+    /// (each request's head and body), and what it asked of Proxmox.
+    async fn a_pass_with_the_head_at(head: u64, view: serde_json::Value) -> (Vec<(String, String)>, Vec<crate::pvemock::Call>) {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = view.to_string();
+        let (base, mut rx) = session_stub(move |line, _| {
+            if line.starts_with("GET /provider/v1/desired-state") {
+                ("200 OK", body.clone())
+            } else {
+                ("204 No Content", String::new())
+            }
+        })
+        .await;
+        let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
+            ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+            ("GET", p) if p.starts_with("/cluster/resources") => (200, serde_json::json!([])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let snippets = tempfile::tempdir().unwrap();
+        let snippet_dir = snippets.path().join("snippets");
+        std::fs::create_dir_all(&snippet_dir).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippet_dir.display()
+        ))
+        .expect("config");
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string()))
+            .unwrap()
+            .with_restore_head(crate::restore::head_file(&cfg.proxmox.snippet_dir));
+        crate::restore::arm(&core.restore, &serde_json::json!({"provider_id": "p", "restore_mode": true}));
+        let mut at_head: DesiredState = serde_json::from_value(view.clone()).unwrap();
+        at_head.version = head;
+        at_head.instances.clear();
+        crate::restore::observe(&core.restore, &at_head, None, |_| false);
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        // One more call, to see what every call carries after the pass.
+        let _ = core.post("/provider/v1/heartbeat", None).await;
+        let mut sent = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            sent.push(r);
+        }
+        let calls = pve.calls.lock().unwrap().clone();
+        (sent, calls)
+    }
+
+    /// **In a restore this agent lists and acts on nothing** (lifecycle phase
+    /// 8, TD11; the model's G_restoreMode). Core's view is revision 3, and this
+    /// agent acted on revision 9: the ledger went back. The pass lists the
+    /// guests and reports them, asks Proxmox nothing but reads, reports no
+    /// machine, and says so to Core on the calls that follow. The same view
+    /// against a head it extends is converged as ever: a status per machine.
+    #[tokio::test]
+    async fn restore_mode_lists_and_acts_on_nothing() {
+        let mut view: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        view["version"] = serde_json::json!(3);
+        view["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+
+        let (sent, calls) = a_pass_with_the_head_at(9, view.clone()).await;
+        let writes: Vec<_> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
+        assert!(writes.is_empty(), "an agent in a restore asked Proxmox to change something: {writes:?}");
+        let (_, report) = sent.iter().find(|(h, _)| h.starts_with("post /provider/v1/status")).expect("a report");
+        let report: serde_json::Value = serde_json::from_str(report).unwrap();
+        assert_eq!(report["instances"], serde_json::json!([]), "a machine was acted on or reported in a restore");
+        assert_eq!(report["observation"]["complete"], serde_json::json!(false));
+        assert!(report["checks"].as_array().unwrap().iter().any(|c| c["name"] == "guests.surveyed"),
+            "the listing Core ends a restore on was not sent: {report}");
+        let (beat, _) = sent.iter().find(|(h, _)| h.starts_with("post /provider/v1/heartbeat")).expect("a heartbeat");
+        assert!(beat.contains("onv-restore-detected: core sent view revision 3, below revision 9"),
+            "the agent did not tell Core: {beat}");
+
+        let (sent, _) = a_pass_with_the_head_at(2, view).await;
+        let (_, report) = sent.iter().find(|(h, _)| h.starts_with("post /provider/v1/status")).expect("a report");
+        let report: serde_json::Value = serde_json::from_str(report).unwrap();
+        assert_eq!(report["instances"].as_array().map(Vec::len), Some(1), "a head the view extends was held: {report}");
+        assert!(!sent.iter().any(|(h, _)| h.contains("onv-restore-detected")), "a restore was reported with none");
     }
 
     /// **A disclosure is never two of Core's polls old while the agent is
@@ -1478,6 +1600,9 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
                 // The session this agent now holds its provider under, or
                 // none from a Core that mints none: then no header is sent.
                 let session = crate::session::take(&core.session, &v);
+                // Whether this Core holds restores (lifecycle phase 8): only
+                // then is this agent's own detection armed.
+                crate::restore::arm(&core.restore, &v);
                 println!(
                     "handshake ok: provider {} protocol v{} heartbeat {}s session {}",
                     v.get("provider_id").and_then(|x| x.as_str()).unwrap_or("?"),
@@ -1712,8 +1837,8 @@ async fn reconcile_workers(
 
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
 
-    let fetched: DesiredState =
-        match core.get_json(&format!("/provider/v1/desired-state?known={known}")).await {
+    let (fetched, restore_named): (DesiredState, Option<String>) =
+        match core.get_view(known).await {
             Ok(d) => d,
             Err(e) => {
                 // **Only an outage is maintained through (PROVIDER-6).** Every
@@ -1729,6 +1854,13 @@ async fn reconcile_workers(
                 // destroyed, but a machine that was meant to be running and
                 // has crashed is started again. An outage of the control plane
                 // must not become an outage of somebody's machine.
+                //
+                // Not in a restore (lifecycle phase 8, TD11): the copy in hand
+                // may be from the history the restore replaced, and a start
+                // is an act.
+                if crate::restore::active(&core.restore) {
+                    return Err(e.context("Core unreachable during a restore; nothing was maintained"));
+                }
                 let specs = crate::poison::lock(held, "held desired state")
                     .as_ref()
                     .map(|d| d.instances.clone())
@@ -1787,6 +1919,16 @@ async fn reconcile_workers(
     if !desired.images.is_empty() {
         crate::poison::lock(mirror_wanted, "image catalogue").clone_from(&desired.images);
         mirror_kick.notify_one();
+    }
+
+    // **A restore of Core's ledger, read against this agent's head**
+    // (lifecycle phase 8, TD11). A view below the revision this agent acted
+    // on, one wanting an attempt it tore down, or Core's own word: the
+    // ledger went back. The guests are listed and reported, and nothing is
+    // destroyed, started, created or recovered until Core ends it.
+    let torn = |id: &str| crate::teardown::built_again(&cfg.proxmox.snippet_dir, id).is_some();
+    if crate::restore::observe(&core.restore, &desired, restore_named.as_deref(), torn) {
+        return report_restoring(core, driver, cfg, &desired).await;
     }
 
     // **The journal, settled on every pass** (26 September 2026). This ran at
@@ -2190,6 +2332,49 @@ async fn reconcile_workers(
     Ok(())
 }
 
+/// **A pass in restore mode** (lifecycle phase 8, TD11): the guests listed
+/// and reported, and nothing else. What Core reads to end the restore is
+/// this listing — `guests.surveyed`, and a `guest.unclaimed` for each
+/// claimed guest its ledger does not name — so it goes every pass. No item
+/// is reported: nothing was acted on, and the observation says it is
+/// incomplete, so Core reads nothing into what it lacks.
+async fn report_restoring(
+    core: &Core,
+    driver: &proxmox::Client,
+    cfg: &AgentConfig,
+    desired: &DesiredState,
+) -> anyhow::Result<()> {
+    let surveyed = driver.guests().await.map_err(|e| e.to_string());
+    let mut checks = crate::survey::checks(surveyed.as_deref().map_err(|e| e.clone()), desired);
+    checks.extend(runtime_checks(cfg, driver).await);
+    let observation = omnuv_protocol::Observation {
+        generation: *GENERATION,
+        sequence: SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        collected_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        scope: vec!["desired_instances".into(), "desired_workers".into()],
+        complete: false,
+        incomplete_because: vec!["restore mode: this agent listed its guests and acted on nothing".into()],
+        desired_revision: Some(desired.version),
+    };
+    let report = StatusReport {
+        protocol_version: omnuv_protocol::PROTOCOL_VERSION,
+        audit: audit::drain(100),
+        workers: Vec::new(),
+        instances: Vec::new(),
+        checks,
+        observation: Some(observation),
+    };
+    let res = core.post("/provider/v1/status", Some(serde_json::to_value(&report)?)).await?;
+    if !res.status().is_success() {
+        anyhow::bail!("core rejected status report: {}", res.status());
+    }
+    println!("restore mode: guests listed and reported; nothing acted on");
+    Ok(())
+}
+
 /// **Lets go of the provider on the way out**: the session this agent holds,
 /// released, so the next agent's handshake is let in at once. Best-effort —
 /// an agent that cannot say so is waited out — and nothing when no session
@@ -2247,7 +2432,14 @@ async fn still_wanted(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: 
 /// is never acted on (G_viewMonotone).
 async fn intent_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<Option<Lifecycle>> {
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
-    let fetched: DesiredState = core.get_json(&format!("/provider/v1/desired-state?known={known}")).await?;
+    let (fetched, named) = core.get_view(known).await?;
+    // **No act in a restore** (lifecycle phase 8, TD11): one that began
+    // between the pass's read and this one is caught here. Tombstones are
+    // the pass's to read; a view below the head is caught by either.
+    if crate::restore::observe(&core.restore, &fetched, named.as_deref(), |_| false) {
+        eprintln!("the view read again before an act names a restore; nothing is done on it");
+        return Ok(None);
+    }
     let view = if fetched.unchanged {
         match crate::poison::lock(held, "held desired state").clone() {
             Some(d) => d,

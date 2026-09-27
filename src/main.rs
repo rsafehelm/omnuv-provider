@@ -23,6 +23,7 @@ mod survey;
 mod workload;
 mod poison;
 mod session;
+mod restore;
 mod teardown;
 mod dur;
 mod timings;
