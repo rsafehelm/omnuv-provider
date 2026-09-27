@@ -352,6 +352,9 @@ impl Client {
     /// signature that accepts a node it will not use is a lie the next caller
     /// believes. Where a worker goes is the provider's own local placement,
     /// which CLAUDE.md puts behind the driver on purpose.
+    /// Ungated: every start goes ahead. For tests about everything but the
+    /// re-read; the agent calls the gated form.
+    #[cfg(test)]
     pub async fn ensure_inference_worker(
         &self,
         template_vmid: u32,
@@ -359,6 +362,22 @@ impl Client {
         snippet_dir: &str,
         spec: &InferenceWorkerSpec,
         core_url: &str,
+    ) -> anyhow::Result<WorkerStatus> {
+        self.ensure_inference_worker_gated(template_vmid, storage, snippet_dir, spec, core_url, std::future::ready(Ok(true)))
+            .await
+    }
+
+    /// `ensure_inference_worker`, with Core's view read again just before a
+    /// worker already built is started, for the reason and in the way
+    /// `ensure_instance_gated` gives. Anything but `Ok(true)` starts nothing.
+    pub async fn ensure_inference_worker_gated(
+        &self,
+        template_vmid: u32,
+        storage: &str,
+        snippet_dir: &str,
+        spec: &InferenceWorkerSpec,
+        core_url: &str,
+        start_gate: impl std::future::Future<Output = anyhow::Result<bool>>,
     ) -> anyhow::Result<WorkerStatus> {
         // **Cluster-wide, and under the allocation gate — the same two rules as
         // `ensure_instance`.** This path attaches a card too (`hostpci` below)
@@ -407,8 +426,14 @@ impl Client {
             // running when Core wants it running must be started on this pass,
             // otherwise a failed first boot leaves it stopped forever.
             if !running && spec.intent == Lifecycle::Running {
-                self.start_when_ready(node, vm.vmid).await?;
-                running = true;
+                match start_gate.await {
+                    Ok(true) => {
+                        self.start_when_ready(node, vm.vmid).await?;
+                        running = true;
+                    }
+                    Ok(false) => eprintln!("worker {}: Core's view, read again before the start, no longer wants it running; not started", spec.id),
+                    Err(e) => eprintln!("worker {}: Core's view could not be read again before the start, so it is not started: {e:#}", spec.id),
+                }
             }
             if running && spec.intent == Lifecycle::Stopped {
                 let upid: String = self

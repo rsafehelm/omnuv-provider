@@ -639,6 +639,9 @@ impl Client {
         Ok(())
     }
 
+    /// Ungated: every start goes ahead. For tests about everything but the
+    /// re-read; the agent calls the gated form.
+    #[cfg(test)]
     pub async fn ensure_instance(
         &self,
         node: &str,
@@ -646,6 +649,28 @@ impl Client {
         storage: &str,
         snippet_dir: &str,
         spec: &InstanceSpec,
+    ) -> anyhow::Result<InstanceStatus> {
+        self.ensure_instance_gated(node, template_vmid, storage, snippet_dir, spec, std::future::ready(Ok(true))).await
+    }
+
+    /// `ensure_instance`, with **Core's view read again just before a
+    /// machine already built is started** (the phase 7 follow-up: G_reread
+    /// for a start, as the build and the destroy already have it). A pass
+    /// acts on the view it fetched at its start, so a start late in a pass
+    /// acted on a view up to a pass old: the buyer may have stopped or
+    /// deleted the machine since. `start_gate` is that re-read, awaited only
+    /// when a start is about to be asked for; anything but `Ok(true)` starts
+    /// nothing, and the machine is reported as it was seen, stopped, with
+    /// what it waits for. A machine this call has just cloned is started on
+    /// the re-read its build already had.
+    pub async fn ensure_instance_gated(
+        &self,
+        node: &str,
+        template_vmid: u32,
+        storage: &str,
+        snippet_dir: &str,
+        spec: &InstanceSpec,
+        start_gate: impl std::future::Future<Output = anyhow::Result<bool>>,
     ) -> anyhow::Result<InstanceStatus> {
         // **The segment, before either branch.** Both of them attach a NIC to
         // it: the create path writes `net1` into the clone's configuration, and
@@ -757,19 +782,30 @@ impl Client {
                 // reporting what is there.
                 let mut held: Option<String> = None;
                 match spec.intent {
-                    // Through the gate: its inputs first, then the start.
-                    Lifecycle::Running if !running => match self.start_when_ready(node, vm.vmid).await {
-                        Ok(()) => {
-                            audit::record("instance.start", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
-                            running = true;
-                        }
-                        Err(e) => match e.downcast_ref::<crate::proxmox::NotReady>() {
-                            Some(blocked) => {
-                                audit::record("instance.start", "core", &spec.id, "waiting", Some(&blocked.to_string()));
-                                held = Some(blocked.0.join("; "));
+                    // Through two gates: Core's view read again, then the
+                    // machine's inputs, then the start.
+                    Lifecycle::Running if !running => match start_gate.await {
+                        Ok(true) => match self.start_when_ready(node, vm.vmid).await {
+                            Ok(()) => {
+                                audit::record("instance.start", "core", &spec.id, "ok", Some(&vm.vmid.to_string()));
+                                running = true;
                             }
-                            None => return Err(e),
+                            Err(e) => match e.downcast_ref::<crate::proxmox::NotReady>() {
+                                Some(blocked) => {
+                                    audit::record("instance.start", "core", &spec.id, "waiting", Some(&blocked.to_string()));
+                                    held = Some(blocked.0.join("; "));
+                                }
+                                None => return Err(e),
+                            },
                         },
+                        Ok(false) => {
+                            audit::record("instance.start", "core", &spec.id, "withheld", Some("the view read again no longer wants it running"));
+                            held = Some("Core's view, read again before the start, no longer wants it running".into());
+                        }
+                        Err(e) => {
+                            audit::record("instance.start", "core", &spec.id, "withheld", Some(&format!("{e:#}")));
+                            held = Some(format!("Core's view to be read again before the start: {e:#}"));
+                        }
                     },
                     Lifecycle::Stopped if running => {
                         let upid: String = self
