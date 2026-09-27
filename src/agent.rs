@@ -584,11 +584,10 @@ async fn core_check(core: &Core, url: &str, config_hash: &str) -> String {
     }
 }
 
-pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
-    // Shared with the image mirror's own task, which outlives no call here
-    // but does outlive every reconcile pass.
-    let cfg = Arc::new(cfg);
-    let driver = Arc::new(proxmox::Client::new(
+/// The hypervisor client a configuration describes: the agent's, and the
+/// host timer's (`run-lease-expire`), built the same way from the same files.
+pub fn driver_of(cfg: &AgentConfig) -> anyhow::Result<proxmox::Client> {
+    Ok(proxmox::Client::new(
         &cfg.proxmox.api_url,
         cfg.proxmox.tls_fingerprint_sha256.as_deref(),
         &cfg.proxmox.token_id,
@@ -606,12 +605,28 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     )?
     .with_images(cfg.proxmox.image_map())
     .with_environment(cfg.environment.clone())
-    .with_timings(cfg.timings.clone()));
+    .with_timings(cfg.timings.clone()))
+}
+
+pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
+    // Shared with the image mirror's own task, which outlives no call here
+    // but does outlive every reconcile pass.
+    let cfg = Arc::new(cfg);
+    let driver = Arc::new(driver_of(&cfg)?);
     let core = Core::new(&cfg.core.url, &cfg.core.token)?
         .with_restore_head(crate::restore::head_file(&cfg.proxmox.snippet_dir));
     // What every heartbeat says this agent runs, computed once: the file does
     // not change under a running agent, because a change is a restart (D34).
     let config_hash = cfg.timings.hash();
+
+    // **The run lease's own task** (lifecycle phase 12, A9): beside the
+    // reconcile loop, because it must act exactly when Core is unreachable,
+    // and so before the handshake, which waits for Core as long as it takes.
+    // It came after it until 27 September 2026: an agent restarted during a
+    // partition held its machines' leases in nobody's hands. It resumes the
+    // leases its predecessor wrote, and takes the lock the host timer
+    // defers to.
+    crate::lease::spawn(core.lease.clone(), driver.clone(), crate::lease::file(&cfg.proxmox.snippet_dir));
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
     // without Core ever learning this provider's addressing.
@@ -634,10 +649,6 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 
     let heartbeat_secs = handshake(&core, &driver).await?;
-
-    // **The run lease's own task** (lifecycle phase 12, A9): beside the
-    // reconcile loop, because it must act exactly when Core is unreachable.
-    crate::lease::spawn(core.lease.clone(), driver.clone(), crate::lease::file(&cfg.proxmox.snippet_dir));
 
     // Woken by Core over the tunnel; the poll below is the safety net for when
     // no tunnel is up, so a push is never a correctness dependency.

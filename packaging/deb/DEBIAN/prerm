@@ -3,6 +3,11 @@ set -e
 case "$1" in
   remove|deconfigure)
     if [ -d /run/systemd/system ]; then
+        # The host timer first: with the agent stopped and the timer still
+        # armed, it would take over the leases a minute later, in the middle
+        # of a removal.
+        systemctl stop onv-lease-expire.timer onv-lease-expire.service || true
+        systemctl disable onv-lease-expire.timer >/dev/null 2>&1 || true
         systemctl stop onv-provider.service || true
         systemctl disable onv-provider.service >/dev/null 2>&1 || true
     fi

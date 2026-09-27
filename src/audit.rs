@@ -75,6 +75,15 @@ struct Record<'a> {
 }
 
 pub fn init(path: Option<&str>) {
+    if let Some(path) = open(path) {
+        record("audit.start", "agent", &path, "ok", None);
+    }
+}
+
+/// `init` without its `audit.start` record: for the host timer, which runs
+/// every minute and opens the log only when it has something to say. The
+/// path opened, or `None` (said on stderr) when it could not be.
+pub fn open(path: Option<&str>) -> Option<String> {
     let path = path.unwrap_or(DEFAULT_PATH);
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -82,13 +91,14 @@ pub fn init(path: Option<&str>) {
     match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => {
             *crate::poison::lock(&SINK, "audit file") = Some(f);
-            record("audit.start", "agent", path, "ok", None);
+            Some(path.to_string())
         }
         Err(e) => {
             // Not fatal: the journal still receives every event. But say so
             // loudly, because a provider who cannot read the file would
             // otherwise assume it exists.
             eprintln!("warning: cannot open audit log at {path}: {e}. Events go to the journal only.");
+            None
         }
     }
 }
@@ -105,8 +115,11 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
     // The journal copy means the record survives even if the file is missing.
     println!("audit {line}");
 
+    // One write per record, newline included: the host timer appends to the
+    // same file from its own process, and `writeln!` is two writes, between
+    // which another process's line could land.
     if let Some(f) = crate::poison::lock(&SINK, "audit file").as_mut() {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(format!("{line}\n").as_bytes());
         let _ = f.flush();
     }
 

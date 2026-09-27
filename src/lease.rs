@@ -25,10 +25,18 @@
 //! the new copy anywhere: 2T covers this host's clock running at half speed,
 //! the pass covers this task's period and the stop's own time.
 //!
-//! An agent that is dead stops nothing. The file this task writes
-//! (`run-lease.json`, each leased machine's wall-clock deadline) is for a
-//! host timer that does; the timer is not built yet (the plan's "Not in this
-//! phase"), so restart elsewhere must stay off where agents may die.
+//! An agent that is dead stops nothing, so the file this task writes
+//! (`run-lease.json`, each leased machine's wall-clock deadline) is read by
+//! the **host timer** (`hosttimer.rs`, `onv-lease-expire.timer`), which stops
+//! them when this task is not running. The two never act at once: this task
+//! holds `run-lease.lock` for as long as it runs, and the timer acts only
+//! when it can take that lock itself (the kernel frees it the moment this
+//! process, or this task, is gone).
+//!
+//! **The file outlives the process.** A restarted agent resumes the leases
+//! its predecessor wrote before it hears Core again, and this task starts
+//! before the handshake, not after it: a restart during a partition is
+//! exactly when Core cannot renew or release anything.
 
 use crate::proxmox::Client;
 use std::collections::HashMap;
@@ -163,20 +171,99 @@ pub fn file_body(book: &Shared) -> serde_json::Value {
     })
 }
 
+/// One lease as the file holds it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct Written {
+    pub id: String,
+    pub until_unix: u64,
+}
+
+/// **The file read strictly**, by the agent at start and by the host timer:
+/// empty (nothing written, or only whitespace) is no lease; otherwise it is
+/// `{"leases": [{"id", "until_unix"}, …]}` with every id non-empty, or it is
+/// refused whole and nothing in it is acted on.
+pub fn read_body(body: &str) -> Result<Vec<Written>, String> {
+    #[derive(serde::Deserialize)]
+    struct File {
+        leases: Vec<Written>,
+    }
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let f: File = serde_json::from_str(body).map_err(|e| format!("not a run-lease file: {e}"))?;
+    if let Some(n) = f.leases.iter().position(|l| l.id.trim().is_empty()) {
+        return Err(format!("lease {n} names no machine"));
+    }
+    Ok(f.leases)
+}
+
+/// **A restarted agent resumes its predecessor's leases**: each deadline in
+/// the file, mapped from the wall clock onto this process's monotonic one (one
+/// already past is past now), unless the book already holds a later one. An
+/// expired lease resumed here is never restarted by maintenance and is stopped
+/// by the first pass, as it would have been. Returns how many were resumed.
+pub fn resume(book: &Shared, file: &std::path::Path) -> usize {
+    let body = match std::fs::read_to_string(file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            eprintln!("run lease: {} could not be read, so no lease is resumed: {e}", file.display());
+            return 0;
+        }
+    };
+    let leases = match read_body(&body) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("run lease: {} refused, so no lease is resumed: {e}", file.display());
+            return 0;
+        }
+    };
+    let (now, wall) = (Instant::now(), SystemTime::now());
+    let mut b = crate::poison::lock(book, "run lease");
+    let mut n = 0;
+    for l in leases {
+        let until = SystemTime::UNIX_EPOCH + Duration::from_secs(l.until_unix);
+        let deadline = now + until.duration_since(wall).unwrap_or(Duration::ZERO);
+        if b.leases.get(&l.id).is_some_and(|held| held.deadline >= deadline) {
+            continue;
+        }
+        b.leases.insert(l.id, Lease { deadline, wall: until, stopped: false });
+        n += 1;
+    }
+    n
+}
+
+/// What one stop of a leased machine did, guest by guest, for whoever logs it.
+#[derive(Debug, Default)]
+pub(crate) struct Stops {
+    /// `vm <vmid> on <node>`, stopped by this call.
+    pub stopped: Vec<String>,
+    /// Guests carrying the claim that were left, and why: another stamp.
+    pub refused: Vec<String>,
+}
+
 impl Client {
     /// **A leased machine stopped**: every guest carrying its claim tag and
     /// its whole stamp, stopped when its node says it is not. A guest with
-    /// the tag and another stamp is left alone and said. Returns how many
-    /// were stopped.
-    pub(crate) async fn stop_leased(&self, id: &str) -> anyhow::Result<usize> {
+    /// the tag and another stamp is left alone and said. What was done is in
+    /// `out` even when a later guest fails; an error ends the call there, and
+    /// the caller tries the whole machine again on its next pass.
+    ///
+    /// The power state is the node's live one (`status/current`), never the
+    /// cluster listing's, which lags. Stop only: nothing here destroys.
+    pub(crate) async fn stop_leased(&self, id: &str, out: &mut Stops) -> anyhow::Result<()> {
         let tag = crate::names::TAG_INSTANCE;
-        let mut n = 0;
         for g in self.claimed_guests(tag, id).await? {
             let config: serde_json::Value =
                 self.get_json(&format!("/nodes/{}/qemu/{}/config", g.node, g.vm.vmid)).await?;
             let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
             if first != Some(crate::names::stamped(tag, id).as_str()) {
-                eprintln!("run lease: vm {} on {} carries {id}'s tag but not its stamp; not stopped", g.vm.vmid, g.node);
+                out.refused.push(format!(
+                    "vm {} on {} carries {id}'s tag but not its stamp (its first line reads {:?}); not stopped",
+                    g.vm.vmid,
+                    g.node,
+                    first.unwrap_or("")
+                ));
                 continue;
             }
             if self.live_status(&g.node, g.vm.vmid).await? == "stopped" {
@@ -186,19 +273,26 @@ impl Client {
                 .post_form(&format!("/nodes/{}/qemu/{}/status/stop", g.node, g.vm.vmid), &[] as &[(String, String)])
                 .await?;
             self.wait_task(&g.node, &upid).await?;
-            n += 1;
+            out.stopped.push(format!("vm {} on {}", g.vm.vmid, g.node));
         }
-        Ok(n)
+        Ok(())
     }
 }
 
 /// One look: every expired lease's machine stopped, and the file written.
 pub async fn check(book: &Shared, driver: &Client, file: &std::path::Path) {
     for id in expired(book, Instant::now()) {
-        match driver.stop_leased(&id).await {
-            Ok(n) => {
+        let mut out = Stops::default();
+        let result = driver.stop_leased(&id, &mut out).await;
+        for r in &out.refused {
+            crate::audit::record("instance.lease", "agent", &id, "refused", Some(r));
+            eprintln!("run lease: {r}");
+        }
+        match result {
+            Ok(()) => {
                 stopped(book, &id);
-                crate::audit::record("instance.lease", "agent", &id, "stopped", Some(&n.to_string()));
+                let n = out.stopped.len().to_string();
+                crate::audit::record("instance.lease", "agent", &id, "stopped", Some(&n));
                 println!("run lease: {id} ran past its lease without a view from Core; stopped ({n})");
             }
             Err(e) => eprintln!("run lease: {id} past its lease was not stopped: {e:#}"),
@@ -211,11 +305,70 @@ pub async fn check(book: &Shared, driver: &Client, file: &std::path::Path) {
     }
 }
 
+/// How often the lease task looks, and so writes the file. The host timer's
+/// staleness bound is derived from it (`hosttimer::STALE_AFTER`).
+pub const WRITE_EVERY: Duration = Duration::from_secs(30);
+
+/// The lock that says the lease task is running, beside the file.
+pub fn lock_file(file: &std::path::Path) -> std::path::PathBuf {
+    file.with_extension("lock")
+}
+
+/// Opens the lock file, creating it, never truncating anything.
+pub fn open_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+}
+
+/// **The lease lock, held for as long as the task runs.** Waited for while
+/// the host timer holds it (it is stopping machines; this task goes on after
+/// it), and owned by the task, so a panic here frees it as surely as the
+/// process ending does. `None` when it cannot be opened or locked: the task
+/// runs anyway, and the timer's second test, a file written within
+/// `hosttimer::STALE_AFTER`, is what keeps it from acting meanwhile.
+pub(crate) async fn take_lock(file: &std::path::Path) -> Option<std::fs::File> {
+    let path = lock_file(file);
+    let f = match open_lock(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("run lease: {} could not be opened ({e}); the lease task runs without it", path.display());
+            return None;
+        }
+    };
+    match f.try_lock() {
+        Ok(()) => return Some(f),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            println!("run lease: the host timer holds {}; waiting for its pass to end", path.display());
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            eprintln!("run lease: {} could not be locked ({e}); the lease task runs without it", path.display());
+            return None;
+        }
+    }
+    match tokio::task::spawn_blocking(move || f.lock().map(|()| f)).await {
+        Ok(Ok(f)) => Some(f),
+        Ok(Err(e)) => {
+            eprintln!("run lease: {} could not be locked ({e}); the lease task runs without it", path.display());
+            None
+        }
+        Err(e) => {
+            eprintln!("run lease: waiting for {} failed ({e}); the lease task runs without it", path.display());
+            None
+        }
+    }
+}
+
 /// The lease task: beside the reconcile loop, never inside it, because it
-/// must run exactly when Core cannot be reached. Every 30 s.
+/// must run exactly when Core cannot be reached. Every [`WRITE_EVERY`]. The
+/// file's leases are resumed before this returns, so the first view renews
+/// or releases them rather than racing their resumption.
 pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf) {
+    let n = resume(&book, &file);
+    if n > 0 {
+        println!("run lease: {n} lease(s) resumed from {}", file.display());
+    }
     tokio::spawn(async move {
-        let mut every = tokio::time::interval(Duration::from_secs(30));
+        let _held = take_lock(&file).await;
+        let mut every = tokio::time::interval(WRITE_EVERY);
         loop {
             every.tick().await;
             check(&book, &driver, &file).await;
@@ -323,6 +476,67 @@ mod tests {
         renew(&b, &view(&[("m1", Lifecycle::Running)]));
         assert!(may_restart(&b, "m1", t0.at + Duration::from_secs(59)));
         assert!(!may_restart(&b, "m1", t0.at + Duration::from_secs(61)));
+    }
+
+    /// **A restarted agent resumes the leases its predecessor wrote**, before
+    /// it hears Core: one already past is past now and never restarted, one
+    /// still running keeps its deadline, and the file is written back as it
+    /// was read rather than emptied. It started with an empty book until 27
+    /// September 2026, and its first pass wrote `{"leases": []}` over the
+    /// only record of what had to stop.
+    #[test]
+    fn a_restarted_agent_resumes_the_leases_in_its_file() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("run-lease.json");
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let body = serde_json::json!({"leases": [
+            {"id": "gone", "until_unix": now - 60},
+            {"id": "later", "until_unix": now + 600},
+        ]});
+        std::fs::write(&file, body.to_string()).unwrap();
+        let b = book();
+        assert_eq!(resume(&b, &file), 2);
+        let t = Instant::now();
+        assert_eq!(expired(&b, t), ["gone"], "the expired lease was not resumed as expired");
+        assert!(!may_restart(&b, "gone", t), "maintenance may restart a machine past its lease");
+        assert!(may_restart(&b, "later", t));
+        assert_eq!(expired(&b, t + Duration::from_secs(601)), ["gone", "later"]);
+        assert_eq!(file_body(&b), body, "the file was not written back as it was read");
+        // A file that does not read resumes nothing, and neither does none.
+        std::fs::write(&file, "{\"leases\": [").unwrap();
+        assert_eq!(resume(&book(), &file), 0);
+        assert_eq!(resume(&book(), &dir.path().join("absent.json")), 0);
+    }
+
+    /// **The lease task holds the lock the host timer defers to**, from its
+    /// start, and writes the file on its first pass.
+    #[tokio::test]
+    async fn the_lease_task_holds_the_lock_the_host_timer_defers_to() {
+        let mock = crate::pvemock::Mock::start(|_, _, _| (404, serde_json::Value::Null)).await;
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("run-lease.json");
+        spawn(book(), Arc::new(mock.client()), file.clone());
+        let probe = open_lock(&lock_file(&file)).unwrap();
+        let mut held = false;
+        for _ in 0..250 {
+            match probe.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    held = true;
+                    break;
+                }
+                Ok(()) => probe.unlock().unwrap(),
+                Err(std::fs::TryLockError::Error(e)) => panic!("the lock could not be tried: {e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(held, "the lease task did not take the lock within 5 s");
+        for _ in 0..250 {
+            if file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(read_body(&std::fs::read_to_string(&file).unwrap()), Ok(vec![]));
     }
 
     /// **A leased machine is stopped once its view is older than T** — the

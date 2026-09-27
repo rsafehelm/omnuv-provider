@@ -1,0 +1,17 @@
+[Unit]
+Description=Omnuv host timer: every minute, stop machines past their run lease while the agent is not running
+Documentation=https://github.com/rsafehelm/omnuv-provider
+
+[Timer]
+# Every minute, to the second: omnuv's lifecycle.run_lease_pass (120 s) is
+# budgeted on "the host timer every 60 s", and hosttimer.rs derives its 45 s
+# staleness bound from the same period. AccuracySec defaults to a minute,
+# which would double it.
+OnCalendar=minutely
+AccuracySec=1s
+# A missed run is not caught up: the next is a minute away and asks afresh.
+Persistent=false
+Unit=onv-lease-expire.service
+
+[Install]
+WantedBy=timers.target

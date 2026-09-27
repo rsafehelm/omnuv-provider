@@ -86,6 +86,23 @@ grep -q ' ./lib/systemd/system/onv-provider.service$' <<< "$listing"
 for s in postinst prerm postrm; do dpkg-deb -I "$deb" "$s" > /dev/null; done
 test "$(dpkg-deb -f "$deb" Version)" = "$(cat "$out/onv-provider_current.version")"
 
+# The host timer (lifecycle phase 12). The packaged binary is run, not only
+# listed: against a configuration that is not there it must refuse (exit 1,
+# not the 2 of an unknown command), say so in its own file and in the audit
+# log as `host-timer`, and touch nothing else.
+step "The package holds the host timer, its postinst enables it, and the packaged binary runs it"
+grep -q ' ./lib/systemd/system/onv-lease-expire.service$' <<< "$listing"
+grep -q ' ./lib/systemd/system/onv-lease-expire.timer$' <<< "$listing"
+postinst="$(dpkg-deb -I "$deb" postinst)"
+grep -q '^ *systemctl enable --now onv-lease-expire.timer' <<< "$postinst"
+dpkg-deb -x "$deb" "$out/root"
+rc=0
+OMNUV_LEASE_TIMER_LOG="$out/timer.log" OMNUV_AUDIT_LOG="$out/audit.log" \
+    "$out/root/usr/bin/onv-provider" run-lease-expire --config "$out/absent.yaml" > "$out/timer.out" 2>&1 || rc=$?
+test "$rc" -eq 1
+grep -q 'refused' "$out/timer.log"
+grep -q '"actor":"host-timer"' "$out/audit.log"
+
 step "The Workload Agent is built, static, and starts"
 kind="$(file "$out/workloadd/onv-workloadd")"
 grep -q 'static' <<< "$kind"

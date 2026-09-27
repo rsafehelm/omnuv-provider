@@ -1,0 +1,38 @@
+[Unit]
+Description=Omnuv host timer: stop machines past their run lease while the agent is not running
+Documentation=https://github.com/rsafehelm/omnuv-provider
+# Lifecycle phase 12. The agent stops a machine whose run lease ran out; this
+# does it when the agent cannot: `run-lease-expire` acts only when it can take
+# the lock the agent's lease task holds for as long as it runs, and only on a
+# run-lease.json older than 45 s, so the two never act at once. It stops, and
+# nothing else. Started by onv-lease-expire.timer, never enabled on its own.
+After=network-online.target pve-guests.service
+Wants=network-online.target
+# Nothing is leased, and no credential exists, until `join` has written a
+# configuration. A condition that fails is a skipped run, not a failed one.
+ConditionPathExists=/etc/onv/agent.yaml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/onv-provider run-lease-expire --config /etc/onv/agent.yaml
+User=onv
+Group=onv
+# ceiling: one stop task is waited for up to 10 minutes by the client itself
+# (proxmox.rs wait_task); past this the run is killed, its lock goes with it,
+# and the next minute's run tries again. Unmeasured: a stop takes seconds.
+TimeoutStartSec=15min
+
+# The agent's own confinement: a hypervisor API on this host, its state
+# directory for the lease file and its lock, and the log directory for its
+# own log and the audit log.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/onv /var/log/onv
+UMask=0027
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

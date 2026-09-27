@@ -25,6 +25,7 @@ mod poison;
 mod session;
 mod restore;
 mod lease;
+mod hosttimer;
 mod teardown;
 mod dur;
 mod timings;
@@ -40,6 +41,7 @@ USAGE:
     onv-provider leave [--dry-run] [--without-core] [--config PATH]
     onv-provider agent [--config /etc/onv/agent.yaml] [--secrets PATH]
     onv-provider check-config [--config /etc/onv/agent.yaml] [--secrets PATH]
+    onv-provider run-lease-expire [--config /etc/onv/agent.yaml] [--secrets PATH] [--dry-run]
     onv-provider print-config
     onv-provider discover --provider <id> [--config <path>]
 
@@ -49,6 +51,12 @@ CONFIGURATION:
     would, prints the hash of the timings in force on stdout and the whole
     configuration, credentials redacted, on stderr; it exits 2 on a file that
     does not pass, naming the key. `print-config` prints the default timings.
+
+    `run-lease-expire` is the host timer (onv-lease-expire.timer, every
+    minute): when the agent's lease task is not running, it stops each machine
+    in run-lease.json past its run lease, and only stops. `--dry-run` says
+    what it would stop. It exits 0 when nothing is wrong, 1 when something was
+    not done, and 2 when the file was refused.
 
 JOIN OPTIONS:
     --region <name>       marketplace region                 (default eu-west)
@@ -176,6 +184,14 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         }
+    }
+
+    // **The host timer** (lifecycle phase 12): a separate, minimal entry
+    // point, run by onv-lease-expire.timer. No Core, no tunnel, no reconcile:
+    // the lease file, its lock, and a stop.
+    if command == "run-lease-expire" {
+        let dry_run = std::env::args().any(|a| a == "--dry-run");
+        std::process::exit(hosttimer::main(&path, &secrets, dry_run).await);
     }
 
     if command == "agent" {

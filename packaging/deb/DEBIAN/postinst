@@ -58,6 +58,13 @@ case "$1" in
             echo "    sudo onv-provider join --core <https://your-core> --token <your enrolment token>"
             echo
         fi
+        # **The host timer** (lifecycle phase 12): every minute, it stops each
+        # machine past its run lease while the agent's lease task is not
+        # running. Enabled and started after the agent's restart above, so
+        # its first run meets the agent this package installed, which holds
+        # the lease lock, and never the one it replaced. Before `join` its
+        # service's ConditionPathExists skips each run.
+        systemctl enable --now onv-lease-expire.timer >/dev/null 2>&1 || true
     fi
     ;;
 esac
