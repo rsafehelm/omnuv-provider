@@ -162,23 +162,19 @@ pub fn observe(
         return false;
     }
     let before = st.head.clone();
-    match (named, &mut st.head.mode) {
-        (Some(id), Some(m)) => m.core = Some(id.to_string()),
-        (Some(id), None) => {
-            st.head.mode = Some(Mode { evidence: format!("Core holds this provider in restore {id}"), core: Some(id.to_string()) });
+    // Core named a restore before and names none now: a person ended it. The
+    // head is re-based on what Core sends from here on.
+    let ended = named.is_none() && matches!(&st.head.mode, Some(m) if m.core.is_some());
+    if ended {
+        let was = st.head.mode.take().and_then(|m| m.core).unwrap_or_default();
+        println!("restore {was} ended by Core; this agent acts again");
+        if !view.unchanged {
+            st.head.revision = view.version;
         }
-        // Core named a restore before and names none now: a person ended it.
-        // The head is re-based on what Core sends from here on.
-        (None, Some(m)) if m.core.is_some() => {
-            println!("restore {} ended by Core; this agent acts again", m.core.as_deref().unwrap_or("?"));
-            st.head.mode = None;
-            if !view.unchanged {
-                st.head.revision = view.version;
-            }
-        }
-        _ => {}
     }
-    if st.head.mode.is_none() && !view.unchanged {
+    // This agent's own reading first, so what it saw is said even when Core
+    // names the restore in the same answer.
+    if !ended && st.head.mode.is_none() && !view.unchanged {
         let wanted_again = view
             .instances
             .iter()
@@ -210,6 +206,17 @@ pub fn observe(
         }
         if let Some(m) = &st.head.mode {
             eprintln!("RESTORE DETECTED: {}; this agent lists and acts on nothing until Core ends it", m.evidence);
+        }
+    }
+    // Core's word: the restore that holds this provider.
+    if let Some(id) = named {
+        match &mut st.head.mode {
+            Some(m) => m.core = Some(id.to_string()),
+            None => {
+                eprintln!("Core holds this provider in restore {id}; this agent lists and acts on nothing until it ends");
+                st.head.mode =
+                    Some(Mode { evidence: format!("Core holds this provider in restore {id}"), core: Some(id.to_string()) });
+            }
         }
     }
     if st.head != before {
