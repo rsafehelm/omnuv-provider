@@ -631,9 +631,7 @@ mod tests {
             h
         };
         for (why, host) in [
-            ("the VM listing failed", blinded("/nodes/Titan/qemu")),
             ("one VM's configuration failed", blinded("/nodes/Titan/qemu/101/config")),
-            ("the container listing failed", blinded("/nodes/Titan/lxc")),
             ("one container's configuration failed", blinded("/nodes/Titan/lxc/200/config")),
             ("a running guest's memory was not listed", {
                 let mut h = with_container();
@@ -648,5 +646,42 @@ mod tests {
 
         let n = report(blinded("/cluster/mapping/pci"), &titan_contributes()).await;
         assert!(n.committed.is_some(), "the PCI mappings are the cards' business, not the guests'");
+    }
+
+    /// **D35: a host that does not answer a listing reports nothing at all.**
+    /// Its storage, its devices, its guests or its containers unlisted is the
+    /// host not answering — a wedged pvestatd, a hung API — and Core judges a
+    /// provider's silence by its reports, so the survey is incomplete and no
+    /// report is made; a node reported with no disk, no cards or no
+    /// disclosure would read as alive. Until 27 September 2026 the guest and
+    /// container listings disclosed nothing and reported the node, and the
+    /// storage and device listings reported it as having none.
+    ///
+    /// The control is the host whose every listing answered, above and here.
+    #[tokio::test]
+    async fn a_host_that_does_not_answer_a_listing_reports_nothing() {
+        let with_container = || {
+            let mut h = titan();
+            h.containers = vec![guest(200, true, 4, 4, &[("rootfs", "zfs-fast:subvol-200-disk-0,size=8G")])];
+            h
+        };
+        let contributes = titan_contributes();
+        let mock = crate::pvemock::Mock::start(with_container().route()).await;
+        mock.client().discover(Some("Titan"), &contributes).await.expect("the control: every listing answered");
+
+        for (path, what) in [
+            ("/nodes/Titan/storage", "the storage listing of Titan"),
+            ("/nodes/Titan/hardware/pci", "the device listing of Titan"),
+            ("/nodes/Titan/qemu", "the guest listing of Titan"),
+            ("/nodes/Titan/lxc", "the container listing of Titan"),
+        ] {
+            let mut host = with_container();
+            host.broken.insert(path);
+            let mock = crate::pvemock::Mock::start(host.route()).await;
+            let refused = mock.client().discover(Some("Titan"), &contributes).await
+                .expect_err(&format!("{path} did not answer, and the survey was reported"));
+            let said = format!("{refused:#}");
+            assert!(said.contains("survey is incomplete") && said.contains(what), "{path}: {said}");
+        }
     }
 }

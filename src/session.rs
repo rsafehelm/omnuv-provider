@@ -44,9 +44,19 @@ pub const HEADER: &str = "onv-session";
 /// worker-lost    this agent reads a worker's `built`, never builds one sent
 ///                built, and says one it holds nothing of is lost (`worker`,
 ///                finding 6 for workers)
+/// report-interval
+///                this agent reports its inventory at Core's period, and
+///                only when its survey completed, so Core may judge its
+///                silence by its reports (`report`, D35)
 /// ```
-pub const CAPABILITIES: &[&str] =
-    &["session", "proven-delete", crate::restore::CAPABILITY, crate::lease::CAPABILITY, crate::worker::CAPABILITY];
+pub const CAPABILITIES: &[&str] = &[
+    "session",
+    "proven-delete",
+    crate::restore::CAPABILITY,
+    crate::lease::CAPABILITY,
+    crate::worker::CAPABILITY,
+    crate::report::CAPABILITY,
+];
 
 /// The session in force, if any.
 pub fn current(session: &Session) -> Option<String> {

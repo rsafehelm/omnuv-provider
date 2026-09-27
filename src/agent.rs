@@ -72,6 +72,9 @@ struct Core {
     /// Which workers each recent full view sends as built (finding 6 for
     /// workers): Core's own JSON beside the protocol's fields.
     built: crate::worker::SharedBuilt,
+    /// D35: the report period Core last said, and its poll, which the report
+    /// task reads (`crate::report`).
+    report: crate::report::Heard,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -218,6 +221,7 @@ impl Core {
             restore: Default::default(),
             lease: Default::default(),
             built: Default::default(),
+            report: Default::default(),
         })
     }
 
@@ -260,6 +264,8 @@ impl Core {
         }
         let named = res.headers().get(crate::restore::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let lease = res.headers().get(crate::lease::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        // D35: Core's report period, on every view (D33).
+        self.report.header(res.headers().get(crate::report::HEADER).and_then(|v| v.to_str().ok()));
         // **One body, read twice** (finding 6 for workers): as the protocol's
         // view, and for the `built` Core sends beside a worker's fields.
         let body = res.bytes().await?;
@@ -765,10 +771,17 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // predates the field, the 120 s this always was.
     let mut core_poll: Option<u64> = None;
     let mut reconcile = tokio::time::interval(crate::timings::poll(core_poll));
-    // The inventory carries the disclosure, whose freshness is judged on
-    // Core's poll too: see `inventory_period`.
-    let mut inventory =
-        tokio::time::interval(inventory_period(cfg.timings.inventory_every.std(), crate::timings::poll(core_poll)));
+    // **The report is its own task** (D35): at Core's period, and never
+    // behind a reconcile pass, which can take minutes on a clone or a start.
+    // Core judges this provider's silence by its reports, so a report waiting
+    // on a pass would read a busy host as a silent one. It was a branch of
+    // the loop below until 27 September 2026.
+    let mut reports = spawn_reports(
+        core.clone(),
+        driver.clone(),
+        cfg.proxmox.offered_images(),
+        cfg.timings.inventory_every.std(),
+    );
     // Push for latency, pull for truth (CLAUDE.md, *The Three Tiers*): Core
     // pushes a nudge when something changes, this interval is what makes a
     // lost nudge cost latency rather than correctness.
@@ -825,13 +838,8 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = inventory.tick() => {
-                if let Err(e) = report_inventory(&core, &driver, cfg.proxmox.offered_images()).await {
-                    // Never exit on a transient failure: the agent is a daemon,
-                    // and a provider that gives up looks identical to one that
-                    // died. Missed heartbeats already mark it offline.
-                    eprintln!("inventory report failed: {e}");
-                }
+            ended = &mut reports => {
+                anyhow::bail!("report task ended unexpectedly: {ended:?}");
             }
         }
         // Re-armed, not restarted, when Core's poll moved: the first look at
@@ -840,26 +848,47 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             println!("poll: every {}s, as Core asks (was {}s)", period.as_secs(), reconcile.period().as_secs());
             reconcile = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         }
-        let every = inventory_period(cfg.timings.inventory_every.std(), crate::timings::poll(core_poll));
-        if every != inventory.period() {
-            println!("inventory: every {}s, twice per Core poll (was {}s)", every.as_secs(), inventory.period().as_secs());
-            inventory = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
-        }
+        // The report task's fallback, for a Core that says no report period,
+        // is derived from the poll (`report::fallback`).
+        core.report.poll(core_poll);
     }
 }
 
-/// How often the inventory is reported: `timings.inventoryEvery`, and never
-/// less often than twice per Core poll.
+/// **The report task** (D35): the inventory, at the period Core last said
+/// (`report::Heard::period`), re-armed when that moves. A survey that fails
+/// or is incomplete sends nothing (`report_inventory`), and so does a Core
+/// that cannot be asked: silence is the honest reading of a host that could
+/// not be surveyed. Never exits on a failure: the agent is a daemon, and a
+/// task that gave up would read exactly as a wedged host does.
 ///
-/// **The inventory carries the node's disclosure**, and Core stops selling a
-/// node whose disclosure is two of its polls old (D10; Core's
-/// `inventory::disclosure_fresh_secs`). At the 300 s default against Core's
-/// 120 s poll, every node was unsellable for the last minute of every five.
-/// Twice per poll leaves one missed report still fresh, which is the tolerance
-/// Core's window was built for. Core owns the poll (D33), so this derives from
-/// it rather than keeping a second copy of the window.
-fn inventory_period(configured: std::time::Duration, core_poll: std::time::Duration) -> std::time::Duration {
-    configured.min(core_poll / 2)
+/// Missed ticks are skipped, not burst: a survey slower than the period
+/// reports at the next tick after it, never several back to back.
+fn spawn_reports<D: ComputeDriver + Send + Sync + 'static>(
+    core: Core,
+    driver: Arc<D>,
+    offered_images: Vec<String>,
+    inventory_every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let arm = |period: std::time::Duration, first: tokio::time::Instant| {
+            let mut tick = tokio::time::interval_at(first, period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick
+        };
+        let mut tick = arm(core.report.period(inventory_every), tokio::time::Instant::now());
+        loop {
+            tick.tick().await;
+            if let Err(e) = report_inventory(&core, driver.as_ref(), offered_images.clone()).await {
+                eprintln!("inventory report not sent: {e:#}");
+            }
+            let every = core.report.period(inventory_every);
+            if every != tick.period() {
+                let whose = if core.report.said() { "as Core asks" } else { "Core says no period: this agent's own" };
+                println!("inventory: every {}s, {whose} (was {}s)", every.as_secs(), tick.period().as_secs());
+                tick = arm(every, tokio::time::Instant::now() + every);
+            }
+        }
+    })
 }
 
 /// The reconcile interval to keep, given what Core's last answer said; `None`
@@ -1230,6 +1259,87 @@ mod handshake_tests {
         (base, rx)
     }
 
+    /// A survey that completes, or one that does not (D35).
+    struct Survey {
+        complete: bool,
+    }
+
+    impl ComputeDriver for Survey {
+        fn kind(&self) -> omnuv_protocol::RuntimeKind {
+            omnuv_protocol::RuntimeKind::Proxmox
+        }
+
+        async fn inventory(&self, _: &DesiredState) -> anyhow::Result<omnuv_protocol::InventoryReport> {
+            anyhow::ensure!(self.complete, "the survey is incomplete, so nothing is reported (D35): a listing failed");
+            Ok(serde_json::from_value(serde_json::json!({
+                "protocol_version": omnuv_protocol::PROTOCOL_VERSION,
+                "runtime": omnuv_protocol::RuntimeKind::Proxmox,
+                "capabilities": omnuv_protocol::ComputeCapabilities::default(),
+                "nodes": [],
+            }))?)
+        }
+    }
+
+    /// **D35: a report goes only from a completed survey, from its own task.**
+    /// Against a Core that says no period (the fallback, here 200 ms), with no
+    /// reconcile loop running at all: a host whose survey completes is
+    /// reported every period, each report after a full view; one whose survey
+    /// never completes asks for the view every period and reports nothing,
+    /// so Core hears it only through its heartbeats and, judging by reports,
+    /// finds it silent.
+    #[tokio::test]
+    async fn a_report_goes_only_from_a_completed_survey_from_its_own_task() {
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let view = format!(r#"{{"protocol_version":{},"version":3,"unchanged":false,"instances":[]}}"#, omnuv_protocol::PROTOCOL_VERSION);
+        for complete in [true, false] {
+            let view = view.clone();
+            let (base, mut rx) = session_stub(move |line, _| {
+                if line.starts_with("GET /provider/v1/desired-state") {
+                    return ("200 OK", view.clone());
+                }
+                ("200 OK", "{}".into())
+            })
+            .await;
+            let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+            assert!(!core.report.said(), "the stub Core said a period");
+            let task = spawn_reports(core, Arc::new(Survey { complete }), vec![], std::time::Duration::from_millis(200));
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // wait: counting ticks of a 200 ms period
+            task.abort();
+            let (mut views, mut reports) = (0, 0);
+            while let Ok((head, _)) = rx.try_recv() {
+                views += usize::from(head.starts_with("get /provider/v1/desired-state"));
+                reports += usize::from(head.starts_with("post /provider/v1/inventory"));
+            }
+            assert!(views >= 4, "complete={complete}: the survey was asked for {views} times in 1.1 s at 200 ms");
+            if complete {
+                assert_eq!(reports, views, "a completed survey went unreported");
+            } else {
+                assert_eq!(reports, 0, "an incomplete survey was reported");
+            }
+        }
+    }
+
+    /// **The period is Core's, from the handshake**, before any view: the
+    /// agent advertises the capability and keeps what the answer said.
+    #[tokio::test]
+    async fn the_handshake_s_report_period_is_kept() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (base, mut rx) = session_stub(|_, _| {
+            ("200 OK", r#"{"provider_id":"p","protocol_version":6,"heartbeat_interval_secs":30,"report_interval_secs":45}"#.into())
+        })
+        .await;
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        handshake(&core, &HeartbeatDriver).await.expect("the handshake");
+        let (_, body) = rx.recv().await.unwrap();
+        let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(said["capabilities"].as_array().unwrap().contains(&serde_json::json!("report-interval")), "{body}");
+        assert_eq!(core.report.period(std::time::Duration::from_secs(300)), std::time::Duration::from_secs(45));
+    }
+
     /// **A held provider is waited for, and the session rides every call**
     /// (lifecycle phase 7, RC12). The first handshake meets a provider held
     /// by another agent (409) and is tried again rather than given up; the
@@ -1381,7 +1491,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1409,6 +1519,7 @@ mod handshake_tests {
             restore: Default::default(),
             lease: Default::default(),
             built: Default::default(),
+            report: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1489,7 +1600,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1518,7 +1629,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1898,22 +2009,6 @@ mod handshake_tests {
         }
     }
 
-    /// **A disclosure is never two of Core's polls old while the agent is
-    /// reporting** (D10): the inventory goes at least twice per poll, and the
-    /// configured interval still wins when it is the shorter.
-    #[test]
-    fn the_inventory_goes_at_least_twice_per_core_poll() {
-        let secs = std::time::Duration::from_secs;
-        // The shipped defaults: 300 s configured, Core's 120 s poll, whose
-        // window is 240 s. Five minutes between reports outlived it.
-        assert_eq!(inventory_period(secs(300), crate::timings::poll(None)), secs(60));
-        assert!(2 * inventory_period(secs(300), secs(120)) < 2 * secs(120), "one missed report went stale");
-        assert_eq!(inventory_period(secs(30), secs(120)), secs(30), "a shorter configured interval is kept");
-        assert_eq!(inventory_period(secs(300), crate::timings::poll(Some(1800))), secs(300));
-        assert!(inventory_period(secs(1), crate::timings::poll(Some(1))) > std::time::Duration::ZERO,
-                "a zero period panics the interval");
-    }
-
     /// The loop is re-armed when Core's poll moved, and only then.
     #[test]
     fn the_loop_is_re_armed_only_when_core_s_poll_moved() {
@@ -1981,6 +2076,8 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
                 // Whether this Core holds restores (lifecycle phase 8): only
                 // then is this agent's own detection armed.
                 crate::restore::arm(&core.restore, &v);
+                // D35: the period to report at, before the first view says it.
+                core.report.answer(&v);
                 println!(
                     "handshake ok: provider {} protocol v{} heartbeat {}s session {}",
                     v.get("provider_id").and_then(|x| x.as_str()).unwrap_or("?"),
