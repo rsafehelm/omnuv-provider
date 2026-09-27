@@ -46,7 +46,8 @@ pub const HEADER: &str = "onv-session";
 ///                finding 6 for workers)
 /// ```
 pub const CAPABILITIES: &[&str] =
-    &["session", "proven-delete", crate::restore::CAPABILITY, crate::lease::CAPABILITY, crate::worker::CAPABILITY];
+    &["session", "proven-delete", crate::restore::CAPABILITY, crate::lease::CAPABILITY, crate::worker::CAPABILITY,
+      crate::scrub::CAPABILITY];
 
 /// The session in force, if any.
 pub fn current(session: &Session) -> Option<String> {

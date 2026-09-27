@@ -1505,7 +1505,7 @@ impl Client {
     /// "could not look", never "the file says no": a guest with no agent, a
     /// machine still booting, and a path that does not exist are one answer
     /// here, and every caller has to treat them as one.
-    async fn read_guest_file(&self, node: &str, vmid: u32, path: &str) -> Option<String> {
+    pub(crate) async fn read_guest_file(&self, node: &str, vmid: u32, path: &str) -> Option<String> {
         #[derive(serde::Deserialize)]
         struct FileRead {
             content: String,
@@ -1696,7 +1696,12 @@ impl Client {
             // description, in the pool the clone put it in. A config that
             // cannot be read proves nothing, and keeps the record for later.
             let stamped = if cloned && tags.trim().is_empty() {
-                let pool = if entry.claim == crate::names::TAG_WORKER { crate::join::GATEWAY_POOL } else { BUYER_POOL };
+                // A worker's clone and a scrub's go to the marketplace's pool.
+                let pool = if entry.claim == crate::names::TAG_WORKER || entry.claim == crate::names::TAG_SCRUB {
+                    crate::join::GATEWAY_POOL
+                } else {
+                    BUYER_POOL
+                };
                 let config = match self
                     .get_json::<serde_json::Value>(&format!("/nodes/{}/qemu/{}/config", entry.node, entry.vmid))
                     .await

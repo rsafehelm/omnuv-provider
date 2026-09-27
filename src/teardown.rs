@@ -230,7 +230,11 @@ impl Client {
             #[serde(default)]
             pool: Option<String>,
         }
-        let pool = if kind == crate::names::TAG_WORKER { crate::join::GATEWAY_POOL } else { crate::instance::BUYER_POOL };
+        let pool = if kind == crate::names::TAG_WORKER || kind == crate::names::TAG_SCRUB {
+            crate::join::GATEWAY_POOL
+        } else {
+            crate::instance::BUYER_POOL
+        };
         let id_tag = crate::names::short_tag(id);
         let claimed = |tags: Option<&str>| {
             tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))

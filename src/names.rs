@@ -97,6 +97,10 @@ pub const NAT_VNET_LEGACY: &str = "onat0";
 pub const TAG_INSTANCE: &str = "onv-instance";
 pub const TAG_GATEWAY: &str = "onv-gateway";
 pub const TAG_WORKER: &str = "onv-worker";
+/// A card scrub's guest (lifecycle phase 9, D11, D24): the cleaning tag that
+/// joins the claim tags. Marketplace-owned, in the marketplace's pool, and
+/// removed by the agent that made it once its verdict is read.
+pub const TAG_SCRUB: &str = "onv-scrub";
 
 /// **The stamp a machine carries from the moment it is cloned** (phase 1 of
 /// the lifecycle roadmap, 26 September 2026). Its first line names the claim
@@ -105,7 +109,11 @@ pub const TAG_WORKER: &str = "onv-worker";
 /// configure step writes the same text; the GPU matcher (`proxmox::accounted_pci`)
 /// and clone recovery (`recover_pending`) read the first line.
 pub fn stamped(claim: &str, id: &str) -> String {
-    let label = if claim == TAG_WORKER { "inference worker" } else { "instance" };
+    let label = match claim {
+        TAG_WORKER => "inference worker",
+        TAG_SCRUB => "card scrub",
+        _ => "instance",
+    };
     format!("Omnuv {label} {id}")
 }
 
@@ -126,6 +134,11 @@ pub const LEGACY_PREFIXES: &[&str] = &["omnuv-", "omnu-"];
 /// A buyer machine's name on the hypervisor, and a gateway's.
 pub fn instance(name: &str) -> String {
     format!("{PREFIX}-{name}")
+}
+
+/// A card scrub's guest's name on the hypervisor.
+pub fn scrub(scrub_id: &str) -> String {
+    format!("{PREFIX}-scrub-{}", &scrub_id[..scrub_id.len().min(8)])
 }
 
 /// A marketplace-owned worker's name on the hypervisor.

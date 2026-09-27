@@ -50,6 +50,17 @@ pub mod defaults {
     /// agent cannot see, so 30 days (unmeasured; a site with older backups
     /// says more).
     pub const TOMBSTONE_KEEP: Dur = Dur::hours(30 * 24);
+    /// Lifecycle phase 9: how long a scrub guest may run without its
+    /// program's verdict: a boot with the driver, then a read, a pattern and
+    /// zeros over the card's memory, each read back. Unmeasured on Pluto. The
+    /// one reading there is, on another host's cards outside any guest, is
+    /// all of its passes over 9854 MiB in about 8 s, which puts a 24 GiB
+    /// card's passes near 20 s; the rest of the twenty minutes is the boot's.
+    pub const SCRUB_GUEST_DEADLINE: Dur = Dur::mins(20);
+    /// Lifecycle phase 9: how often this agent asks Core which cards to scrub,
+    /// and looks at the scrubs it runs. A held card idles at most this long
+    /// after its program's verdict before it is reported.
+    pub const SCRUB_EVERY: Dur = Dur::secs(30);
 }
 
 /// The poll this agent keeps while Core says none: a Core that predates
@@ -118,6 +129,14 @@ pub struct Timings {
     /// oldest request first, reported as waiting. 0: no cap, the shipped
     /// default until a number is measured.
     pub started_destroys_per_hour: u32,
+    /// How long a card scrub's guest may run without its program's verdict
+    /// before the scrub is reported failed and the guest removed (lifecycle
+    /// phase 9). Measured by the guest's own uptime, so a restart of this
+    /// agent neither extends nor shortens it.
+    pub scrub_guest_deadline: Dur,
+    /// How often this agent asks Core which of its cards to scrub, and looks
+    /// at the scrubs it runs (lifecycle phase 9).
+    pub scrub_every: Dur,
 }
 
 impl Default for Timings {
@@ -136,6 +155,8 @@ impl Default for Timings {
             workload: WorkloadConfig::default(),
             tombstone_keep: TOMBSTONE_KEEP,
             started_destroys_per_hour: 0,
+            scrub_guest_deadline: SCRUB_GUEST_DEADLINE,
+            scrub_every: SCRUB_EVERY,
         }
     }
 }
@@ -192,6 +213,11 @@ impl Timings {
         within(&mut bad, "tombstoneKeep", self.tombstone_keep, Dur::hours(24), Dur::hours(24 * 3650),
             "a tombstone is what stops a restored view rebuilding a machine this agent deleted, so it \
              outlives at least a day of backups");
+        within(&mut bad, "scrubGuestDeadline", self.scrub_guest_deadline, Dur::mins(5), Dur::hours(6),
+            "a boot with the driver and three passes over a card take minutes, and a scrub that never \
+             reports holds its card out of sale for as long as this");
+        within(&mut bad, "scrubEvery", self.scrub_every, Dur::secs(5), Dur::mins(10),
+            "each look asks Core and the hypervisor, and a scrubbed card waits this long to be reported");
         if self.started_destroys_per_hour > 10_000 {
             bad.push(format!(
                 "timings.startedDestroysPerHour ({}) is past 10000: a cap nothing can reach caps nothing; \
@@ -254,9 +280,11 @@ mod tests {
         // every provider at once, so it moves here, on purpose, in that change.
         // Lifecycle phase 7 added `tombstoneKeep`: a57be9feb152 became
         // 3cf6624da40e; phase 8 added `startedDestroysPerHour` (0, no cap):
-        // bac073f3123c.
+        // bac073f3123c; phase 9 added `scrubGuestDeadline` and `scrubEvery`:
+        // c2961f8ee260.
         assert_eq!(t.started_destroys_per_hour, 0, "lifecycle phase 8: a new key, shipped off");
-        assert_eq!(t.hash(), "bac073f3123c");
+        assert_eq!((secs(t.scrub_guest_deadline), secs(t.scrub_every)), (1200.0, 30.0), "lifecycle phase 9: two new keys");
+        assert_eq!(t.hash(), "c2961f8ee260");
     }
 
     /// Core's poll is obeyed inside Core's own range, and zero or absent is
@@ -293,6 +321,8 @@ mod tests {
             ("cloneBudgetMax: 3h", "timings.cloneBudgetMax"),
             ("workload:\n  degradedAbove: 10s", "timings.workload.degradedAbove"),
             ("workloadStuckAfterReads: 1", "timings.workload.reportEvery (15s) must be at most"),
+            ("scrubGuestDeadline: 4m", "timings.scrubGuestDeadline"),
+            ("scrubEvery: 11m", "timings.scrubEvery"),
         ] {
             let e = refused(yaml);
             assert!(e.iter().any(|m| m.starts_with(key)), "{yaml:?} was not refused as {key}: {e:?}");
