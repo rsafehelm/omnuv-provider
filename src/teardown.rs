@@ -389,6 +389,12 @@ impl Client {
 // stays after it was asked to go is a residue: the compute claim may end, the
 // disk stays counted, and the volumes are named — never dropped.
 
+/// **The typed report of one residue volume** (the phase 7 follow-up): a
+/// self-check of this name, its subject the volume's id, `pass` when a
+/// listing found it gone. Core's `claims::RESIDUE_VOLUME` is the reader, and
+/// closes a residue only when every one of its volumes is said gone.
+pub(crate) const RESIDUE_VOLUME: &str = "teardown.residue.volume";
+
 /// What a delete can say about a machine, on this pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Gone {
@@ -444,6 +450,12 @@ pub(crate) struct Tombstone {
     /// Volumes that stayed after they were asked to go.
     #[serde(default)]
     pub residue: Vec<String>,
+    /// Volumes that were a residue and that a listing since found gone:
+    /// reported every pass while the tombstone lives, so Core closes its
+    /// residue on the agent's word even if one report is lost (the phase 7
+    /// follow-up; `retry_residues`).
+    #[serde(default)]
+    pub residue_gone: Vec<String>,
 }
 
 fn now() -> i64 {
@@ -477,6 +489,7 @@ pub(crate) fn read_tomb(dir: &std::path::Path, id: &str) -> Option<Tombstone> {
                 destroyed_at: None,
                 proven_at: None,
                 residue: Vec::new(),
+                residue_gone: Vec::new(),
             })
         }
     }
@@ -549,6 +562,7 @@ impl Client {
                     destroyed_at: None,
                     proven_at: None,
                     residue: Vec::new(),
+                    residue_gone: Vec::new(),
                 });
                 let t = Tombstone { destroyed_at: Some(t.destroyed_at.unwrap_or_else(now)), ..t };
                 write_tomb(&dir, &t)?;
@@ -572,6 +586,7 @@ impl Client {
             destroyed_at: None,
             proven_at: None,
             residue: Vec::new(),
+            residue_gone: Vec::new(),
         };
         // Merged with what an earlier, unconfirmed destroy recorded: a volume
         // named then is still this machine's to account for.
@@ -651,6 +666,13 @@ impl Client {
             return Ok(Gone::NotYet(blockers.join("; ")));
         }
         t.proven_at.get_or_insert_with(now);
+        // A volume that was a residue and that this listing found gone is
+        // remembered as gone, so `retry_residues` keeps saying so to Core.
+        for v in &t.residue {
+            if !residue.contains(v) && !t.residue_gone.contains(v) {
+                t.residue_gone.push(v.clone());
+            }
+        }
         t.residue = residue.clone();
         write_tomb(dir, &t)?;
         if residue.is_empty() {
@@ -766,34 +788,68 @@ impl Client {
     /// sends the machine: once Core ended the compute claim on a residue, the
     /// machine leaves the view, and nothing else would look again. Answers a
     /// self-check naming what is left, so the provider's board shows it.
-    pub(crate) async fn retry_residues(&self, snippet_dir: &str) -> Option<omnuv_protocol::SelfCheck> {
+    ///
+    /// **And one typed check per volume** (the phase 7 follow-up: Core closes
+    /// a residue on it). `teardown.residue.volume`, its subject the volume's
+    /// id: `fail` while it is still there, `pass` once a listing found it
+    /// gone — said every pass while the tombstone lives, so a lost report
+    /// only delays the close. A pass is only ever a listing's answer
+    /// (`volume_left`), never a delete call's return. A volume both left for
+    /// one machine and gone for another (a reused name) is said left.
+    pub(crate) async fn retry_residues(&self, snippet_dir: &str) -> Vec<omnuv_protocol::SelfCheck> {
         use omnuv_protocol::{CheckKind, CheckResult, SelfCheck};
         let dir = tombstones(snippet_dir);
         let mut left = Vec::new();
-        for mut t in list_tombs(&dir).into_iter().filter(|t| !t.residue.is_empty()) {
-            let Some(node) = t.node.clone() else { continue };
-            let mut still = Vec::new();
-            for volid in &t.residue {
-                match self.volume_left(&node, volid).await {
-                    Ok(false) => {}
-                    Ok(true) | Err(_) => still.push(volid.clone()),
+        let mut volumes: std::collections::BTreeMap<String, (CheckResult, String)> = Default::default();
+        for mut t in list_tombs(&dir).into_iter().filter(|t| !t.residue.is_empty() || !t.residue_gone.is_empty()) {
+            if let Some(node) = t.node.clone()
+                && !t.residue.is_empty()
+            {
+                let mut still = Vec::new();
+                let mut gone = Vec::new();
+                for volid in &t.residue {
+                    match self.volume_left(&node, volid).await {
+                        Ok(false) => gone.push(volid.clone()),
+                        Ok(true) | Err(_) => still.push(volid.clone()),
+                    }
+                }
+                if still != t.residue {
+                    t.residue = still;
+                    for v in gone {
+                        if !t.residue_gone.contains(&v) {
+                            t.residue_gone.push(v);
+                        }
+                    }
+                    if let Err(e) = write_tomb(&dir, &t) {
+                        eprintln!("tombstone {}: {e}", t.id);
+                    }
                 }
             }
-            if still != t.residue {
-                t.residue = still.clone();
-                if let Err(e) = write_tomb(&dir, &t) {
-                    eprintln!("tombstone {}: {e}", t.id);
-                }
+            for v in &t.residue_gone {
+                volumes
+                    .entry(v.clone())
+                    .or_insert((CheckResult::Pass, format!("listed gone; left by deleted machine {}", t.id)));
             }
-            left.extend(still.into_iter().map(|v| format!("{v} (machine {})", t.id)));
+            for v in &t.residue {
+                volumes.insert(v.clone(), (CheckResult::Fail, format!("still there; left by deleted machine {}", t.id)));
+                left.push(format!("{v} (machine {})", t.id));
+            }
         }
-        Some(SelfCheck {
+        let mut out = vec![SelfCheck {
             name: "teardown.residue".into(),
             kind: CheckKind::Presence,
             result: if left.is_empty() { CheckResult::Pass } else { CheckResult::Fail },
             detail: (!left.is_empty()).then(|| format!("volumes left by deleted machines: {}", left.join(", "))),
             subject: None,
-        })
+        }];
+        out.extend(volumes.into_iter().map(|(volid, (result, detail))| SelfCheck {
+            name: RESIDUE_VOLUME.into(),
+            kind: CheckKind::Presence,
+            result,
+            detail: Some(detail),
+            subject: Some(volid),
+        }));
+        out
     }
 }
 
@@ -1144,15 +1200,60 @@ mod tests {
             mock.calls.lock().unwrap().iter().any(|c| c.method == "DELETE" && c.path.contains("/storage/local-lvm/content/")),
             "the left volumes were never asked to go"
         );
-        let check = mock.client().retry_residues(&dir).await.expect("a check");
+        let checks = mock.client().retry_residues(&dir).await;
+        let check = checks.iter().find(|c| c.name == "teardown.residue").expect("a check");
         assert_eq!(check.result, omnuv_protocol::CheckResult::Fail);
         assert!(check.detail.as_deref().unwrap_or_default().contains(DISK), "{check:?}");
+        let typed = |checks: &[omnuv_protocol::SelfCheck], volid: &str| {
+            checks.iter().find(|c| c.name == RESIDUE_VOLUME && c.subject.as_deref() == Some(volid)).map(|c| c.result)
+        };
+        assert_eq!(typed(&checks, DISK), Some(omnuv_protocol::CheckResult::Fail), "{checks:?}");
+        assert_eq!(typed(&checks, CLOUDINIT), Some(omnuv_protocol::CheckResult::Fail), "{checks:?}");
 
         // They go when they can: the residue closes, and the board says so.
         host.lock().unwrap().volume_delete_fails = false;
-        let check = mock.client().retry_residues(&dir).await.expect("a check");
+        let checks = mock.client().retry_residues(&dir).await;
+        let check = checks.iter().find(|c| c.name == "teardown.residue").expect("a check");
         assert_eq!(check.result, omnuv_protocol::CheckResult::Pass, "{check:?}");
         assert_eq!(host.lock().unwrap().volumes, vec![FOREIGN.to_string()]);
+        // **Each volume is said gone, typed, and said again next pass** (the
+        // phase 7 follow-up): Core closes the residue on these, and a report
+        // lost on the way only delays it.
+        for _ in 0..2 {
+            let checks = mock.client().retry_residues(&dir).await;
+            assert_eq!(typed(&checks, DISK), Some(omnuv_protocol::CheckResult::Pass), "{checks:?}");
+            assert_eq!(typed(&checks, CLOUDINIT), Some(omnuv_protocol::CheckResult::Pass), "{checks:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A residue that goes under the delete's own proof is said gone too**
+    /// (the phase 7 follow-up). Core may still send the machine Absent after
+    /// its residue (its claim held with the switch off), so the delete's next
+    /// proof can be the listing that finds the volumes gone. That listing is
+    /// remembered: every later pass says each volume gone, typed, and Core
+    /// closes the residue on it.
+    #[tokio::test]
+    async fn a_residue_gone_under_the_proof_is_said_gone_every_pass() {
+        let (root, dir) = state_dir("residue-proof");
+        let host = machine();
+        {
+            let mut h = host.lock().unwrap();
+            h.destroy_leaves_disks = true;
+            h.volume_delete_fails = true;
+        }
+        let mock = stateful(host.clone()).await;
+        assert!(matches!(pass(&mock, &dir).await, Gone::NotYet(_)));
+        assert!(matches!(pass(&mock, &dir).await, Gone::Residue(_)));
+        host.lock().unwrap().volume_delete_fails = false;
+        assert_eq!(pass(&mock, &dir).await, Gone::Proven, "the volumes went and the proof did not say so");
+        for _ in 0..2 {
+            let checks = mock.client().retry_residues(&dir).await;
+            for volid in [DISK, CLOUDINIT] {
+                let said = checks.iter().find(|c| c.name == RESIDUE_VOLUME && c.subject.as_deref() == Some(volid));
+                assert_eq!(said.map(|c| c.result), Some(omnuv_protocol::CheckResult::Pass), "{volid}: {checks:?}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1228,6 +1329,7 @@ mod tests {
             destroyed_at: Some(proven_at),
             proven_at: Some(proven_at),
             residue,
+            residue_gone: Vec::new(),
         };
         write_tomb(&tombs, &tomb(ID, long_ago, vec![])).unwrap();
         write_tomb(&tombs, &tomb(TWIN_ELSEWHERE, long_ago, vec![])).unwrap();

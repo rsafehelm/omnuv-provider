@@ -906,6 +906,16 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     })
 }
 
+/// **Core's view, read again just before a start** of a machine or worker
+/// already built (the phase 7 follow-up; G_reread for a start, beside the
+/// build's `still_wanted` and the destroy's `still_absent`). Only a fresh view
+/// that still names the id Running starts it: Stopped, Absent, gone from the
+/// view, a view older than the one held, a restore, or a Core that could not
+/// be asked all start nothing. Awaited only when a start is about to be asked.
+async fn still_running(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<bool> {
+    Ok(intent_now(core, held, id).await? == Some(Lifecycle::Running))
+}
+
 /// Why a pass's observation does not cover everything it was asked about:
 /// one line per kind that had items the agent could not read or act on.
 fn incompleteness(
@@ -1632,6 +1642,95 @@ mod handshake_tests {
         assert!(!sent.iter().any(|(h, _)| h.contains("onv-restore-detected")), "a restore was reported with none");
     }
 
+    /// **A built machine is started only on a view read again** (the phase 7
+    /// follow-up; G_reread for a start, as the build and the destroy have it).
+    /// The pass's view wants machine 900, built and stopped, running. Just
+    /// before the start the view is asked again: when it still says running,
+    /// the machine is started; when the buyer has stopped it since, nothing
+    /// is started and the machine is reported as it was seen, stopped.
+    #[tokio::test]
+    async fn a_built_machine_is_started_only_on_a_view_read_again() {
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut view: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        view["version"] = serde_json::json!(5);
+        view["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+        view["instances"][0]["built"] = serde_json::json!(true);
+        view["instances"][0]["lifecycle"] = serde_json::json!("running");
+        let id = view["instances"][0]["id"].as_str().unwrap().to_string();
+        let claim = format!("{};{}", crate::instance::TAG, crate::names::short_tag(&id));
+        for (again, started) in [("stopped", false), ("running", true)] {
+            let mut later = view.clone();
+            later["version"] = serde_json::json!(6);
+            later["instances"][0]["lifecycle"] = serde_json::json!(again);
+            let (first, later) = (view.to_string(), later.to_string());
+            let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (base, mut rx) = session_stub(move |line, _| {
+                if line.starts_with("GET /provider/v1/desired-state") {
+                    match asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => ("200 OK", first.clone()),
+                        _ => ("200 OK", later.clone()),
+                    }
+                } else {
+                    ("204 No Content", String::new())
+                }
+            })
+            .await;
+            let claim = claim.clone();
+            let pve = crate::pvemock::Mock::start(move |method, path, _| {
+                if let Some(r) = crate::pvemock::task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                        {"node": "n1", "vmid": 900, "status": "stopped", "tags": claim}])),
+                    ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([{"vmid": 900, "status": "stopped", "tags": claim}])),
+                    ("GET", "/nodes/n1/qemu/900/status/current") => (200, serde_json::json!({"status": "stopped"})),
+                    ("POST", "/nodes/n1/qemu/900/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                    _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+                }
+            })
+            .await;
+            let snippets = tempfile::tempdir().unwrap();
+            let snippet_dir = snippets.path().join("snippets");
+            std::fs::create_dir_all(&snippet_dir).unwrap();
+            let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+                "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+                pve.base,
+                snippet_dir.display()
+            ))
+            .expect("config");
+            let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+            let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+            let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+            let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+            let kick = Arc::new(tokio::sync::Notify::new());
+            let mut core_poll = None;
+            let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+            assert_eq!(
+                pve.called("POST", "/nodes/n1/qemu/900/status/start"),
+                started,
+                "the view read again said {again}"
+            );
+            let mut sent = Vec::new();
+            while let Ok(r) = rx.try_recv() {
+                sent.push(r);
+            }
+            let reads = sent.iter().filter(|(h, _)| h.starts_with("get /provider/v1/desired-state")).count();
+            assert!(reads >= 2, "the view was not read again before the start ({reads} read)");
+            if !started {
+                let (_, report) = sent.iter().find(|(h, _)| h.starts_with("post /provider/v1/status")).expect("a report");
+                let report: serde_json::Value = serde_json::from_str(report).unwrap();
+                let machine = &report["instances"][0];
+                assert_eq!(machine["state"], serde_json::json!("STOPPED"), "{report}");
+                assert!(machine["waiting_on"].as_str().unwrap_or_default().contains("read again"), "{report}");
+            }
+        }
+    }
+
     /// **A disclosure is never two of Core's polls old while the agent is
     /// reporting** (D10): the inventory goes at least twice per poll, and the
     /// configured interval still wins when it is the shorter.
@@ -2127,16 +2226,28 @@ async fn reconcile_workers(
             }
             _ => {
                 driver
-                    .ensure_inference_worker(
+                    .ensure_inference_worker_gated(
                         cfg.proxmox.template_vmid,
                         storage,
                         &cfg.proxmox.snippet_dir,
                         spec,
                         &cfg.core.url,
+                        still_running(core, held, &spec.id),
                     )
                     .await
             }
         };
+        // **Not looked at is not an error** (PROVIDER-26, as for instances
+        // below): a worker whose node would not give its power state was
+        // neither acted on nor seen, so it is left out of the report and the
+        // observation is incomplete, rather than painted ERROR on one blip.
+        if let Err(e) = &result
+            && e.downcast_ref::<crate::instance::NotLookedAt>().is_some()
+        {
+            unobserved_workers += 1;
+            eprintln!("worker {}: {e}", spec.id);
+            continue;
+        }
         // A failure on one worker must not stop the others from converging, and
         // must be visible to the operator rather than retried in silence.
         statuses.push(result.unwrap_or_else(|e| {
@@ -2281,7 +2392,16 @@ async fn reconcile_workers(
             }
             _ => match cfg.proxmox.template_for(&spec.image.id) {
                 Some(template) => {
-                    driver.ensure_instance(node, template, storage, &cfg.proxmox.snippet_dir, spec).await
+                    driver
+                        .ensure_instance_gated(
+                            node,
+                            template,
+                            storage,
+                            &cfg.proxmox.snippet_dir,
+                            spec,
+                            still_running(core, held, &spec.id),
+                        )
+                        .await
                 }
                 None => Err(anyhow::anyhow!("image {} is not offered by this provider", spec.image.id)),
             },
