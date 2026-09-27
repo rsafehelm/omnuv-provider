@@ -111,7 +111,7 @@ fn apply(b: &mut Book, r: &Reading, view: &omnuv_protocol::DesiredState) {
             continue;
         }
         match &told {
-            Some((t, ids)) if ids.iter().any(|i| *i == spec.id) => {
+            Some((t, ids)) if ids.contains(&spec.id) => {
                 let deadline = r.asked.at + *t;
                 // Never moved back by an older reading.
                 let keep = b.leases.get(&spec.id).is_some_and(|l| l.deadline > deadline);
