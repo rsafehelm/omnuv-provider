@@ -289,6 +289,16 @@ pub async fn pass(driver: &Client, file: &Path, log: &Log, now: SystemTime, act:
 /// exit status is [`Verdict::exit_code`]; a configuration that cannot be
 /// loaded is 1, said without the loader's words (they can quote a value).
 pub async fn main(config: &str, secrets: &str, dry_run: bool) -> i32 {
+    // As the agent's user, as the unit runs it: a log this made as root is one
+    // the unit can no longer append to, and nobody would notice.
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "run-lease-expire: not as root; as the agent's user, as onv-lease-expire.service runs it: \
+             runuser -u onv -- onv-provider run-lease-expire --dry-run. Nothing done"
+        );
+        return 1;
+    }
     let audit = std::env::var("OMNUV_AUDIT_LOG").unwrap_or_else(|_| "/var/log/onv/audit.log".into());
     let own = std::env::var("OMNUV_LEASE_TIMER_LOG").unwrap_or_else(|_| DEFAULT_LOG.into());
     let log = Log::new(PathBuf::from(own), Some(audit));

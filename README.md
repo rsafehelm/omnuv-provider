@@ -93,6 +93,19 @@ layer exists so that a second runtime can arrive, and a package that checks for
 one at install time cannot be installed on a provider running something else.
 What kind of host this is, is a question for `join`, not for the packager.
 
+It also installs and enables `onv-lease-expire.timer`. A machine whose buyer
+chose restart elsewhere runs under a lease the agent renews from Core's view;
+past it, the agent stops the machine, so a copy restarted on another provider
+never runs beside this one. The timer does the same when the agent cannot:
+every minute, `onv-provider run-lease-expire` stops each machine in
+`/var/lib/onv/run-lease.json` past its time, and it acts only when it can take
+the lock the agent holds while it runs (and on a file older than 45 s). It
+stops, and nothing else: only guests carrying the machine's tag and its whole
+stamp, only when their node says they run. It writes what it did to
+`/var/log/onv/run-lease-expire.log` and to the audit log.
+`runuser -u onv -- onv-provider run-lease-expire --dry-run` says what it would
+do.
+
 Your configuration is not a packaged file. `join` writes it, which means an
 upgrade can never ask you what to do about a file you did not edit.
 

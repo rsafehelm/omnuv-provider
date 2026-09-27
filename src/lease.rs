@@ -314,9 +314,17 @@ pub fn lock_file(file: &std::path::Path) -> std::path::PathBuf {
     file.with_extension("lock")
 }
 
-/// Opens the lock file, creating it, never truncating anything.
+/// Opens the lock file, creating it when it is not there, never truncating
+/// anything. **Read-only when it exists**: `flock` needs no write access, so a
+/// lock file another user made (a person running the timer by hand as root)
+/// still locks, rather than leaving the agent's task to run without it.
 pub fn open_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+    match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path)
+        }
+        opened => opened,
+    }
 }
 
 /// **The lease lock, held for as long as the task runs.** Waited for while
@@ -366,12 +374,24 @@ pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf) {
     if n > 0 {
         println!("run lease: {n} lease(s) resumed from {}", file.display());
     }
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _held = take_lock(&file).await;
         let mut every = tokio::time::interval(WRITE_EVERY);
         loop {
             every.tick().await;
             check(&book, &driver, &file).await;
+        }
+    });
+    // **The agent never runs without its lease task.** A panic there frees
+    // the lock, and the host timer would then act beside a reconcile loop
+    // still maintaining the same machines; so the process ends, and systemd
+    // starts it again with the file's leases resumed.
+    tokio::spawn(async move {
+        if let Err(e) = task.await
+            && e.is_panic()
+        {
+            eprintln!("run lease: the lease task panicked; the agent exits rather than run without it");
+            std::process::exit(70);
         }
     });
 }
@@ -506,6 +526,23 @@ mod tests {
         std::fs::write(&file, "{\"leases\": [").unwrap();
         assert_eq!(resume(&book(), &file), 0);
         assert_eq!(resume(&book(), &dir.path().join("absent.json")), 0);
+    }
+
+    /// **A lock file the agent cannot write to still locks**: one a person
+    /// made by running the timer as root, say. It was opened read-write, so
+    /// the task would have run without the lock and the timer beside it.
+    #[tokio::test]
+    async fn a_lock_file_the_agent_cannot_write_to_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("run-lease.json");
+        let lock = lock_file(&file);
+        std::fs::write(&lock, "").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let held = take_lock(&file).await;
+        assert!(held.is_some(), "a read-only lock file left the lease task without its lock");
+        let probe = open_lock(&lock).unwrap();
+        assert!(matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "the lock was not held");
     }
 
     /// **The lease task holds the lock the host timer defers to**, from its
