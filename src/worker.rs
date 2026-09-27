@@ -16,6 +16,84 @@ pub const TAG: &str = crate::names::TAG_WORKER;
 /// Typed empty form body for endpoints that take no parameters.
 const NO_FORM: &[(String, String)] = &[];
 
+/// **What this agent advertises when it can answer a worker's question**
+/// (finding 6 for workers): it reads a worker's `built` in Core's view,
+/// never builds one sent built, and says one it holds nothing of, and owes
+/// nothing for, is lost in [`LOST_WORKER`]. Core's
+/// `workers::WORKER_LOST_CAPABILITY`, which concludes a worker's create past
+/// its horizon only on those words from a view that carried its question
+/// where the agent advertised this, and as before where it did not.
+pub const CAPABILITY: &str = "worker-lost";
+
+/// **What this agent says of a worker sent as built that it does not hold**:
+/// its create ran past its horizon (Core sends it built from then, 0220),
+/// nothing carries its claim or its clone stamp, and nothing is owed for it.
+/// Core's clock concludes on these words from a view that carried its
+/// question (`workers::WORKER_LOST_WORDS` in omnuv, which parses their
+/// start): an untyped string on this wire, pinned on both sides by test until
+/// the protocol carries a reason code.
+pub(crate) const LOST_WORKER: &str = "this worker is no longer on its provider and was not built again: its create ran past \
+                                      its horizon, and nothing here carries its claim or its stamp or is owed for it";
+
+/// **Which workers Core's views send as built** (finding 6 for workers).
+///
+/// `InferenceWorkerSpec` has no `built`: Core sends it in its own JSON, as
+/// `"built": true` beside the protocol's fields of each worker it is true of,
+/// and this agent reads it from the same body it reads the view from. Kept
+/// per view revision, beside the view in hand rather than in it, for the
+/// last few full answers: an `unchanged` answer names none and keeps the
+/// view in hand, and so keeps its entry. A view with no entry here — one
+/// read some other way — is one whose `built` is not known.
+#[derive(Default)]
+pub(crate) struct BuiltViews(std::collections::VecDeque<(u64, std::collections::BTreeSet<String>)>);
+
+/// Shared by every clone of the Core client.
+pub(crate) type SharedBuilt = std::sync::Arc<std::sync::Mutex<BuiltViews>>;
+
+/// How many full answers are remembered. The view in hand is always the
+/// newest or one refused as older, so two would do; a few more cost nothing.
+const BUILT_VIEWS_KEPT: usize = 8;
+
+impl BuiltViews {
+    /// A full answer's revision and the workers it sends as built. The
+    /// newest answer under a revision replaces an older one under it (a
+    /// restore's new generation can serve a number again).
+    pub(crate) fn heard(&mut self, version: u64, built: std::collections::BTreeSet<String>) {
+        self.0.retain(|(v, _)| *v != version);
+        self.0.push_back((version, built));
+        while self.0.len() > BUILT_VIEWS_KEPT {
+            self.0.pop_front();
+        }
+    }
+
+    /// Whether view `version` sends worker `id` as built; `None` when that
+    /// view's answer is not held here.
+    pub(crate) fn built(&self, version: u64, id: &str) -> Option<bool> {
+        self.0.iter().rev().find(|(v, _)| *v == version).map(|(_, ids)| ids.contains(id))
+    }
+}
+
+/// The workers a view's body sends as built: `"built": true` on a worker.
+/// A Core that predates it sends none, and every worker reads as not built,
+/// as it always has. A body this cannot read names none; the protocol's own
+/// read of it is what fails, and says why.
+pub(crate) fn built_workers(body: &[u8]) -> std::collections::BTreeSet<String> {
+    #[derive(Deserialize)]
+    struct Worker {
+        id: String,
+        #[serde(default)]
+        built: bool,
+    }
+    #[derive(Deserialize)]
+    struct View {
+        #[serde(default)]
+        inference_workers: Vec<Worker>,
+    }
+    serde_json::from_slice::<View>(body)
+        .map(|v| v.inference_workers.into_iter().filter(|w| w.built).map(|w| w.id).collect())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct VmRef {
     pub(crate) vmid: u32,
@@ -352,8 +430,9 @@ impl Client {
     /// signature that accepts a node it will not use is a lie the next caller
     /// believes. Where a worker goes is the provider's own local placement,
     /// which CLAUDE.md puts behind the driver on purpose.
-    /// Ungated: every start goes ahead. For tests about everything but the
-    /// re-read; the agent calls the gated form.
+    /// Ungated: every start and every build goes ahead, and Core has not
+    /// sent the worker as built. For tests about everything but the re-reads
+    /// and `built`; the agent calls the gated form.
     #[cfg(test)]
     pub async fn ensure_inference_worker(
         &self,
@@ -363,13 +442,31 @@ impl Client {
         spec: &InferenceWorkerSpec,
         core_url: &str,
     ) -> anyhow::Result<WorkerStatus> {
-        self.ensure_inference_worker_gated(template_vmid, storage, snippet_dir, spec, core_url, std::future::ready(Ok(true)))
-            .await
+        self.ensure_inference_worker_gated(
+            template_vmid,
+            storage,
+            snippet_dir,
+            spec,
+            core_url,
+            Some(false),
+            std::future::ready(Ok(true)),
+            std::future::ready(Ok(true)),
+        )
+        .await
     }
 
     /// `ensure_inference_worker`, with Core's view read again just before a
     /// worker already built is started, for the reason and in the way
     /// `ensure_instance_gated` gives. Anything but `Ok(true)` starts nothing.
+    ///
+    /// **And `built`, and a re-read before a build** (finding 6 for workers):
+    /// `built` is whether the view in hand sends this worker as built (`None`:
+    /// that view's answer is not held, so it is not known). One sent built is
+    /// looked for and never cloned; one nothing here carries or is owed for is
+    /// reported lost. One not sent built is cloned only if `build_gate`, a
+    /// fresh view, still wants it and still does not say built (finding 7's
+    /// C4b, for a worker). Anything but `Ok(true)` builds nothing.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_inference_worker_gated(
         &self,
         template_vmid: u32,
@@ -377,7 +474,9 @@ impl Client {
         snippet_dir: &str,
         spec: &InferenceWorkerSpec,
         core_url: &str,
+        built: Option<bool>,
         start_gate: impl std::future::Future<Output = anyhow::Result<bool>>,
+        build_gate: impl std::future::Future<Output = anyhow::Result<bool>>,
     ) -> anyhow::Result<WorkerStatus> {
         // **Cluster-wide, and under the allocation gate — the same two rules as
         // `ensure_instance`.** This path attaches a card too (`hostpci` below)
@@ -567,6 +666,62 @@ impl Client {
                 )),
                 telemetry: None,
             });
+        }
+
+        // **A worker sent as built is not built again** (finding 6 for
+        // workers). Core sends a worker create past its horizon as built
+        // (0220): whether anything was built for it is Core's question, and
+        // this is the answer. Nothing carries its claim — the miss above is
+        // confirmed live (PROVIDER-5) — nothing is owed for it, and nothing
+        // carries its stamp, so it is lost here, in the words Core's clock
+        // concludes on from a view that carried its question. One-shot:
+        // Core withdraws it; retrying would only clone it again.
+        match built {
+            Some(true) => {
+                crate::audit::record("worker.lost", "agent", &spec.id, "error", Some("no worker found for one sent as built"));
+                return Ok(WorkerStatus {
+                    id: spec.id.clone(),
+                    state: WorkerState::Error,
+                    retryable: Some(false),
+                    waiting_on: None,
+                    local_id: None,
+                    endpoint: None,
+                    adapters: Vec::new(),
+                    diagnostics: None,
+                    message: Some(LOST_WORKER.into()),
+                    telemetry: None,
+                });
+            }
+            Some(false) => {}
+            None => {
+                return Err(crate::instance::NotLookedAt(
+                    "whether Core sends this worker as built is not known for the view in hand; nothing was built".into(),
+                )
+                .into());
+            }
+        }
+        // **Re-read before a build** (G_reread, S8; finding 7's C4b for a
+        // worker): cloned only if a fresh view still wants it and does not
+        // say built. A pass whose view predates the horizon read it unbuilt;
+        // its fresh view may say built, and then the next pass looks for it
+        // rather than cloning. Not wanted, built, or not read: nothing is
+        // built, nothing is said, and the observation is incomplete.
+        match build_gate.await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(crate::instance::NotLookedAt(
+                    "Core's view, read again just before the build, no longer wants this worker or says it was built; \
+                     nothing was built"
+                        .into(),
+                )
+                .into());
+            }
+            Err(e) => {
+                return Err(crate::instance::NotLookedAt(format!(
+                    "Core's view could not be read again just before the build, so nothing was built: {e:#}"
+                ))
+                .into());
+            }
         }
 
         // Snippet must exist before the VM references it.
@@ -1396,6 +1551,213 @@ mod a_worker_is_claimed_before_it_can_fail {
         drop(calls);
         assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod a_worker_sent_built_is_looked_for {
+    //! Finding 6 for workers: Core sends a worker create past its horizon as
+    //! built (omnuv 0220). It is looked for and never cloned, and said lost
+    //! only when nothing carries its claim or its stamp and nothing is owed
+    //! for it: those words, from a view that carried Core's question, are
+    //! what its clock concludes on.
+    use crate::pvemock::{task_ok, Mock};
+    use omnuv_protocol::{InferenceWorkerSpec, Lifecycle, WorkerState};
+
+    fn spec() -> InferenceWorkerSpec {
+        InferenceWorkerSpec {
+            id: "5f0a6b1e-0000-4000-8000-00000000f6f6".into(),
+            intent: Lifecycle::Running,
+            image: "vllm/vllm-openai:latest".into(),
+            model_repo: "org/model".into(),
+            vllm_args: vec![],
+            vcpus: 4,
+            memory_mib: 4096,
+            disk_gib: 20,
+            gpu_local_ids: vec![],
+            gpu_node: None,
+            port: 8000,
+            budget_secs: None,
+        }
+    }
+
+    /// A cluster whose one node holds `guests` (vmid, tags, pool, first line
+    /// of the description), and on which a clone can be asked for.
+    async fn a_cluster(guests: Vec<(u32, &'static str, &'static str, String)>) -> Mock {
+        Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            let listed: Vec<serde_json::Value> = guests
+                .iter()
+                .map(|(vmid, tags, pool, _)| serde_json::json!({"node": "n1", "vmid": vmid, "status": "running", "tags": tags, "pool": pool}))
+                .collect();
+            match (method, path) {
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!(listed)),
+                ("GET", p) if p.starts_with("/cluster/resources") => (200, serde_json::json!(listed)),
+                ("GET", "/cluster/status") => (200, serde_json::json!([{"type": "node", "name": "n1", "local": 1, "online": 1}])),
+                ("GET", p) if p.ends_with("/storage/onv-snippets/status") => (200, serde_json::json!({"shared": 1})),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("321")),
+                ("GET", p) if p.ends_with("/status/current") => (200, serde_json::json!({"status": "running"})),
+                ("GET", p) if p.ends_with("/config") => {
+                    let vmid: u32 = p.trim_start_matches("/nodes/n1/qemu/").trim_end_matches("/config").parse().unwrap_or(0);
+                    let description = guests.iter().find(|g| g.0 == vmid).map(|g| g.3.clone()).unwrap_or_default();
+                    (200, serde_json::json!({"description": description}))
+                }
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await
+    }
+
+    /// A snippet directory of its own: the clone journal is kept beside it
+    /// (`pending::dir`), so a bare temporary directory would share it.
+    fn snippets() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("snippets");
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    async fn ensure(
+        mock: &Mock,
+        dir: &std::path::Path,
+        built: Option<bool>,
+        build: bool,
+    ) -> anyhow::Result<omnuv_protocol::WorkerStatus> {
+        mock.client()
+            .ensure_inference_worker_gated(
+                9000,
+                "local",
+                dir.to_str().unwrap(),
+                &spec(),
+                "https://api.example.com",
+                built,
+                std::future::ready(Ok(true)),
+                std::future::ready(Ok(build)),
+            )
+            .await
+    }
+
+    fn writes(mock: &Mock) -> Vec<String> {
+        mock.calls.lock().unwrap().iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect()
+    }
+
+    fn lost(s: &omnuv_protocol::WorkerStatus) -> bool {
+        s.message.as_deref() == Some(super::LOST_WORKER)
+    }
+
+    /// Nothing carries it, nothing is owed, nothing is stamped: lost, in the
+    /// words Core parses, and nothing asked of Proxmox. Not known whether it
+    /// is built, and a fresh view that refuses the build: nothing built, and
+    /// nothing said.
+    #[tokio::test]
+    async fn a_worker_sent_built_that_nothing_carries_is_lost() {
+        let (_root, dir) = snippets();
+        let mock = a_cluster(vec![]).await;
+        let status = ensure(&mock, &dir, Some(true), true).await.expect("a status");
+        assert!(lost(&status), "{status:?}");
+        assert_eq!(
+            (status.state, status.retryable, status.local_id.as_deref(), status.waiting_on.as_deref()),
+            (WorkerState::Error, Some(false), None, None)
+        );
+        assert!(writes(&mock).is_empty(), "a worker sent built asked Proxmox to change something: {:?}", writes(&mock));
+
+        for (built, build, why) in [(None, true, "not known to be built"), (Some(false), false, "refused by the fresh view")] {
+            let mock = a_cluster(vec![]).await;
+            let e = ensure(&mock, &dir, built, build).await.expect_err(why);
+            assert!(e.downcast_ref::<crate::instance::NotLookedAt>().is_some(), "{why}: {e:#}");
+            assert!(writes(&mock).is_empty(), "{why}: a worker was built: {:?}", writes(&mock));
+        }
+        // The control: not built, and the fresh view still wants it: cloned.
+        let mock = a_cluster(vec![]).await;
+        let _ = ensure(&mock, &dir, Some(false), true).await;
+        assert!(mock.called("POST", "/nodes/n1/qemu/9000/clone"), "the control cloned nothing: {:?}", writes(&mock));
+    }
+
+    /// Carried by its claim: the worker is there, and is reported as it is,
+    /// with its runtime id, which Core adopts. Never lost.
+    #[tokio::test]
+    async fn a_worker_sent_built_that_is_there_is_reported_not_lost() {
+        let (_root, dir) = snippets();
+        let tags: &'static str = Box::leak(format!("{};{}", super::TAG, crate::names::short_tag(&spec().id)).into_boxed_str());
+        let mock = a_cluster(vec![(412, tags, crate::join::GATEWAY_POOL, String::new())]).await;
+        let status = ensure(&mock, &dir, Some(true), true).await.expect("a status");
+        assert!(!lost(&status), "a worker that is there was said lost: {status:?}");
+        assert_eq!(status.local_id.as_deref(), Some("412"));
+        assert!(!mock.called("POST", "/nodes/n1/qemu/9000/clone"), "a worker that is there was cloned");
+    }
+
+    /// Owed a clone (its record in the journal), or beside a clone carrying
+    /// its stamp and no claim: waited on, never said lost, never cloned.
+    #[tokio::test]
+    async fn a_worker_sent_built_but_owed_or_stamped_is_not_lost() {
+        let (_root, dir) = snippets();
+        let journal = crate::pending::dir(dir.to_str().unwrap());
+        crate::pending::write(&journal, &crate::pending::PendingClone {
+            vmid: 555,
+            id: spec().id,
+            node: "n1".into(),
+            upid: None,
+            claim: super::TAG.to_string(),
+            stage: crate::pending::Stage::Cloning,
+        })
+        .unwrap();
+        let mock = a_cluster(vec![]).await;
+        let status = ensure(&mock, &dir, Some(true), true).await.expect("a status");
+        assert!(!lost(&status) && status.waiting_on.is_some(), "a worker owed a clone was said lost: {status:?}");
+        assert!(writes(&mock).is_empty(), "{:?}", writes(&mock));
+
+        let (_root, dir) = snippets();
+        let stamp = crate::names::stamped(super::TAG, &spec().id);
+        let mock = a_cluster(vec![(777, "", crate::join::GATEWAY_POOL, stamp)]).await;
+        let status = ensure(&mock, &dir, Some(true), true).await.expect("a status");
+        assert!(!lost(&status) && status.waiting_on.is_some(), "a worker beside its stamped clone was said lost: {status:?}");
+        assert!(writes(&mock).is_empty(), "{:?}", writes(&mock));
+    }
+
+    /// **`built` rides Core's JSON, and is kept per view** (finding 6 for
+    /// workers). Read from the body: true where Core says so, and nowhere
+    /// else — a missing field, a Core that predates it, and a body this
+    /// cannot read name none. The protocol's own read of the same body is
+    /// unchanged by the field. A view's entry answers only for its revision;
+    /// the newest answer under a revision replaces an older one, and only a
+    /// few are kept.
+    #[test]
+    fn built_is_read_from_cores_json_and_kept_per_view() {
+        let body = serde_json::json!({
+            "protocol_version": omnuv_protocol::PROTOCOL_VERSION, "version": 7, "unchanged": false,
+            "instances": [], "images": [],
+            "inference_workers": [
+                {"id": "a", "lifecycle": "running", "image": "i", "model_repo": "r", "vcpus": 1, "memory_mib": 1,
+                 "disk_gib": 1, "port": 8000, "built": true},
+                {"id": "b", "lifecycle": "running", "image": "i", "model_repo": "r", "vcpus": 1, "memory_mib": 1,
+                 "disk_gib": 1, "port": 8000, "built": false},
+                {"id": "c", "lifecycle": "running", "image": "i", "model_repo": "r", "vcpus": 1, "memory_mib": 1,
+                 "disk_gib": 1, "port": 8000}
+            ]
+        })
+        .to_string();
+        let built = super::built_workers(body.as_bytes());
+        assert_eq!(built.into_iter().collect::<Vec<_>>(), vec!["a".to_string()]);
+        let view: omnuv_protocol::DesiredState = serde_json::from_slice(body.as_bytes()).expect("the protocol's read");
+        assert_eq!(view.inference_workers.len(), 3);
+        assert!(super::built_workers(br#"{"version": 1}"#).is_empty(), "a view with no workers named one");
+        assert!(super::built_workers(b"not json").is_empty(), "a body that cannot be read named one");
+
+        let mut views = super::BuiltViews::default();
+        views.heard(7, ["a".to_string()].into());
+        assert_eq!(views.built(7, "a"), Some(true));
+        assert_eq!(views.built(7, "b"), Some(false));
+        assert_eq!(views.built(8, "a"), None, "a view whose answer is not held was answered");
+        views.heard(7, Default::default());
+        assert_eq!(views.built(7, "a"), Some(false), "an older answer under a revision outlived a newer one");
+        for v in 10..30 {
+            views.heard(v, Default::default());
+        }
+        assert_eq!(views.built(7, "a"), None, "every view ever heard is kept");
+        assert_eq!(views.built(29, "a"), Some(false));
     }
 }
 
