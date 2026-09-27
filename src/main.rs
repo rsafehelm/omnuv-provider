@@ -30,6 +30,7 @@ mod teardown;
 mod dur;
 mod timings;
 mod workload_config;
+mod scrub;
 #[cfg(test)]
 mod pvemock;
 

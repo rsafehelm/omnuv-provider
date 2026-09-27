@@ -747,6 +747,28 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         });
     }
 
+    // **The card scrub runs beside the reconcile loop, never inside it**
+    // (lifecycle phase 9), for the image mirror's reason: a scrub is a clone
+    // and a boot with the driver, minutes each, and a buyer's machine must not
+    // wait behind a card nobody can buy yet. Its own period,
+    // `timings.scrubEvery`; its own failures, said and retried next period.
+    {
+        let core = core.clone();
+        let driver = driver.clone();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let mut held = crate::scrub::Held::default();
+            let mut tick = tokio::time::interval(cfg.timings.scrub_every.std());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(e) = scrub_once(&core, &driver, &cfg, &mut held).await {
+                    eprintln!("scrub: {e:#}");
+                }
+            }
+        });
+    }
+
     // Runtime tasks can take minutes. Their progress must not suppress the
     // liveness channel or make Core mark a working provider offline.
     let mut heartbeat = spawn_heartbeat(
@@ -846,6 +868,45 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             inventory = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         }
     }
+}
+
+/// **One look at the cards Core holds for a scrub** (lifecycle phase 9): ask
+/// which, run or look at each, and report what finished. Nothing while this
+/// agent is in restore mode (TD11), and nothing from a Core that predates the
+/// route (404): its cards are never held for a scrub.
+async fn scrub_once(
+    core: &Core,
+    driver: &proxmox::Client,
+    cfg: &AgentConfig,
+    held: &mut crate::scrub::Held,
+) -> anyhow::Result<()> {
+    if crate::restore::active(&core.restore) {
+        return Ok(());
+    }
+    let wants: crate::scrub::Wants = match core.get_json(crate::scrub::PATH).await {
+        Ok(w) => w,
+        Err(e) if e.downcast_ref::<CoreAnswered>().is_some_and(|a| a.status == 404) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
+    let template_for = |image: &str| cfg.proxmox.template_for(image);
+    let setup = crate::scrub::Setup { storage, snippet_dir: &cfg.proxmox.snippet_dir, template_for: &template_for };
+    let said = driver.scrub_pass(&wants.scrubs, held, &setup).await;
+    if said.is_empty() {
+        return Ok(());
+    }
+    let res = core
+        .post(crate::scrub::PATH, Some(serde_json::to_value(crate::scrub::Report { scrubs: &said })?))
+        .await?;
+    if !res.status().is_success() {
+        return Err(CoreAnswered { path: crate::scrub::PATH.into(), status: res.status().as_u16() }.into());
+    }
+    let answer: crate::scrub::Answer = res.json().await?;
+    for r in &answer.results {
+        println!("scrub {} attempt {}: Core recorded {}", r.id, r.attempt, r.result);
+    }
+    held.answered(&answer.results);
+    Ok(())
 }
 
 /// How often the inventory is reported: `timings.inventoryEvery`, and never
