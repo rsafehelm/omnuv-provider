@@ -2017,6 +2017,17 @@ async fn reconcile_workers(
                     .await
             }
         };
+        // **Not looked at is not an error** (PROVIDER-26, as for instances
+        // below): a worker whose node would not give its power state was
+        // neither acted on nor seen, so it is left out of the report and the
+        // observation is incomplete, rather than painted ERROR on one blip.
+        if let Err(e) = &result
+            && e.downcast_ref::<crate::instance::NotLookedAt>().is_some()
+        {
+            unobserved_workers += 1;
+            eprintln!("worker {}: {e}", spec.id);
+            continue;
+        }
         // A failure on one worker must not stop the others from converging, and
         // must be visible to the operator rather than retried in silence.
         statuses.push(result.unwrap_or_else(|e| {

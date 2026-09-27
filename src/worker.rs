@@ -375,18 +375,31 @@ impl Client {
             // the same correction as `ensure_instance`, for the same reason:
             // converging on a stale `stopped` starts a running machine and
             // reports a failure that never happened.
-            let vm = match self
-                .get_json::<serde_json::Value>(&format!(
-                    "/nodes/{node}/qemu/{}/status/current",
-                    vm.vmid
-                ))
+            //
+            // **Not looked at, so not acted on** (the phase 7 follow-up to
+            // `fixed.md`'s "A machine deleted the moment it started"). A node
+            // that would not answer fell back to the listing's `status`, and
+            // the start or shutdown below then acted on exactly the stale
+            // reading this read exists to replace. Nothing is started, shut
+            // down or reported; the next pass asks again (PROVIDER-26).
+            let live = self
+                .get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{}/status/current", vm.vmid))
                 .await
-            {
-                Ok(live) => VmRef {
-                    status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
-                    ..vm
-                },
-                Err(_) => vm,
+                .and_then(|live| {
+                    live.get("status")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow::anyhow!("its answer carried no power state"))
+                });
+            let vm = match live {
+                Ok(status) => VmRef { status: Some(status), ..vm },
+                Err(e) => {
+                    return Err(crate::instance::NotLookedAt(format!(
+                        "{node} would not say how worker vm {} is: {e:#}",
+                        vm.vmid
+                    ))
+                    .into());
+                }
             };
             let mut running = vm.status.as_deref() == Some("running");
 
@@ -1444,5 +1457,47 @@ mod a_worker_takes_its_new_configuration {
             .expect("a pass");
         assert_eq!(reboots(&mock), 2, "a new argument never reached the worker");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A worker's power state is its node's, or nothing is done** (the
+    /// phase 7 follow-up to `fixed.md`'s "A machine deleted the moment it
+    /// started"). The listing lags: it says stopped for a worker wanted
+    /// running, and running for one wanted stopped. The node will not
+    /// answer. Nothing is started, nothing is shut down, and the pass says
+    /// the worker was not looked at rather than reporting it.
+    #[tokio::test]
+    async fn a_worker_status_the_node_would_not_give_is_not_guessed_from_the_listing() {
+        let key = short_tag("worker_abc");
+        for (listed, intent, verb) in [
+            ("stopped", Lifecycle::Running, "/nodes/n1/qemu/801/status/start"),
+            ("running", Lifecycle::Stopped, "/nodes/n1/qemu/801/status/shutdown"),
+        ] {
+            let key = key.clone();
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                        {"node": "n1", "vmid": 801, "status": listed, "tags": format!("{TAG};{key}")}])),
+                    ("GET", "/nodes/n1/qemu/801/status/current") => (503, serde_json::Value::Null),
+                    _ => crate::pvemock::gate_clear(method, path).unwrap_or((200, serde_json::Value::Null)),
+                }
+            })
+            .await;
+            let root = std::env::temp_dir().join(format!("onv-worker-unlooked-{listed}-{}", std::process::id()));
+            let dir = root.join("snippets");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut sp = spec(&["--model", "org/model"]);
+            sp.intent = intent;
+            let e = mock
+                .client()
+                .ensure_inference_worker(9000, "local", &dir.to_string_lossy(), &sp, "https://core")
+                .await
+                .expect_err("nothing was observed");
+            assert!(e.downcast_ref::<crate::instance::NotLookedAt>().is_some(), "reported as something: {e:#}");
+            assert!(!mock.called("POST", verb), "{verb} on the listing's {listed}");
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 }

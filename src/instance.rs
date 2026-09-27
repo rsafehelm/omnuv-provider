@@ -1462,7 +1462,21 @@ impl Client {
                 }
             };
             let (at, vm) = found;
-            let running = vm.status.as_deref() == Some("running");
+            // **Its power state from its node, not from the listing** (the
+            // phase 7 follow-up to `fixed.md`'s "A machine deleted the moment
+            // it started"). The listing answered *where*; its `status` is
+            // pvestatd's cache and lags a start by up to ten seconds, so a
+            // machine started a moment ago read `stopped` and was started
+            // again. Only a machine its node calls stopped now is restarted:
+            // running, paused and anything else are left, and a node that
+            // will not say is left too — never a start on a guess.
+            let running = match self.live_status(&at, vm.vmid).await {
+                Ok(now) => now != "stopped",
+                Err(e) => {
+                    eprintln!("maintain {}: its node would not say whether vm {} runs, left as it is: {e:#}", spec.id, vm.vmid);
+                    continue;
+                }
+            };
             if !maintenance_may_touch(spec.intent, true, running) {
                 continue;
             }
@@ -2396,6 +2410,9 @@ mod tests {
                     {"node": "n2", "vmid": 702, "status": "stopped", "tags": format!("{TAG};{b}")}])),
                 ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([{"vmid": 701, "status": "stopped", "tags": format!("{TAG};{a}")}])),
                 ("GET", "/nodes/n2/qemu") => (200, serde_json::json!([{"vmid": 702, "status": "stopped", "tags": format!("{TAG};{b}")}])),
+                ("GET", "/nodes/n1/qemu/701/status/current") | ("GET", "/nodes/n2/qemu/702/status/current") => {
+                    (200, serde_json::json!({"status": "stopped"}))
+                }
                 ("POST", "/nodes/n1/qemu/701/status/start") => (500, serde_json::Value::Null),
                 ("POST", "/nodes/n2/qemu/702/status/start") => (200, serde_json::json!("UPID:n2:start")),
                 _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
@@ -2405,6 +2422,42 @@ mod tests {
         let restarted = mock.client().maintain(&[first, second]).await.expect("maintenance");
         assert_eq!(restarted, 1, "the machine on the other node was not restarted after the first failed");
         assert!(mock.called("POST", "/nodes/n2/qemu/702/status/start"));
+    }
+
+    /// **Maintenance restarts only what its node calls stopped now** (the
+    /// phase 7 follow-up to `fixed.md`'s "A machine deleted the moment it
+    /// started"). Core is unreachable and both machines should be running;
+    /// the listing, which lags a start by seconds, says both are stopped.
+    /// The first's node says it runs: not started again. The second's node
+    /// will not answer: left as it is, never started on the listing's word.
+    #[tokio::test]
+    async fn maintenance_reads_the_node_and_never_the_listing() {
+        use crate::pvemock::{task_ok, Mock};
+        let mut first = spec();
+        first.id = "33333333-3333-4333-8333-333333333333".into();
+        first.intent = Lifecycle::Running;
+        let mut second = first.clone();
+        second.id = "44444444-4444-4444-8444-444444444444".into();
+        let (a, b) = (short_tag(&first.id), short_tag(&second.id));
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 711, "status": "stopped", "tags": format!("{TAG};{a}")},
+                    {"node": "n1", "vmid": 712, "status": "stopped", "tags": format!("{TAG};{b}")}])),
+                ("GET", "/nodes/n1/qemu/711/status/current") => (200, serde_json::json!({"status": "running"})),
+                ("GET", "/nodes/n1/qemu/712/status/current") => (503, serde_json::Value::Null),
+                ("POST", p) if p.ends_with("/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+            }
+        })
+        .await;
+        let restarted = mock.client().maintain(&[first, second]).await.expect("maintenance");
+        assert_eq!(restarted, 0, "a machine was restarted on the listing's word");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/711/status/start"), "a running machine was started again");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/712/status/start"), "a machine nobody could look at was started");
     }
 
     /// **A machine that was built is not built again.** No VM carries its
