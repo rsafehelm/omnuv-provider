@@ -69,6 +69,9 @@ struct Core {
     /// The run lease (lifecycle phase 12, A9): what each view answer said
     /// of it, and the leases held.
     lease: crate::lease::Shared,
+    /// Which workers each recent full view sends as built (finding 6 for
+    /// workers): Core's own JSON beside the protocol's fields.
+    built: crate::worker::SharedBuilt,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -214,6 +217,7 @@ impl Core {
             session: Default::default(),
             restore: Default::default(),
             lease: Default::default(),
+            built: Default::default(),
         })
     }
 
@@ -256,7 +260,13 @@ impl Core {
         }
         let named = res.headers().get(crate::restore::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let lease = res.headers().get(crate::lease::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
-        let view = res.json().await?;
+        // **One body, read twice** (finding 6 for workers): as the protocol's
+        // view, and for the `built` Core sends beside a worker's fields.
+        let body = res.bytes().await?;
+        let view: DesiredState = serde_json::from_slice(&body)?;
+        if !view.unchanged {
+            crate::poison::lock(&self.built, "workers sent as built").heard(view.version, crate::worker::built_workers(&body));
+        }
         crate::lease::heard(&self.lease, asked, lease);
         Ok((view, named))
     }
@@ -1303,7 +1313,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1330,6 +1340,7 @@ mod handshake_tests {
             session: Default::default(),
             restore: Default::default(),
             lease: Default::default(),
+            built: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1410,7 +1421,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1439,7 +1450,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1576,6 +1587,94 @@ mod handshake_tests {
             ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
             _ => (404, serde_json::Value::Null),
         }
+    }
+
+    /// A view of one worker being created and nothing else, at `version`,
+    /// with Core's `built` beside the protocol's fields when `built` is set.
+    fn a_worker_view(version: u64, built: Option<bool>) -> serde_json::Value {
+        let mut view: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        view["version"] = serde_json::json!(version);
+        view["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+        view["instances"] = serde_json::json!([]);
+        let mut worker = serde_json::json!({
+            "id": "5f0a6b1e-0000-4000-8000-00000000f6f6", "lifecycle": "running",
+            "image": "vllm/vllm-openai:latest", "model_repo": "org/model", "vllm_args": [],
+            "vcpus": 4, "memory_mib": 4096, "disk_gib": 20, "gpu_local_ids": [], "port": 8000
+        });
+        if let Some(b) = built {
+            worker["built"] = serde_json::json!(b);
+        }
+        view["inference_workers"] = serde_json::json!([worker]);
+        view
+    }
+
+    /// An empty node a worker can be cloned onto: [`an_empty_node`], and what
+    /// a worker's placement asks besides.
+    fn an_empty_node_for_a_worker(method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+        match (method, path) {
+            ("GET", "/cluster/status") => (200, serde_json::json!([{"type": "node", "name": "n1", "local": 1, "online": 1}])),
+            ("GET", p) if p.ends_with("/storage/onv-snippets/status") => {
+                (200, serde_json::json!({"shared": 1, "type": "dir", "active": 1}))
+            }
+            _ => an_empty_node(method, path, body),
+        }
+    }
+
+    fn clones(calls: &[crate::pvemock::Call]) -> Vec<String> {
+        calls.iter().filter(|c| c.method == "POST" && c.path.ends_with("/clone")).map(|c| c.path.clone()).collect()
+    }
+
+    fn the_report(sent: &[(String, String)]) -> serde_json::Value {
+        let (_, report) = sent.iter().find(|(h, _)| h.starts_with("post /provider/v1/status")).expect("a report");
+        serde_json::from_str(report).unwrap()
+    }
+
+    /// **A worker Core sends as built, that nothing here carries, is reported
+    /// lost and never cloned** (finding 6 for workers; H6 for a worker). The
+    /// view is Core's JSON with `"built": true` beside the worker's fields:
+    /// its create ran past its horizon. Nothing carries its claim or stamp and
+    /// nothing is owed, so the pass says it is lost, in the words Core's clock
+    /// concludes on, and asks Proxmox for nothing. The control: the same view
+    /// without `built`, as a Core that predates it sends it, is cloned as it
+    /// always was, so the harness can see a clone. Before this, the built
+    /// worker was cloned too.
+    #[tokio::test]
+    async fn a_worker_sent_built_that_nothing_carries_is_lost_not_cloned() {
+        let (_, calls) = a_pass_serving(vec![a_worker_view(5, None)], an_empty_node_for_a_worker).await;
+        assert!(!clones(&calls).is_empty(), "the control asked for no clone, so this test could not see one: {calls:?}");
+
+        let (sent, calls) = a_pass_serving(vec![a_worker_view(5, Some(true))], an_empty_node_for_a_worker).await;
+        assert!(clones(&calls).is_empty(), "a worker Core sends as built was cloned again (H6): {:?}", clones(&calls));
+        let writes: Vec<_> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
+        assert!(writes.is_empty(), "a lost worker asked Proxmox to change something: {writes:?}");
+        let report = the_report(&sent);
+        let w = &report["workers"][0];
+        assert_eq!(
+            (w["state"].as_str(), w["retryable"].as_bool(), w["local_id"].is_null(), w["waiting_on"].is_null()),
+            (Some("ERROR"), Some(false), true, true),
+            "{report}"
+        );
+        assert_eq!(w["message"].as_str(), Some(crate::worker::LOST_WORKER), "{report}");
+        assert!(crate::worker::LOST_WORKER.starts_with("this worker is no longer on its provider"),
+            "Core parses this start: {}", crate::worker::LOST_WORKER);
+    }
+
+    /// **A worker create a fresh view says was built is not cloned** (finding
+    /// 7's C4b, for a worker). The pass's view is revision 5, from before the
+    /// worker's horizon: Running, not built. Core has since passed the
+    /// horizon, and its view, revision 6, sends it as built. The re-read
+    /// before the build reads revision 6; it must refuse, and the pass clone
+    /// nothing, report nothing of the worker, and say it did not look. Before
+    /// this a worker's build had no re-read at all.
+    #[tokio::test]
+    async fn a_worker_a_fresh_view_says_was_built_is_not_cloned() {
+        let (sent, calls) =
+            a_pass_serving(vec![a_worker_view(5, None), a_worker_view(6, Some(true))], an_empty_node_for_a_worker).await;
+        assert!(clones(&calls).is_empty(), "a worker create the fresh view says was built was cloned (C4b): {:?}", clones(&calls));
+        let report = the_report(&sent);
+        assert_eq!(report["workers"], serde_json::json!([]), "the worker was reported on a pass that did not look: {report}");
+        assert_eq!(report["observation"]["complete"], serde_json::json!(false));
     }
 
     /// **A create a fresh view says was built is not cloned** (finding 7 of
@@ -2225,6 +2324,10 @@ async fn reconcile_workers(
                 Err(anyhow::anyhow!(crate::teardown::built_again(&cfg.proxmox.snippet_dir, &spec.id).unwrap_or_default()))
             }
             _ => {
+                // Whether the view in hand sends it as built (finding 6 for
+                // workers), and, if it is to be built, a fresh view read
+                // again first (G_reread, and C4b for a worker).
+                let built = crate::poison::lock(&core.built, "workers sent as built").built(desired.version, &spec.id);
                 driver
                     .ensure_inference_worker_gated(
                         cfg.proxmox.template_vmid,
@@ -2232,7 +2335,9 @@ async fn reconcile_workers(
                         &cfg.proxmox.snippet_dir,
                         spec,
                         &cfg.core.url,
+                        built,
                         still_running(core, held, &spec.id),
+                        still_wanted(core, held, &spec.id),
                     )
                     .await
             }
@@ -2683,8 +2788,9 @@ async fn intent_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &s
 }
 
 /// What a fresh view says of `id`: its intent and whether Core has seen it
-/// built (a worker carries no such flag: never), or nothing, as
-/// [`intent_now`].
+/// built, or nothing, as [`intent_now`]. A worker's `built` rides Core's own
+/// JSON (finding 6 for workers); a view whose answer is not held reads as
+/// built, so nothing is built on it.
 async fn seen_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<Option<(Lifecycle, bool)>> {
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
     let (fetched, named) = core.get_view(known).await?;
@@ -2710,12 +2816,15 @@ async fn seen_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str
         *crate::poison::lock(held, "held desired state") = Some(fetched.clone());
         fetched
     };
+    let worker_built = |id: &str| {
+        crate::poison::lock(&core.built, "workers sent as built").built(view.version, id).unwrap_or(true)
+    };
     Ok(view
         .instances
         .iter()
         .find(|s| s.id == id)
         .map(|s| (s.intent, s.built))
-        .or_else(|| view.inference_workers.iter().find(|s| s.id == id).map(|s| (s.intent, false))))
+        .or_else(|| view.inference_workers.iter().find(|s| s.id == id).map(|s| (s.intent, worker_built(&s.id)))))
 }
 
 #[cfg(test)]

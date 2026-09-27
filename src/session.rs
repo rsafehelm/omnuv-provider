@@ -41,8 +41,12 @@ pub const HEADER: &str = "onv-session";
 /// restore-mode   this agent keeps its head, tells Core when a view does not
 ///                extend it, and lists and acts on nothing while in a restore
 ///                (`restore`, lifecycle phase 8)
+/// worker-lost    this agent reads a worker's `built`, never builds one sent
+///                built, and says one it holds nothing of is lost (`worker`,
+///                finding 6 for workers)
 /// ```
-pub const CAPABILITIES: &[&str] = &["session", "proven-delete", crate::restore::CAPABILITY, crate::lease::CAPABILITY];
+pub const CAPABILITIES: &[&str] =
+    &["session", "proven-delete", crate::restore::CAPABILITY, crate::lease::CAPABILITY, crate::worker::CAPABILITY];
 
 /// The session in force, if any.
 pub fn current(session: &Session) -> Option<String> {
