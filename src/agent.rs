@@ -1191,6 +1191,8 @@ mod handshake_tests {
             (view(8, "running"), held_at(7, Lifecycle::Absent), false, true, "a newer view wanting it again"),
             (view(6, "deleted"), held_at(7, Lifecycle::Running), false, false, "an older view (G_viewMonotone)"),
             (r#"{"protocol_version":6,"version":7,"unchanged":true}"#.to_string(), held_at(7, Lifecycle::Running), false, true, "unchanged: the view held"),
+            (view(8, "running").replace(r#""disk_gib":8"#, r#""disk_gib":8,"built":true"#), held_at(7, Lifecycle::Running), false, false,
+             "a newer view saying built (finding 7, G_rereadBuilt)"),
         ] {
             let (base, _rx) = session_stub(move |_, _| ("200 OK", answer.clone())).await;
             let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
@@ -1485,6 +1487,95 @@ mod handshake_tests {
         }
         let calls = pve.calls.lock().unwrap().clone();
         (sent, calls)
+    }
+
+    /// One pass against a Core serving `views` in turn to each view request
+    /// (the last one repeated), with no restore armed, and a Proxmox that
+    /// answers `pve`. What the pass sent Core, and what it asked of Proxmox.
+    pub(super) async fn a_pass_serving(
+        views: Vec<serde_json::Value>,
+        pve: impl Fn(&str, &str, &str) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> (Vec<(String, String)>, Vec<crate::pvemock::Call>) {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let bodies: Vec<String> = views.iter().map(|v| v.to_string()).collect();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base, mut rx) = session_stub(move |line, _| {
+            if line.starts_with("GET /provider/v1/desired-state") {
+                let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ("200 OK", bodies[n.min(bodies.len() - 1)].clone())
+            } else {
+                ("204 No Content", String::new())
+            }
+        })
+        .await;
+        let pve = crate::pvemock::Mock::start(pve).await;
+        let snippets = tempfile::tempdir().unwrap();
+        let snippet_dir = snippets.path().join("snippets");
+        std::fs::create_dir_all(&snippet_dir).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippet_dir.display()
+        ))
+        .expect("config");
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        let mut sent = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            sent.push(r);
+        }
+        let calls = pve.calls.lock().unwrap().clone();
+        (sent, calls)
+    }
+
+    /// A Proxmox with one empty node, on which a clone can be asked for (the
+    /// clone itself is refused: what is asserted is whether it was asked).
+    pub(super) fn an_empty_node(method: &str, path: &str, _: &str) -> (u16, serde_json::Value) {
+        match (method, path) {
+            ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+            ("GET", p) if p.starts_with("/cluster/resources") => (200, serde_json::json!([])),
+            ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+            _ => (404, serde_json::Value::Null),
+        }
+    }
+
+    /// **A create a fresh view says was built is not cloned** (finding 7 of
+    /// the lifecycle model, C4b; the model's G_rereadBuilt). The pass's view
+    /// is revision 5, from before the machine's horizon: Running, not built.
+    /// Core has since passed the horizon, and its view, revision 6, sends the
+    /// machine as built — "never cloned again". The re-read before the build
+    /// reads revision 6; it must refuse, and the pass clone nothing.
+    #[tokio::test]
+    async fn a_create_a_fresh_view_says_was_built_is_not_cloned() {
+        let mut before: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        before["version"] = serde_json::json!(5);
+        before["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+        let mut after = before.clone();
+        after["version"] = serde_json::json!(6);
+        after["instances"][0]["built"] = serde_json::json!(true);
+
+        // The control: the same pass with a fresh view that still wants it
+        // unbuilt does ask for the clone, so the harness can see one.
+        let (_, calls) = a_pass_serving(vec![before.clone(), before.clone()], an_empty_node).await;
+        assert!(calls.iter().any(|c| c.method == "POST" && c.path.ends_with("/clone")),
+            "the control asked for no clone, so this test could not see one: {calls:?}");
+
+        let (sent, calls) = a_pass_serving(vec![before, after], an_empty_node).await;
+        let clones: Vec<_> = calls.iter().filter(|c| c.method == "POST" && c.path.ends_with("/clone")).collect();
+        assert!(clones.is_empty(), "a create the fresh view says was built was cloned (C4b): {clones:?}");
+        let (_, report) = sent.iter().find(|(h, _)| h.starts_with("post /provider/v1/status")).expect("a report");
+        let report: serde_json::Value = serde_json::from_str(report).unwrap();
+        assert_eq!(report["instances"], serde_json::json!([]), "the machine was reported on a pass that did not look: {report}");
+        assert_eq!(report["observation"]["complete"], serde_json::json!(false));
     }
 
     /// **In a restore this agent lists and acts on nothing** (lifecycle phase
@@ -2150,8 +2241,9 @@ async fn reconcile_workers(
             // here, with the reason reported, is what keeps the scheduler's
             // provider_images honest: Core only places images we said we offer.
             // **Re-read before a build** (G_reread, S8): a machine Core has
-            // not seen built is cloned only if a fresh view still wants it.
-            // Not wanted, or the view could not be read: nothing is built,
+            // not seen built is cloned only if a fresh view still wants it,
+            // and still does not say built (finding 7, G_rereadBuilt).
+            // Not wanted, built, or the view could not be read: nothing is built,
             // nothing is said, and the observation is incomplete.
             _ if !spec.built && !matches!(still_wanted(core, held, &spec.id).await, Ok(true)) => {
                 Err(anyhow::Error::from(crate::instance::NotLookedAt(
@@ -2423,14 +2515,28 @@ async fn still_absent(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: 
 /// fetched a machine Running, the buyer deleted it, and the agent cloned and
 /// started it from the view it held. A machine Core has not seen built is
 /// cloned only if a fresh view still wants it.
+///
+/// **And not built** (finding 7 of the lifecycle model, C4b; G_rereadBuilt).
+/// From a create's horizon Core sends it as built, so it is never cloned
+/// again (0192). A pass whose view predates the horizon read it unbuilt, and
+/// its re-read asked only the intent: it cloned after Core had said nothing
+/// would. A fresh view that says built is a refusal like any other; the next
+/// pass reads the machine as built, and looks for it rather than cloning.
 async fn still_wanted(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<bool> {
-    Ok(matches!(intent_now(core, held, id).await?, Some(Lifecycle::Running | Lifecycle::Stopped)))
+    Ok(matches!(seen_now(core, held, id).await?, Some((Lifecycle::Running | Lifecycle::Stopped, false))))
 }
 
 /// What a fresh view says of `id`: its intent, or nothing — not in the view,
 /// or no view this agent may act on. A full answer older than the view held
 /// is never acted on (G_viewMonotone).
 async fn intent_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<Option<Lifecycle>> {
+    Ok(seen_now(core, held, id).await?.map(|(intent, _)| intent))
+}
+
+/// What a fresh view says of `id`: its intent and whether Core has seen it
+/// built (a worker carries no such flag: never), or nothing, as
+/// [`intent_now`].
+async fn seen_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &str) -> anyhow::Result<Option<(Lifecycle, bool)>> {
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
     let (fetched, named) = core.get_view(known).await?;
     // **No act in a restore** (lifecycle phase 8, TD11): one that began
@@ -2459,8 +2565,8 @@ async fn intent_now(core: &Core, held: &Arc<Mutex<Option<DesiredState>>>, id: &s
         .instances
         .iter()
         .find(|s| s.id == id)
-        .map(|s| s.intent)
-        .or_else(|| view.inference_workers.iter().find(|s| s.id == id).map(|s| s.intent)))
+        .map(|s| (s.intent, s.built))
+        .or_else(|| view.inference_workers.iter().find(|s| s.id == id).map(|s| (s.intent, false))))
 }
 
 #[cfg(test)]
