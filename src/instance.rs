@@ -2496,6 +2496,10 @@ mod tests {
                 assert_eq!(status.state, InstanceState::Error);
                 assert_eq!(status.retryable, Some(false), "a lost machine was offered as worth retrying");
                 assert!(status.message.as_deref().unwrap_or("").contains("no longer on its provider"));
+                // **The words Core's clock concludes on** (finding 6, omnuv
+                // 0260, `workers::LOST_WORDS`): their start is the grammar.
+                assert_eq!(status.message.as_deref(), Some(LOST));
+                assert!(LOST.starts_with("this machine is no longer on its provider"), "Core parses this start: {LOST}");
             } else {
                 assert!(cloned, "a machine never built was not built");
             }
