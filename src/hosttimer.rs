@@ -165,7 +165,8 @@ impl Log {
         let ts = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
-        let line = format!("{ts} {subject} {outcome}: {detail}\n");
+        // One record, one line: a hypervisor's hint can carry newlines.
+        let line = format!("{ts} {subject} {outcome}: {}\n", detail.replace(['\n', '\r'], " "));
         eprintln!("run-lease-expire: {subject} {outcome}: {detail}");
         let written = std::fs::OpenOptions::new()
             .create(true)
@@ -194,8 +195,10 @@ fn refuse(log: &Log, file: &Path, why: String) -> Verdict {
 /// **One run.** Stops, when `act`, each machine in `file` past its time, if
 /// and only if the agent's lease task is not running; see the module note for
 /// the order of the tests. The lock is held from the first test to the last
-/// stop, and released when this returns.
-pub async fn pass(driver: &Client, file: &Path, log: &Log, now: SystemTime, act: bool) -> Verdict {
+/// stop, and released when this returns. `driver` is asked for only when
+/// there is something to stop, so a hypervisor client that cannot be built
+/// is said only then, not every minute on a host with nothing leased.
+pub async fn pass(driver: &anyhow::Result<Client>, file: &Path, log: &Log, now: SystemTime, act: bool) -> Verdict {
     match std::fs::metadata(file) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Verdict::NoFile,
@@ -254,6 +257,10 @@ pub async fn pass(driver: &Client, file: &Path, log: &Log, now: SystemTime, act:
     if !act {
         return Verdict::WouldStop(due.into_iter().map(|l| l.id).collect());
     }
+    let driver = match driver {
+        Ok(d) => d,
+        Err(e) => return refuse(log, file, format!("the hypervisor client could not be built: {e:#}")),
+    };
 
     // Every due lease is asked about on every run (this keeps no state of its
     // own), but only what is done is said: a machine already stopped makes
@@ -319,13 +326,7 @@ pub async fn main(config: &str, secrets: &str, dry_run: bool) -> i32 {
             return 1;
         }
     };
-    let driver = match crate::agent::driver_of(&cfg) {
-        Ok(d) => d,
-        Err(e) => {
-            log.say(config, "refused", &format!("the hypervisor client could not be built: {e:#}; nothing stopped"));
-            return 1;
-        }
-    };
+    let driver = crate::agent::driver_of(&cfg);
     let file = lease::file(&cfg.proxmox.snippet_dir);
     let v = pass(&driver, &file, &log, SystemTime::now(), !dry_run).await;
     println!("run-lease-expire: {}", v.describe());
@@ -425,7 +426,7 @@ mod tests {
     async fn an_expired_machine_is_stopped_when_the_agent_is_dead() {
         let mock = proxmox(running()).await;
         let h = host(Some(&expired_body(60)), Duration::from_secs(120));
-        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert_eq!(v, Verdict::Acted { due: 1, stopped: 1, refused: 1, failed: 0 }, "{}", v.describe());
         assert_eq!(stops(&mock), ["/nodes/n1/qemu/701/status/stop"], "the wrong guests were stopped");
         let said = own_log(&h);
@@ -442,7 +443,7 @@ mod tests {
     async fn a_decoy_with_the_tag_but_another_stamp_is_left() {
         let mock = proxmox(running()).await;
         let h = host(Some(&expired_body(60)), Duration::from_secs(120));
-        pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert!(!stops(&mock).iter().any(|p| p.contains("/702/")), "the decoy was stopped");
         let said = own_log(&h);
         assert!(
@@ -459,14 +460,14 @@ mod tests {
         let mock = proxmox(running()).await;
         let h = host(Some(&expired_body(60)), Duration::from_secs(120));
         let held = lease::take_lock(&h.file).await.expect("the agent's lock");
-        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert_eq!(v, Verdict::AgentHolds { stale: Some(120) }, "{}", v.describe());
         assert!(!asked_anything(&mock), "Proxmox was asked while the agent ran");
         assert!(own_log(&h).contains("refused"), "a live agent that stopped writing was not said");
         // A fresh file under a held lock is the normal case: nothing said.
         let fresh = host(Some(&expired_body(60)), Duration::from_secs(5));
         let _also = lease::take_lock(&fresh.file).await.expect("the agent's lock");
-        let v = pass(&mock.client(), &fresh.file, &fresh.log, SystemTime::now(), true).await;
+        let v = pass(&Ok(mock.client()), &fresh.file, &fresh.log, SystemTime::now(), true).await;
         assert_eq!(v, Verdict::AgentHolds { stale: None });
         assert_eq!(own_log(&fresh), "", "the normal case was logged");
         drop(held);
@@ -480,7 +481,7 @@ mod tests {
     async fn nothing_is_stopped_while_the_file_is_younger_than_the_bound() {
         let mock = proxmox(running()).await;
         let h = host(Some(&expired_body(60)), STALE_AFTER - Duration::from_secs(5));
-        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert!(matches!(v, Verdict::WrittenRecently { .. }), "{}", v.describe());
         assert!(!asked_anything(&mock), "Proxmox was asked while an agent wrote");
     }
@@ -508,7 +509,7 @@ mod tests {
     async fn a_machine_already_stopped_is_left_and_says_nothing() {
         let mock = proxmox((200, serde_json::json!({"status": "stopped"}))).await;
         let h = host(Some(&expired_body(3600)), Duration::from_secs(3000));
-        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert_eq!(v, Verdict::Acted { due: 1, stopped: 0, refused: 1, failed: 0 }, "{}", v.describe());
         assert!(stops(&mock).is_empty(), "a stopped machine was stopped again");
         let said = own_log(&h);
@@ -522,7 +523,7 @@ mod tests {
     async fn an_unreadable_status_stops_nothing() {
         let mock = proxmox((500, serde_json::Value::Null)).await;
         let h = host(Some(&expired_body(60)), Duration::from_secs(120));
-        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert!(stops(&mock).is_empty(), "a machine whose status could not be read was stopped");
         assert!(matches!(v, Verdict::Acted { stopped: 0, failed: 1, .. }), "{}", v.describe());
         assert_eq!(v.exit_code(), 1);
@@ -534,15 +535,29 @@ mod tests {
     async fn an_absent_or_empty_file_is_a_no_op() {
         let mock = proxmox(running()).await;
         let absent = host(None, Duration::ZERO);
-        assert_eq!(pass(&mock.client(), &absent.file, &absent.log, SystemTime::now(), true).await, Verdict::NoFile);
+        assert_eq!(pass(&Ok(mock.client()), &absent.file, &absent.log, SystemTime::now(), true).await, Verdict::NoFile);
         assert!(!lease::lock_file(&absent.file).exists(), "a lock was made where nothing is leased");
         for body in ["", "  \n", "{\"leases\": []}"] {
             let h = host(Some(body), Duration::from_secs(120));
-            let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+            let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
             assert_eq!(v, Verdict::NothingLeased, "{body:?}");
             assert_eq!(own_log(&h), "");
         }
         assert!(!asked_anything(&mock));
+    }
+
+    /// **A hypervisor client that cannot be built is said only when there
+    /// is something to stop**, not every minute on a host with no lease.
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_is_said_only_when_a_stop_is_due() {
+        let broken: anyhow::Result<Client> = Err(anyhow::anyhow!("no tlsFingerprintSha256 configured"));
+        let idle = host(Some("{\"leases\": []}"), Duration::from_secs(120));
+        assert_eq!(pass(&broken, &idle.file, &idle.log, SystemTime::now(), true).await, Verdict::NothingLeased);
+        assert_eq!(own_log(&idle), "", "a client nothing needed was complained of");
+        let due = host(Some(&expired_body(60)), Duration::from_secs(120));
+        let v = pass(&broken, &due.file, &due.log, SystemTime::now(), true).await;
+        assert!(matches!(v, Verdict::Refused(_)), "{}", v.describe());
+        assert!(own_log(&due).contains("no tlsFingerprintSha256 configured; nothing stopped"), "{}", own_log(&due));
     }
 
     /// **A file it cannot parse is refused whole**, said, and nothing stopped:
@@ -559,7 +574,7 @@ mod tests {
             serde_json::json!({"leases": {"id": ID}}).to_string(),
         ] {
             let h = host(Some(&body), Duration::from_secs(120));
-            let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+            let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
             assert!(matches!(v, Verdict::Refused(_)), "{body:?} read as {}", v.describe());
             assert_eq!(v.exit_code(), 2);
             assert!(own_log(&h).contains("refused"), "{body:?}: the refusal was not said");
@@ -575,9 +590,9 @@ mod tests {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         let body = serde_json::json!({"leases": [{"id": ID, "until_unix": now + 600}]}).to_string();
         let h = host(Some(&body), Duration::from_secs(120));
-        assert_eq!(pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await, Verdict::NoneDue { leases: 1 });
+        assert_eq!(pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await, Verdict::NoneDue { leases: 1 });
         let h = host(Some(&expired_body(60)), Duration::from_secs(120));
-        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), false).await;
+        let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), false).await;
         assert_eq!(v, Verdict::WouldStop(vec![ID.to_string()]));
         assert!(!asked_anything(&mock));
     }
