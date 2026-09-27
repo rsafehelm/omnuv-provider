@@ -202,6 +202,55 @@ impl Client {
         Ok(live)
     }
 
+    /// **Every guest carrying this machine's clone stamp and not its claim**
+    /// (finding 8 of the lifecycle model, S8b and S5b; the model's
+    /// `G_stampSeen`). A clone is untagged from the moment it exists until
+    /// its create claims it, and only the agent that made it has it in its
+    /// journal. With two agents on one token — a copied configuration, an
+    /// agent moved to a new host — the other's clone was invisible to a
+    /// lookup by tag and to this journal: a second clone was built beside it,
+    /// and a "nothing built" was proven while it stood.
+    ///
+    /// So the pool a clone is put in is asked too: every guest in it without
+    /// this claim whose description's first line is this machine's stamp
+    /// (`names::stamped`, the whole id). What the clone call itself wrote,
+    /// in the pool it wrote; a guest outside the pool, or with another
+    /// stamp, is not this machine's. A configuration that cannot be read is
+    /// not a guest without the stamp: the error is the caller's, and proves
+    /// nothing.
+    pub(crate) async fn stamped_guests(&self, kind: &str, id: &str) -> anyhow::Result<Vec<Claimed>> {
+        #[derive(serde::Deserialize)]
+        struct ClusterVm {
+            node: String,
+            vmid: u32,
+            #[serde(default)]
+            tags: Option<String>,
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default)]
+            pool: Option<String>,
+        }
+        let pool = if kind == crate::names::TAG_WORKER { crate::join::GATEWAY_POOL } else { crate::instance::BUYER_POOL };
+        let id_tag = crate::names::short_tag(id);
+        let claimed = |tags: Option<&str>| {
+            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))
+        };
+        let stamp = crate::names::stamped(kind, id);
+        let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
+        let mut found = Vec::new();
+        for v in vms.into_iter().filter(|v| v.pool.as_deref() == Some(pool) && !claimed(v.tags.as_deref())) {
+            let config: serde_json::Value = self
+                .get_json(&format!("/nodes/{}/qemu/{}/config", v.node, v.vmid))
+                .await
+                .map_err(|e| anyhow::anyhow!("vm {} on {}: its stamp could not be read: {e}", v.vmid, v.node))?;
+            let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
+            if first == Some(stamp.as_str()) {
+                found.push(Claimed { node: v.node, vm: VmRef { vmid: v.vmid, tags: v.tags, status: v.status } });
+            }
+        }
+        Ok(found)
+    }
+
     /// **Licence (a)**: the one guest a delete of `id` may destroy, or
     /// nothing there, or a [`Refused`] naming why neither can be said.
     /// `live_tags` are the id tags of every machine and worker Core's view
@@ -553,6 +602,19 @@ impl Client {
         if !left.is_empty() {
             let named: Vec<String> = left.iter().map(|c| format!("vm {} on {}", c.vm.vmid, c.node)).collect();
             blockers.push(format!("{} still carries its claim", named.join(", ")));
+        }
+        // **Nor a clone nobody here claimed** (finding 8, G_stampSeen): one
+        // another agent on this token made, or one whose record was lost,
+        // carries the machine's stamp and not its tag. It is not destroyed —
+        // this agent cannot prove it made it — and it is not gone.
+        let stamped = self.stamped_guests(&t.claim, &t.id).await?;
+        if !stamped.is_empty() {
+            let named: Vec<String> = stamped.iter().map(|c| format!("vm {} on {}", c.vm.vmid, c.node)).collect();
+            blockers.push(format!(
+                "{} carries its clone stamp and no claim: a clone another agent made, or one whose record was lost; \
+                 the operator decides",
+                named.join(", ")
+            ));
         }
         let nodes: Vec<serde_json::Value> = self.get_json("/nodes").await?;
         let online = |n: &str| nodes.iter().any(|x| x["node"].as_str() == Some(n) && x["status"].as_str() == Some("online"));

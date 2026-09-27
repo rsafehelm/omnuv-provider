@@ -504,6 +504,32 @@ impl Client {
                 telemetry: None,
             });
         }
+        // **Nor beside another agent's clone** (finding 8 of the lifecycle
+        // model, `G_stampSeen`), as for a machine (`owed_or_stamped`): a
+        // guest in the gateway pool carrying this worker's stamp and no claim
+        // is waited on and named, never built beside. Could not look: nothing
+        // is built.
+        let stamped = self.stamped_guests(TAG, &spec.id).await?;
+        if !stamped.is_empty() {
+            let named: Vec<String> = stamped.iter().map(|c| format!("vm {} on {}", c.vm.vmid, c.node)).collect();
+            eprintln!("worker {}: not cloned; {} carries its stamp and no claim", spec.id, named.join(", "));
+            return Ok(WorkerStatus {
+                id: spec.id.clone(),
+                state: WorkerState::Deploying,
+                retryable: None,
+                waiting_on: Some("the operator: a clone of this worker that this agent did not claim".into()),
+                local_id: None,
+                endpoint: None,
+                adapters: Vec::new(),
+                diagnostics: None,
+                message: Some(format!(
+                    "{} carries this worker's clone stamp and no claim: a clone another agent made, or one whose \
+                     record was lost; nothing new was started",
+                    named.join(", ")
+                )),
+                telemetry: None,
+            });
+        }
 
         // Snippet must exist before the VM references it.
         let file = crate::names::snippet_worker(&spec.id);

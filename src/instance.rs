@@ -19,6 +19,15 @@ pub const TAG: &str = crate::names::TAG_INSTANCE;
 /// console of a machine the marketplace built — never a provider's own.
 pub(crate) const BUYER_POOL: &str = crate::names::POOL_BUYERS;
 
+/// **What this agent says of a machine sent as built that it does not hold**:
+/// nothing carries its claim or its clone stamp, and nothing is owed for it
+/// (findings 6 and 8 of the lifecycle model). Core's clock concludes on these
+/// words from a view that carried its question (`workers::LOST_WORDS` in
+/// omnuv, which parses their start; 0260): an untyped string on this wire,
+/// pinned on both sides by test until the protocol carries a reason code.
+pub(crate) const LOST: &str = "this machine is no longer on its provider and was not rebuilt, since a rebuild would be a \
+                               blank disk; delete it, and create a new one if you want one";
+
 const NO_FORM: &[(String, String)] = &[];
 
 /// The isolated bridge a buyer machine attaches to: its own network's segment
@@ -987,6 +996,15 @@ impl Client {
             });
         }
 
+        // **Nothing owed and nothing stamped, before anything is said or
+        // built** (findings 6 and 8 of the lifecycle model). What is owed and
+        // what carries the stamp are asked before "lost" as well as before a
+        // clone: "lost" is the answer Core's clock concludes on (0260), and a
+        // clone in flight or another agent's unclaimed clone is not lost.
+        if let Some(status) = self.owed_or_stamped(snippet_dir, spec).await? {
+            return Ok(status);
+        }
+
         // **A machine that was built is not built again.** Core marks a
         // machine `built` once it has seen it exist; not finding it now means
         // it was removed out of band or lost with its disk. Cloning again from
@@ -995,6 +1013,11 @@ impl Client {
         // and let the buyer choose. The miss is already confirmed live, not
         // read off a stale listing (PROVIDER-5). One-shot: retrying cannot
         // bring a disk back.
+        //
+        // **Said only when nothing here carries the claim or the stamp and
+        // nothing is owed** (finding 6, G_answerLost): these words, from a
+        // view that carried Core's question, are the one answer its clock
+        // concludes on. Core's `workers::LOST_WORDS` parses them.
         if spec.built {
             audit::record("instance.lost", "agent", &spec.id, "error", Some("no machine found for one that was built"));
             return Ok(InstanceStatus {
@@ -1009,45 +1032,7 @@ impl Client {
                 private_ip: None,
                 adapters: Vec::new(),
                 diagnostics: None,
-                message: Some(
-                    "this machine is no longer on its provider and was not rebuilt, since a rebuild would be a blank disk; \
-                     delete it, and create a new one if you want one"
-                        .into(),
-                ),
-                recipe_progress: None,
-            });
-        }
-
-        // **One clone at a time for one machine (gap 1, 25 September 2026).**
-        // The journal was settled at the start of every create, and a clone it
-        // could not settle — one still running, or one whose rollback failed —
-        // was left journalled and then cloned again anyway: two clones of the
-        // same machine, two disks, and the first destroyed once it was found
-        // finished. The pass settled the journal before this loop ran, so
-        // anything still recorded is work in flight, and the answer is to say
-        // what is being waited on rather than to start a second one.
-        //
-        // No `local_id`: Core reads one as *built* (`instances.local_id is not
-        // null`), and a machine reported built that is then rolled back is
-        // reported lost for ever rather than created again.
-        if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), &spec.id) {
-            eprintln!("instance {}: not cloned again; waiting on {}", spec.id, owed.waiting_on());
-            return Ok(InstanceStatus {
-                id: spec.id.clone(),
-                rebooted_token: None,
-                state: InstanceState::Provisioning,
-                retryable: None,
-                waiting_on: Some(owed.waiting_on()),
-                local_id: None,
-                node: None,
-                console_password_generation: None,
-                private_ip: None,
-                adapters: Vec::new(),
-                diagnostics: None,
-                message: Some(format!(
-                    "an earlier clone of this machine is not settled ({}); nothing new was started",
-                    owed.waiting_on()
-                )),
+                message: Some(LOST.into()),
                 recipe_progress: None,
             });
         }
@@ -1348,6 +1333,74 @@ impl Client {
             // Just created: first boot has not started, let alone finished.
             recipe_progress: None,
         })
+    }
+
+    /// **What is owed for a machine not found by its claim, or carries its
+    /// stamp**: a report saying so, or nothing — and only then may the caller
+    /// say "lost" or build.
+    ///
+    /// **One clone at a time for one machine (gap 1, 25 September 2026).**
+    /// The journal was settled at the start of every create, and a clone it
+    /// could not settle — one still running, or one whose rollback failed —
+    /// was left journalled and then cloned again anyway: two clones of the
+    /// same machine, two disks, and the first destroyed once it was found
+    /// finished. The pass settled the journal before this loop ran, so
+    /// anything still recorded is work in flight, and the answer is to say
+    /// what is being waited on rather than to start a second one. Asked
+    /// before "lost" since finding 6: a clone in flight is not lost.
+    ///
+    /// **Nor beside another agent's clone** (finding 8, S8b; `G_stampSeen`).
+    /// The journal is this agent's, and the tag goes on only once a create
+    /// claims its clone: a second agent on this token, taking over from one
+    /// stopped between its clone and its claim, found nothing and cloned
+    /// again. A guest in the pool carrying this machine's stamp and no claim
+    /// is waited on, named for the operator, and never built beside.
+    ///
+    /// No `local_id` either way: Core reads one as *built*
+    /// (`instances.local_id is not null`), and a machine reported built that
+    /// is then rolled back is reported lost for ever rather than created again.
+    /// Could not look for the stamp: nothing observed, nothing said.
+    async fn owed_or_stamped(&self, snippet_dir: &str, spec: &InstanceSpec) -> anyhow::Result<Option<InstanceStatus>> {
+        let waiting = |waiting_on: String, message: String| InstanceStatus {
+            id: spec.id.clone(),
+            rebooted_token: None,
+            state: InstanceState::Provisioning,
+            retryable: None,
+            waiting_on: Some(waiting_on),
+            local_id: None,
+            node: None,
+            console_password_generation: None,
+            private_ip: None,
+            adapters: Vec::new(),
+            diagnostics: None,
+            message: Some(message),
+            recipe_progress: None,
+        };
+        if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), &spec.id) {
+            eprintln!("instance {}: not cloned again; waiting on {}", spec.id, owed.waiting_on());
+            return Ok(Some(waiting(
+                owed.waiting_on(),
+                format!("an earlier clone of this machine is not settled ({}); nothing new was started", owed.waiting_on()),
+            )));
+        }
+        let stamped = self
+            .stamped_guests(TAG, &spec.id)
+            .await
+            .map_err(|e| anyhow::Error::from(NotLookedAt(format!("{e:#}"))))?;
+        if !stamped.is_empty() {
+            let named: Vec<String> = stamped.iter().map(|c| format!("vm {} on {}", c.vm.vmid, c.node)).collect();
+            eprintln!("instance {}: not cloned; {} carries its stamp and no claim", spec.id, named.join(", "));
+            audit::record("instance.create", "agent", &spec.id, "unclaimed clone seen", Some(&named.join(", ")));
+            return Ok(Some(waiting(
+                "the operator: a clone of this machine that this agent did not claim".into(),
+                format!(
+                    "{} carries this machine's clone stamp and no claim: a clone another agent made, or one whose \
+                     record was lost; nothing new was started, and it is not taken as this machine",
+                    named.join(", ")
+                ),
+            )));
+        }
+        Ok(None)
     }
 
     /// How the recipe's install went, read from the files the recipe writes.
@@ -2448,6 +2501,127 @@ mod tests {
             }
             std::fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    /// **A machine owed a clone is not lost** (finding 6 of the lifecycle
+    /// model, `G_answerLost`). Core sends it as built (its horizon passed, and
+    /// its clock asked), nothing carries its claim, and this agent's journal
+    /// holds a clone of it whose end was not seen. "Lost" is the answer
+    /// Core's clock concludes on (0260), and a clone in flight is not lost: it
+    /// is reported as waited on, with no runtime id, and nothing is cloned.
+    #[tokio::test]
+    async fn a_machine_owed_a_clone_is_not_reported_lost() {
+        use crate::pvemock::Mock;
+        let mock = Mock::start(|method, path, _| match (method, path) {
+            ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+            ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let (root, dir) = snippets("owed-lost");
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        sp.built = true;
+        let journal = crate::pending::dir(&dir);
+        crate::pending::write(
+            &journal,
+            &crate::pending::PendingClone {
+                vmid: 123,
+                id: sp.id.clone(),
+                node: "n1".into(),
+                upid: Some("UPID:n1:clone".into()),
+                claim: TAG.into(),
+                stage: crate::pending::Stage::Cloning,
+            },
+        )
+        .unwrap();
+        let status = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+        assert!(!mock.calls.lock().unwrap().iter().any(|c| c.path.ends_with("/clone")), "cloned beside an owed clone");
+        assert_ne!(status.message.as_deref(), Some(LOST), "a machine owed a clone was reported lost: {status:?}");
+        assert_eq!((status.state, status.local_id.as_deref()), (InstanceState::Provisioning, None), "{status:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **Another agent's clone is neither built beside nor taken for nothing**
+    /// (finding 8 of the lifecycle model: S8b in 8, S5b in 15; `G_stampSeen`).
+    /// Two agents on one token: the first cloned the machine and stopped before
+    /// claiming it, so its guest is in the pool, untagged, with the machine's
+    /// stamp, and in no journal here. This agent took over. Unbuilt, it must not
+    /// clone a second; built (the horizon passed), it must not say lost. The
+    /// control: a guest in the pool stamped for another machine is not this
+    /// one's, and the machine is built as ever.
+    #[tokio::test]
+    async fn another_agents_unclaimed_clone_is_neither_built_beside_nor_lost() {
+        use crate::pvemock::{task_ok, Mock};
+        let mut sp = spec();
+        sp.network = None;
+        sp.intent = Lifecycle::Running;
+        for (stamped_for, built, want_clone) in [
+            (sp.id.clone(), false, false),
+            (sp.id.clone(), true, false),
+            ("77777777-7777-4777-8777-777777777777".to_string(), false, true),
+        ] {
+            let description = crate::names::description(TAG, &stamped_for);
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(r) = task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                        {"node": "n1", "vmid": 777, "status": "stopped", "pool": BUYER_POOL}])),
+                    ("GET", "/nodes/n1/qemu/777/config") => (200, serde_json::json!({"description": description})),
+                    ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                    ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([{"vmid": 777, "status": "stopped"}])),
+                    ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                    ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                    ("POST", p) if p.ends_with("/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                    ("GET", _) => (200, serde_json::json!([])),
+                    _ => (200, serde_json::Value::Null),
+                }
+            })
+            .await;
+            let (root, dir) = snippets("stamp-seen");
+            sp.built = built;
+            let status = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await;
+            let cloned = mock.calls.lock().unwrap().iter().any(|c| c.path.ends_with("/clone"));
+            assert_eq!(cloned, want_clone, "stamped for {stamped_for}, built {built}: cloned {cloned} ({status:?})");
+            if !want_clone {
+                let status = status.expect("a report");
+                assert_ne!(status.message.as_deref(), Some(LOST),
+                    "built, with another agent's clone standing, and reported lost (S5b): {status:?}");
+                assert_eq!((status.state, status.local_id.as_deref()), (InstanceState::Provisioning, None), "{status:?}");
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// **A delete proves nothing beside another agent's clone** (finding 8,
+    /// S5b; `G_stampSeen`). Nothing carries the machine's claim, and a guest
+    /// in the pool carries its stamp: "deleted" would end the claim while that
+    /// clone stands. Not proven; and the guest, which this agent cannot prove
+    /// it made, is not destroyed.
+    #[tokio::test]
+    async fn a_delete_proves_nothing_beside_another_agents_clone() {
+        use crate::pvemock::Mock;
+        let sp = spec();
+        let description = crate::names::description(TAG, &sp.id);
+        let mock = Mock::start(move |method, path, _| match (method, path) {
+            ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                {"node": "n1", "vmid": 777, "status": "stopped", "pool": BUYER_POOL}])),
+            ("GET", "/nodes/n1/qemu/777/config") => (200, serde_json::json!({"description": description})),
+            ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([{"vmid": 777, "status": "stopped"}])),
+            ("GET", _) => (200, serde_json::json!([])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let (root, dir) = snippets("stamp-delete");
+        let gone = mock.client().delete_instance("n1", &sp.id, &dir, &[], async { Ok(true) }).await;
+        assert!(!matches!(gone, Ok(crate::teardown::Gone::Proven)), "deleted was proven beside a stamped clone: {gone:?}");
+        assert!(!mock.calls.lock().unwrap().iter().any(|c| c.method == "DELETE"), "a guest this agent cannot prove it made was destroyed");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// **PROVIDER-27: a machine meant to be stopped is built stopped.** The
