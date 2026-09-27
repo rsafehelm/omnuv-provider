@@ -234,12 +234,16 @@ pub fn resume(book: &Shared, file: &std::path::Path) -> usize {
 }
 
 /// What one stop of a leased machine did, guest by guest, for whoever logs it.
-#[derive(Debug, Default)]
-pub(crate) struct Stops {
+#[derive(Default)]
+pub(crate) struct Stops<'a> {
     /// `vm <vmid> on <node>`, stopped by this call.
     pub stopped: Vec<String>,
     /// Guests carrying the claim that were left, and why: another stamp.
     pub refused: Vec<String>,
+    /// Told `vm <vmid> on <node>` just before its stop is sent, so a run
+    /// that dies mid-stop has said what it was doing, and a machine already
+    /// stopped says nothing at all.
+    pub announce: Option<&'a (dyn Fn(&str) + Sync)>,
 }
 
 impl Client {
@@ -251,7 +255,7 @@ impl Client {
     ///
     /// The power state is the node's live one (`status/current`), never the
     /// cluster listing's, which lags. Stop only: nothing here destroys.
-    pub(crate) async fn stop_leased(&self, id: &str, out: &mut Stops) -> anyhow::Result<()> {
+    pub(crate) async fn stop_leased(&self, id: &str, out: &mut Stops<'_>) -> anyhow::Result<()> {
         let tag = crate::names::TAG_INSTANCE;
         for g in self.claimed_guests(tag, id).await? {
             let config: serde_json::Value =
@@ -268,6 +272,9 @@ impl Client {
             }
             if self.live_status(&g.node, g.vm.vmid).await? == "stopped" {
                 continue;
+            }
+            if let Some(say) = out.announce {
+                say(&format!("vm {} on {}", g.vm.vmid, g.node));
             }
             let upid: String = self
                 .post_form(&format!("/nodes/{}/qemu/{}/status/stop", g.node, g.vm.vmid), &[] as &[(String, String)])

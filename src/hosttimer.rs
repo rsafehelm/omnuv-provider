@@ -255,19 +255,24 @@ pub async fn pass(driver: &Client, file: &Path, log: &Log, now: SystemTime, act:
         return Verdict::WouldStop(due.into_iter().map(|l| l.id).collect());
     }
 
+    // Every due lease is asked about on every run (this keeps no state of its
+    // own), but only what is done is said: a machine already stopped makes
+    // no line, and a stop is said just before it is sent.
     let (mut stopped, mut refused, mut failed) = (0, 0, 0);
     for l in &due {
-        // Said before it is tried, so a run that dies mid-stop leaves a trace.
-        log.say(
-            &l.id,
-            "attempt",
-            &format!(
-                "its lease ran out {} s ago and the agent's lease task is not running (file {} s old); stopping it",
-                now_unix.saturating_sub(l.until_unix),
-                age.as_secs()
-            ),
-        );
-        let mut out = lease::Stops::default();
+        let announce = |guest: &str| {
+            log.say(
+                &l.id,
+                "attempt",
+                &format!(
+                    "{guest}: its lease ran out {} s ago and the agent's lease task is not running \
+                     (run-lease.json {} s old); stopping it",
+                    now_unix.saturating_sub(l.until_unix),
+                    age.as_secs()
+                ),
+            )
+        };
+        let mut out = lease::Stops { announce: Some(&announce), ..Default::default() };
         let result = driver.stop_leased(&l.id, &mut out).await;
         for g in &out.stopped {
             log.say(&l.id, "stopped", g);
@@ -424,8 +429,9 @@ mod tests {
         assert_eq!(v, Verdict::Acted { due: 1, stopped: 1, refused: 1, failed: 0 }, "{}", v.describe());
         assert_eq!(stops(&mock), ["/nodes/n1/qemu/701/status/stop"], "the wrong guests were stopped");
         let said = own_log(&h);
-        assert!(said.contains(&format!("{ID} attempt:")), "the attempt was not said first: {said}");
-        assert!(said.contains(&format!("{ID} stopped: vm 701 on n1")), "the stop was not said: {said}");
+        let attempt = said.find(&format!("{ID} attempt: vm 701 on n1:")).expect("the attempt was not said");
+        let stop = said.find(&format!("{ID} stopped: vm 701 on n1")).expect("the stop was not said");
+        assert!(attempt < stop, "the stop was said before it was tried: {said}");
         assert!(!mock.called("DELETE", "/nodes/n1/qemu/701"), "a stop destroyed");
         assert!(v.exit_code() == 0);
     }
@@ -493,6 +499,20 @@ mod tests {
         drop(timer);
         let held = tokio::time::timeout(Duration::from_secs(5), agent).await.expect("the agent waited for ever");
         assert!(held.unwrap().is_some(), "the agent did not take the lock once the pass ended");
+    }
+
+    /// **A machine already stopped is not stopped again, and says nothing**:
+    /// the timer keeps no state, so a dead agent's expired lease is asked
+    /// about every minute, and only what is done may be written.
+    #[tokio::test]
+    async fn a_machine_already_stopped_is_left_and_says_nothing() {
+        let mock = proxmox((200, serde_json::json!({"status": "stopped"}))).await;
+        let h = host(Some(&expired_body(3600)), Duration::from_secs(3000));
+        let v = pass(&mock.client(), &h.file, &h.log, SystemTime::now(), true).await;
+        assert_eq!(v, Verdict::Acted { due: 1, stopped: 0, refused: 1, failed: 0 }, "{}", v.describe());
+        assert!(stops(&mock).is_empty(), "a stopped machine was stopped again");
+        let said = own_log(&h);
+        assert!(!said.contains("attempt") && !said.contains("stopped:"), "a stop was said that was not tried: {said}");
     }
 
     /// **An unreadable status stops nothing**: the node cannot say whether
