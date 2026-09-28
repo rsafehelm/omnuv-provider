@@ -255,11 +255,11 @@ mod tests {
         s
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("onv-restore-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// A directory of the test's own, removed when the test ends: these
+    /// left `onv-restore-<name>-<pid>` behind in the temp directory, five
+    /// a run, until 28 September 2026.
+    fn scratch(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new().prefix(&format!("onv-restore-{name}-")).tempdir().unwrap()
     }
 
     /// **A view below the head is a restore** (G_restoreGen): a revision only
@@ -267,8 +267,9 @@ mod tests {
     /// back in time. The head survives this agent's restart.
     #[test]
     fn a_view_behind_the_head_is_a_restore() {
-        let d = scratch("behind");
-        let s = armed(&d);
+        let t = scratch("behind");
+        let d = t.path();
+        let s = armed(d);
         assert!(!observe(&s, &view(7, &[]), None, |_| false));
         assert!(!observe(&s, &view(9, &[]), None, |_| false));
         // Restarted: the head is read back.
@@ -283,8 +284,9 @@ mod tests {
     /// climbed back past the number this agent holds.
     #[test]
     fn a_torn_down_attempt_wanted_again_is_a_restore() {
-        let d = scratch("torn");
-        let s = armed(&d);
+        let t = scratch("torn");
+        let d = t.path();
+        let s = armed(d);
         assert!(!observe(&s, &view(3, &[("k-old", Lifecycle::Absent)]), None, |id| id == "k-old"),
             "an Absent this agent tore down read as a restore");
         assert!(observe(&s, &view(5, &[("k-old", Lifecycle::Running)]), None, |id| id == "k-old"));
@@ -297,8 +299,9 @@ mod tests {
     /// restore is not itself read as one.
     #[test]
     fn the_mode_ends_only_when_core_ends_it() {
-        let d = scratch("ends");
-        let s = armed(&d);
+        let t = scratch("ends");
+        let d = t.path();
+        let s = armed(d);
         observe(&s, &view(9, &[]), None, |_| false);
         assert!(observe(&s, &view(4, &[]), None, |_| false));
         // Core has not named it yet: still in the mode, still telling.
@@ -318,8 +321,9 @@ mod tests {
     /// boundary, which Core knows of and the agent's head may not show).
     #[test]
     fn core_naming_a_restore_holds_the_agent() {
-        let d = scratch("named");
-        let s = armed(&d);
+        let t = scratch("named");
+        let d = t.path();
+        let s = armed(d);
         assert!(observe(&s, &view(1, &[]), Some("r-2"), |_| false));
         assert!(to_tell(&s).is_none(), "an agent told Core what Core had told it");
         assert!(!observe(&s, &view(1, &[]), None, |_| false));
@@ -329,7 +333,8 @@ mod tests {
     /// detection, no header, no file.
     #[test]
     fn against_a_core_without_restore_mode_nothing_changes() {
-        let d = scratch("old-core");
+        let t = scratch("old-core");
+        let d = t.path();
         let s = load(d.join("restore-head.json"));
         arm(&s, &serde_json::json!({"provider_id": "p-1"}));
         observe(&s, &view(9, &[]), None, |_| false);
