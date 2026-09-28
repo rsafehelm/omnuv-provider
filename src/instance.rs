@@ -5,7 +5,7 @@
 //! state survives an agent restart, and nothing the marketplace did not create
 //! is ever touched.
 
-use omnuv_protocol::{FirstBoot, InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment};
+use omnuv_protocol::{FirstBoot, InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment, StartReadiness};
 
 use crate::audit;
 use crate::proxmox::Client;
@@ -13,6 +13,11 @@ use crate::proxmox::Client;
 /// Marks VMs this agent owns on behalf of buyers. Distinct from the inference
 /// worker tag so the two lifecycles can never be confused.
 pub const TAG: &str = crate::names::TAG_INSTANCE;
+
+/// Advertised at the handshake (`session::CAPABILITIES`): this agent answers a
+/// held machine's readiness to start (`readiness`), so Core may place group
+/// members here. Core's `groups::CAPABILITY`.
+pub const GROUP_PREPARE: &str = "group-prepare";
 
 /// The Proxmox pool buyer machines are cloned into. Bootstrap grants
 /// `VM.Console` on this pool and nowhere else, so the agent can open the
@@ -1004,6 +1009,15 @@ impl Client {
                     } else {
                         None
                     },
+                    // **Asked only of a machine held stopped** (machine groups
+                    // step 2): its spec names the attempt, and it is built and
+                    // meant to stay stopped until its group commits.
+                    ready_to_start: match spec.attempt {
+                        Some(attempt) if !running && spec.intent == Lifecycle::Stopped => {
+                            self.readiness(node, vm.vmid, attempt).await
+                        }
+                        _ => None,
+                    },
                 });
             }
             .await;
@@ -1032,6 +1046,7 @@ impl Client {
                 diagnostics: None,
                 message: Some("already removed".into()),
                 recipe_progress: None,
+                ready_to_start: None,
             });
         }
 
@@ -1073,6 +1088,7 @@ impl Client {
                 diagnostics: None,
                 message: Some(LOST.into()),
                 recipe_progress: None,
+                ready_to_start: None,
             });
         }
 
@@ -1371,7 +1387,24 @@ impl Client {
             message: Some(format!("vm {vmid} created")),
             // Just created: first boot has not started, let alone finished.
             recipe_progress: None,
+            ready_to_start: None,
         })
+    }
+
+    /// **Whether a held machine could start now** (machine groups step 2,
+    /// omnuv-protocol v0.24.0): the start gate's reads (`start_blockers`),
+    /// once, on the machine as it stands stopped, for the attempt Core asked
+    /// about. Nothing is started and nothing waited for: the group decides,
+    /// and the next pass asks again. Reads that fail answer nothing, which
+    /// Core takes as not looked, never as ready.
+    async fn readiness(&self, node: &str, vmid: u32, attempt: u32) -> Option<StartReadiness> {
+        match self.start_blockers(node, vmid).await {
+            Ok(blockers) => Some(StartReadiness { attempt, ready: blockers.is_empty(), blockers }),
+            Err(e) => {
+                eprintln!("vm {vmid}: the start gate's reads for attempt {attempt} failed, so readiness is not said: {e:#}");
+                None
+            }
+        }
     }
 
     /// **What is owed for a machine not found by its claim, or carries its
@@ -1414,6 +1447,7 @@ impl Client {
             diagnostics: None,
             message: Some(message),
             recipe_progress: None,
+            ready_to_start: None,
         };
         if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), &spec.id) {
             eprintln!("instance {}: not cloned again; waiting on {}", spec.id, owed.waiting_on());
@@ -2261,6 +2295,63 @@ mod tests {
         assert!(e.downcast_ref::<NotLookedAt>().is_some(), "reported as something: {e:#}");
         assert!(!mock.called("POST", "/nodes/n1/qemu/700/status/start"), "started on the listing's stale reading");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A held machine's readiness, asked and answered** (machine groups
+    /// step 2, omnuv-protocol v0.24.0). Built and stopped, meant to stay so,
+    /// its spec naming attempt 4: the start gate's reads answer ready, or
+    /// not ready with the reason while its card is attached to a running
+    /// machine; the attempt is echoed; nothing is started; and a machine whose
+    /// spec asks nothing answers nothing.
+    #[tokio::test]
+    async fn a_held_machine_says_whether_it_could_start() {
+        use crate::pvemock::{task_ok, Mock};
+        async fn pass(attempt: Option<u32>, card_held_by: Option<u64>) -> (Mock, InstanceStatus) {
+            let mut sp = spec();
+            sp.network = None;
+            sp.intent = Lifecycle::Stopped;
+            sp.attempt = attempt;
+            let key = short_tag(&sp.id);
+            let mock = Mock::start(move |method, path, _| {
+                if let Some(ok) = task_ok(path) {
+                    return ok;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                        {"node": "n1", "vmid": 700, "status": "stopped", "tags": format!("{TAG};{key}")}
+                    ])),
+                    ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "stopped"})),
+                    ("GET", "/nodes/n1/qemu/700/config") => (200, serde_json::json!({"hostpci0": "mapping=onv-gpu-a,pcie=1"})),
+                    ("GET", "/nodes/n1/qemu") => (200, match card_held_by {
+                        Some(other) => serde_json::json!([{"vmid": 700, "status": "stopped"}, {"vmid": other, "status": "running"}]),
+                        None => serde_json::json!([{"vmid": 700, "status": "stopped"}]),
+                    }),
+                    ("GET", "/nodes/n1/qemu/800/config") => (200, serde_json::json!({"hostpci0": "mapping=onv-gpu-a,pcie=1"})),
+                    ("GET", "/nodes/n1/tasks?source=active") => (200, serde_json::json!([])),
+                    ("GET", _) => (200, serde_json::json!({})),
+                    _ => (200, serde_json::Value::Null),
+                }
+            })
+            .await;
+            let (root, dir) = snippets(&format!("readiness-{attempt:?}-{card_held_by:?}"));
+            let status = mock.client().ensure_instance("n1", 9000, "local", &dir, &sp).await.expect("a pass");
+            std::fs::remove_dir_all(&root).unwrap();
+            (mock, status)
+        }
+
+        let (mock, clear) = pass(Some(4), None).await;
+        assert_eq!(clear.state, InstanceState::Stopped);
+        assert_eq!(clear.ready_to_start, Some(StartReadiness { attempt: 4, ready: true, blockers: vec![] }));
+        assert!(!mock.called("POST", "/nodes/n1/qemu/700/status/start"), "a held machine was started");
+
+        let (mock, held) = pass(Some(4), Some(800)).await;
+        let answer = held.ready_to_start.expect("an answer");
+        assert_eq!((answer.attempt, answer.ready), (4, false), "{answer:?}");
+        assert!(answer.blockers.iter().any(|b| b.contains("onv-gpu-a is still attached to running machine 800")), "{answer:?}");
+        assert!(!mock.called("POST", "/nodes/n1/qemu/700/status/start"), "a held machine was started");
+
+        let (_, unasked) = pass(None, None).await;
+        assert_eq!(unasked.ready_to_start, None, "a machine nobody asked about answered");
     }
 
     /// **PROVIDER-4: one reboot per token.** A running machine with a token
@@ -3701,6 +3792,7 @@ mod tests {
             recipe: None,
             // No overlay: this fixture is about the marketplace NIC.
             overlay: None,
+            attempt: None,
         }
     }
 

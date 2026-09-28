@@ -2900,6 +2900,7 @@ async fn reconcile_workers(
                 diagnostics: None,
                 message: Some(crate::teardown::said(&gone)),
                 recipe_progress: None,
+                ready_to_start: None,
             }),
             // **Never built again under an id this agent tore down** (the
             // model's G_agentTomb, lifecycle phase 7): a view that names it
@@ -2964,6 +2965,7 @@ async fn reconcile_workers(
                         diagnostics: None,
                         message: Some(seen.cause.chars().take(400).collect()),
                         recipe_progress: None,
+                        ready_to_start: None,
                     })
                 }
                 Err(e) => Err(e),
@@ -3023,6 +3025,7 @@ async fn reconcile_workers(
                 diagnostics: None,
                 message: Some(why.chars().take(400).collect()),
                 recipe_progress: None,
+                ready_to_start: None,
             }
         }));
     }

@@ -48,6 +48,9 @@ pub const HEADER: &str = "onv-session";
 ///                this agent reports its inventory at Core's period, and
 ///                only when its survey completed, so Core may judge its
 ///                silence by its reports (`report`, D35)
+/// group-prepare  this agent answers a held machine's readiness to start:
+///                the start gate's reads on a machine built and stopped whose
+///                spec names an attempt (`instance`, machine groups step 2)
 /// ```
 pub const CAPABILITIES: &[&str] = &[
     "session",
@@ -57,6 +60,7 @@ pub const CAPABILITIES: &[&str] = &[
     crate::worker::CAPABILITY,
     crate::scrub::CAPABILITY,
     crate::report::CAPABILITY,
+    crate::instance::GROUP_PREPARE,
 ];
 
 /// The session in force, if any.
