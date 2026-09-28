@@ -24,6 +24,12 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# **This tree's own target, whatever the caller's environment says.** A target
+# shared by two worktrees of this package ran the other tree's tests, and
+# three failed that were not this tree's (omnuv's TODO): cargo names a path
+# package's build by its path within the workspace, the same in both trees,
+# and judged the other tree's binary fresh.
+export CARGO_TARGET_DIR="$PWD/target"
 out="$(mktemp -d)"
 current=""
 finish() {
