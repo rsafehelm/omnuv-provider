@@ -2070,6 +2070,199 @@ mod handshake_tests {
         }
     }
 
+    /// **The mirror's host-timer proof, replayed on this side** (27
+    /// September 2026; fixtures, not hardware). A leased machine the host
+    /// timer stopped, its lease resumed expired by a restarted agent; the
+    /// first view names it Running and leases it, and it is started; the
+    /// buyer deletes it; the next pass destroys it, and every pass after
+    /// proves it gone. What each pass tells Core about it: `deleted`, the one
+    /// word Core ends the claim on (and it does: omnuv's
+    /// `moves::tests::a_leased_machine_deleted_after_its_agent_came_back_ends_its_claim`).
+    /// And the lease ends with the machine: it outlived the proof until 27
+    /// September 2026, and was "stopped" at T with nothing left to stop.
+    #[tokio::test]
+    async fn a_leased_machine_deleted_after_a_restart_is_reported_deleted() {
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        const M: &str = "f35783b3-0000-4000-8000-000000000001";
+        const DISK: &str = "vmdata:vm-100-disk-0";
+        let spec = |lifecycle: &str| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+            v["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+            v["instances"][0]["id"] = serde_json::json!(M);
+            v["instances"][0]["built"] = serde_json::json!(true);
+            v["instances"][0]["lifecycle"] = serde_json::json!(lifecycle);
+            v
+        };
+        // Core: the view in force, its lease header, and every report.
+        let view = Arc::new(Mutex::new(spec("running")));
+        let lease = Arc::new(Mutex::new(Some(format!("900 {M}"))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        {
+            let (view, lease) = (view.clone(), lease.clone());
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else { return };
+                    let (view, lease, tx) = (view.clone(), lease.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let request = read_request(&mut socket).await;
+                        let line = String::from_utf8_lossy(&request).lines().next().unwrap_or_default().to_string();
+                        let response = if line.starts_with("GET /provider/v1/desired-state") {
+                            let body = view.lock().unwrap().to_string();
+                            let header = lease.lock().unwrap().clone().map(|l| format!("onv-run-lease: {l}\r\n")).unwrap_or_default();
+                            format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{header}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                        } else {
+                            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                        };
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = tx.send((line, body_of(&request)));
+                    });
+                }
+            });
+        }
+        // The host: vm 100 on n1, carrying the claim and stamp, stopped by
+        // the host timer.
+        #[derive(Default)]
+        struct Host {
+            present: bool,
+            running: bool,
+            volumes: Vec<String>,
+        }
+        let host = Arc::new(Mutex::new(Host { present: true, running: false, volumes: vec![DISK.into()] }));
+        let claim = crate::names::tags(crate::names::TAG_INSTANCE, M, Some("test"));
+        let stamp = crate::names::description(crate::names::TAG_INSTANCE, M);
+        let h = host.clone();
+        let pve = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(r) = crate::pvemock::task_ok(path) {
+                return r;
+            }
+            let mut h = h.lock().unwrap();
+            let status = if h.running { "running" } else { "stopped" };
+            match (method, path) {
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", p) if p.starts_with("/cluster/resources") => (
+                    200,
+                    if h.present {
+                        serde_json::json!([{"node": "n1", "vmid": 100, "status": status, "tags": claim, "type": "qemu"}])
+                    } else {
+                        serde_json::json!([])
+                    },
+                ),
+                ("GET", "/nodes/n1/qemu") => (
+                    200,
+                    if h.present { serde_json::json!([{"vmid": 100, "status": status, "tags": claim}]) } else { serde_json::json!([]) },
+                ),
+                ("GET", "/nodes/n1/qemu/100/status/current") if h.present => (200, serde_json::json!({"status": status})),
+                ("GET", "/nodes/n1/qemu/100/config") if h.present => {
+                    (200, serde_json::json!({"description": stamp, "scsi0": format!("{DISK},size=20G")}))
+                }
+                ("POST", "/nodes/n1/qemu/100/status/start") => {
+                    h.running = true;
+                    (200, serde_json::json!("UPID:n1:start"))
+                }
+                ("POST", "/nodes/n1/qemu/100/status/stop") | ("POST", "/nodes/n1/qemu/100/status/shutdown") => {
+                    h.running = false;
+                    (200, serde_json::json!("UPID:n1:stop"))
+                }
+                ("DELETE", p) if p.starts_with("/nodes/n1/qemu/100") => {
+                    h.present = false;
+                    h.running = false;
+                    h.volumes.clear();
+                    (200, serde_json::json!("UPID:n1:destroy"))
+                }
+                ("GET", "/cluster/ha/resources") => (200, serde_json::json!([])),
+                ("GET", "/nodes/n1/storage/vmdata/content") => {
+                    (200, serde_json::json!(h.volumes.iter().map(|v| serde_json::json!({"volid": v})).collect::<Vec<_>>()))
+                }
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+            }
+        })
+        .await;
+        let snippets = tempfile::tempdir().unwrap();
+        let snippet_dir = snippets.path().join("snippets");
+        std::fs::create_dir_all(&snippet_dir).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippet_dir.display()
+        ))
+        .expect("config");
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        let driver = pve.client();
+        // The restarted agent resumes its predecessor's lease, past its
+        // deadline, and its lease task's first look stops nothing: the host
+        // timer already did.
+        let file = crate::lease::file(&cfg.proxmox.snippet_dir);
+        let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 60;
+        std::fs::write(&file, serde_json::json!({"leases": [{"id": M, "until_unix": until}]}).to_string()).unwrap();
+        assert_eq!(crate::lease::resume(&core.lease, &file), 1);
+        crate::lease::check(&core.lease, &driver, &file).await;
+
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        let mut pass = async || {
+            let done = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+            crate::lease::check(&core.lease, &driver, &file).await;
+            let mut sent = Vec::new();
+            while let Ok(r) = rx.try_recv() {
+                sent.push(r);
+            }
+            let report = sent
+                .iter()
+                .rev()
+                .find(|(l, _)| l.starts_with("POST /provider/v1/status"))
+                .map(|(_, b)| serde_json::from_str::<serde_json::Value>(b).unwrap());
+            (done.map_err(|e| format!("{e:#}")), report)
+        };
+        let machine = |report: &Option<serde_json::Value>| -> serde_json::Value {
+            report
+                .as_ref()
+                .and_then(|r| r["instances"].as_array().and_then(|a| a.iter().find(|i| i["id"] == M)).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        // 1. The view names it Running and leases it: started.
+        let (done, report) = pass().await;
+        assert!(host.lock().unwrap().running, "the machine the view names Running was not started: {done:?} {report:?}");
+        // 2. The buyer deletes it: Absent, and no longer leased.
+        {
+            let mut v = spec("deleted");
+            v["version"] = serde_json::json!(42);
+            *view.lock().unwrap() = v;
+            *lease.lock().unwrap() = Some("900".into());
+        }
+        let (done, report) = pass().await;
+        assert!(!host.lock().unwrap().present, "the Absent machine was not destroyed: {done:?} {}", machine(&report));
+        let m = machine(&report);
+        assert_eq!(m["state"], serde_json::json!("STOPPED"), "{done:?} {report:?}");
+        assert_ne!(m["message"], serde_json::json!("deleted"), "the destroy's own pass said deleted");
+        // 3. Every pass after proves it gone, and says `deleted`.
+        for n in 3..6 {
+            let (done, report) = pass().await;
+            let m = machine(&report);
+            assert_eq!(
+                (m["state"].as_str(), m["message"].as_str()),
+                (Some("STOPPED"), Some("deleted")),
+                "pass {n}: the machine is gone from the host and was not reported deleted: {done:?} {report:?}"
+            );
+            // **And its lease ended with it**: nothing is left to stop, and
+            // the host timer's file names it no more. It was kept for good,
+            // and "stopped" at T fifteen minutes after the proof.
+            let written = crate::lease::read_body(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            assert!(written.iter().all(|l| l.id != M), "pass {n}: run-lease.json still names the deleted machine: {written:?}");
+            let far = std::time::Instant::now() + std::time::Duration::from_secs(100_000);
+            assert!(crate::lease::expired(&core.lease, far).is_empty(), "pass {n}: a lease outlived its machine's proof");
+        }
+    }
+
     /// The loop is re-armed when Core's poll moved, and only then.
     #[test]
     fn the_loop_is_re_armed_only_when_core_s_poll_moved() {
@@ -2686,6 +2879,13 @@ async fn reconcile_workers(
             Lifecycle::Absent => driver
                 .delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
                 .await
+                .inspect(|gone| {
+                    // Proven gone, residue or not: nothing carries its claim
+                    // or its stamp, so its run lease has nothing left to stop.
+                    if !matches!(gone, crate::teardown::Gone::NotYet(_)) {
+                        crate::lease::forget(&core.lease, &spec.id);
+                    }
+                })
                 .map(|gone| InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,

@@ -19,7 +19,18 @@
 //! expired   past its deadline the machine is stopped (its claim tag and its
 //!           whole stamp, its live status, status/stop), and maintenance
 //!           never restarts it
+//! ended     the machine proven gone here (its delete's proof: nothing
+//!           carries its claim or its stamp), or stopped past its deadline
+//!           and no longer named by Core's view: nothing is left to stop
 //! ```
+//!
+//! **A lease ends with its machine** (27 September 2026). Until then nothing
+//! ended one but a view naming the machine Running without listing it, which
+//! a deleted machine never gets: on the mirror a machine deleted at 23:12 was
+//! "stopped" by its lease at 23:27, fifteen minutes after its proof, "without
+//! a view from Core" that no longer named it, and `run-lease.json` kept it for
+//! good — so the host-timer proof's stop play, which asserts the file names
+//! exactly the machine under test, refused the next run.
 //!
 //! **Core waits 2T + one pass + skew** after the supersede before it sends
 //! the new copy anywhere: 2T covers this host's clock running at half speed,
@@ -133,6 +144,20 @@ fn apply(b: &mut Book, r: &Reading, view: &omnuv_protocol::DesiredState) {
             }
         }
     }
+    // **Stopped past its deadline, and no longer named: done.** Core names a
+    // superseded attempt Absent until its provider proves it gone, so a view
+    // that does not name it at all has nothing more to ask of this host; and
+    // the stop, the one thing the lease was for, has been made. A lease not
+    // yet past its deadline, or whose stop failed, is kept whatever the view
+    // says: that is the partition the lease exists for.
+    b.leases.retain(|id, l| !(l.stopped && l.deadline <= r.asked.at && !view.instances.iter().any(|s| s.id == *id)));
+}
+
+/// **A machine proven gone here holds no lease**: its delete's proof found
+/// nothing carrying its claim or its stamp, so there is nothing left to stop,
+/// and a stop "without a view from Core" later would say something false.
+pub fn forget(book: &Shared, id: &str) {
+    crate::poison::lock(book, "run lease").leases.remove(id);
 }
 
 /// The leased machines past their deadline and not yet stopped.
@@ -492,6 +517,67 @@ mod tests {
             assert_eq!(parse(bad), None, "{bad:?} read as a lease");
         }
         assert_eq!(parse("900 a b"), Some((Duration::from_secs(900), vec!["a".into(), "b".into()])));
+    }
+
+    /// **A lease ends with its machine** (27 September 2026). Proven gone,
+    /// it is forgotten at once. Stopped past its deadline and no longer named
+    /// by the view, it ends too: the stale lease a restarted agent resumes
+    /// for a machine the ledger has let go is dropped on its first view. And
+    /// what it must not end: a lease still running, or whose stop failed,
+    /// whatever the view says (the partition the lease is for), and one the
+    /// view still names Absent (Core still asks for it).
+    #[test]
+    fn a_lease_ends_with_its_machine() {
+        let b = book();
+        let t0 = Asked::now();
+        heard(&b, t0, Some("60 gone proven kept named".into()));
+        renew(&b, &view(&[("gone", Lifecycle::Running), ("proven", Lifecycle::Running), ("kept", Lifecycle::Running), ("named", Lifecycle::Running)]));
+        forget(&b, "proven");
+        let past = t0.at + Duration::from_secs(61);
+        assert_eq!(expired(&b, past), ["gone", "kept", "named"], "a machine proven gone kept its lease");
+        // "gone" and "named" were stopped by the lease task; "kept"'s stop failed.
+        stopped(&b, "gone");
+        stopped(&b, "named");
+        let later = Asked { at: past, wall: t0.wall + Duration::from_secs(61) };
+        heard(&b, later, Some("60".into()));
+        renew(&b, &view(&[("named", Lifecycle::Absent)]));
+        let left: Vec<String> = read_body(&file_body(&b).to_string()).unwrap().into_iter().map(|l| l.id).collect();
+        assert_eq!(left, ["kept", "named"], "a lease ended while it had work left, or outlived it");
+        // Not yet past its deadline, and not named: kept (Core counts on it).
+        let c = book();
+        heard(&c, t0, Some("900 running".into()));
+        renew(&c, &view(&[("running", Lifecycle::Running)]));
+        heard(&c, Asked { at: t0.at + Duration::from_secs(10), wall: t0.wall }, Some("900".into()));
+        renew(&c, &view(&[]));
+        assert_eq!(expired(&c, t0.at + Duration::from_secs(900)), ["running"], "a lease still running was ended by a view");
+    }
+
+    /// **A stale lease resumed from the file ends on the first view**: the
+    /// mirror's machine of 27 September, deleted and proven while the lease
+    /// was held, resumed expired by a restarted agent, stopped (nothing
+    /// carries its claim), and named by no view: dropped, and the file
+    /// written without it.
+    #[tokio::test]
+    async fn a_stale_lease_resumed_from_the_file_ends_on_the_first_view() {
+        let mock = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
+            ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+            ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+            ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("run-lease.json");
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(&file, serde_json::json!({"leases": [{"id": "f35783b3", "until_unix": now - 600}]}).to_string()).unwrap();
+        let b = book();
+        assert_eq!(resume(&b, &file), 1);
+        check(&b, &mock.client(), &file).await;
+        assert_eq!(read_body(&std::fs::read_to_string(&file).unwrap()).unwrap().len(), 1, "stopped, and not yet told");
+        heard(&b, Asked::now(), Some("900".into()));
+        renew(&b, &view(&[]));
+        check(&b, &mock.client(), &file).await;
+        assert_eq!(read_body(&std::fs::read_to_string(&file).unwrap()), Ok(vec![]), "the stale lease outlived its machine");
     }
 
     /// **An expired lease is never restarted** by maintenance (A6).
