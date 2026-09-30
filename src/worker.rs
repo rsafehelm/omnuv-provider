@@ -99,8 +99,6 @@ pub(crate) struct VmRef {
     pub(crate) vmid: u32,
     #[serde(default)]
     pub(crate) tags: Option<String>,
-    #[serde(default)]
-    pub(crate) status: Option<String>,
 }
 
 /// The marketplace attaches a card with its option ROM hidden (`rombar=0`).
@@ -373,15 +371,13 @@ impl Client {
             vmid: u32,
             #[serde(default)]
             tags: Option<String>,
-            #[serde(default)]
-            status: Option<String>,
         }
         let tagged = |tags: Option<&str>| {
             tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))
         };
         let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
         if let Some(v) = vms.into_iter().find(|v| tagged(v.tags.as_deref())) {
-            return Ok(Some((v.node, VmRef { vmid: v.vmid, tags: v.tags, status: v.status })));
+            return Ok(Some((v.node, VmRef { vmid: v.vmid, tags: v.tags })));
         }
 
         // **A miss is confirmed before anyone acts on it (PROVIDER-5).** That
@@ -509,8 +505,8 @@ impl Client {
                         .map(str::to_string)
                         .ok_or_else(|| anyhow::anyhow!("its answer carried no power state"))
                 });
-            let vm = match live {
-                Ok(status) => VmRef { status: Some(status), ..vm },
+            let status = match live {
+                Ok(status) => status,
                 Err(e) => {
                     return Err(crate::instance::NotLookedAt(format!(
                         "{node} would not say how worker vm {} is: {e:#}",
@@ -519,7 +515,7 @@ impl Client {
                     .into());
                 }
             };
-            let mut running = vm.status.as_deref() == Some("running");
+            let mut running = status == "running";
 
             // Converge, do not merely observe: a worker that exists but is not
             // running when Core wants it running must be started on this pass,
@@ -788,7 +784,7 @@ impl Client {
             node: node.to_string(),
             upid: None,
             claim: TAG.to_string(),
-            stage: crate::pending::Stage::Cloning,
+            stage: crate::pending::Stage::Cloning, volids: Vec::new(),
         };
         crate::pending::write(&journal, &pending)?;
 
@@ -815,7 +811,7 @@ impl Client {
         pending.upid = Some(upid.clone());
         crate::pending::write(&journal, &pending)?;
         match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs, self.timings.clone_budget_max)).await {
-            crate::proxmox::TaskEnd::Ended(Ok(())) => {}
+            crate::proxmox::TaskEnd::Ended(Ok(())) => self.journal_clone_volumes(&journal, &mut pending).await,
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 if self.abandon_clone(&journal, &pending, "worker").await {
                     anyhow::bail!("proxmox task failed: {exit}");
@@ -1546,7 +1542,7 @@ mod a_worker_is_claimed_before_it_can_fail {
         assert!(result.is_err(), "the resize failed and the create reported success");
         assert!(mock.called("DELETE", "/nodes/n1/qemu/321"), "the half-built worker was left to be started");
         let calls = mock.calls.lock().unwrap();
-        let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/321/config").expect("configured");
+        let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/321/config" && c.method != "GET").expect("configured");
         assert!(calls[first_config].body.starts_with("tags="), "the first write after the clone was not the claim");
         drop(calls);
         assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty());
@@ -1701,7 +1697,7 @@ mod a_worker_sent_built_is_looked_for {
             node: "n1".into(),
             upid: None,
             claim: super::TAG.to_string(),
-            stage: crate::pending::Stage::Cloning,
+            stage: crate::pending::Stage::Cloning, volids: Vec::new(),
         })
         .unwrap();
         let mock = a_cluster(vec![]).await;

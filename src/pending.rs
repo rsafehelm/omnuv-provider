@@ -71,6 +71,12 @@ pub struct PendingClone {
     /// What is owed. A record from before this field is a clone's.
     #[serde(default)]
     pub stage: Stage,
+    /// The volumes the clone's configuration named once the clone task ended
+    /// (the phase 7 follow-up): what a rollback must see gone before its record
+    /// goes. Empty for a record written before the clone ended, and for one
+    /// from before this field, which are settled as they always were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volids: Vec<String>,
 }
 
 impl PendingClone {
@@ -157,7 +163,7 @@ mod tests {
             node: "n1".into(),
             upid: None,
             claim: instance_claim(),
-            stage: Stage::Cloning,
+            stage: Stage::Cloning, volids: Vec::new(),
         };
         write(&dir, &entry).unwrap();
         let with_task = PendingClone { upid: Some("UPID:n1:clone".into()), ..entry.clone() };
@@ -191,7 +197,7 @@ mod tests {
             node: "n1".into(),
             upid: Some("UPID:n1:clone".into()),
             claim: instance_claim(),
-            stage: Stage::Cloning,
+            stage: Stage::Cloning, volids: Vec::new(),
         };
         write(&dir, &entry).unwrap();
         write(&dir, &entry.abandoned()).unwrap();

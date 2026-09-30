@@ -347,7 +347,7 @@ impl Client {
             node: node.to_string(),
             upid: None,
             claim: TAG.to_string(),
-            stage: crate::pending::Stage::Cloning,
+            stage: crate::pending::Stage::Cloning, volids: Vec::new(),
         };
         crate::pending::write(&journal, &pending)?;
         let description = format!("{}\nattempt {}", crate::names::description(TAG, &w.id), w.attempt);
@@ -369,7 +369,7 @@ impl Client {
         pending.upid = Some(upid.clone());
         crate::pending::write(&journal, &pending)?;
         match self.task_end(node, &upid, Self::clone_polls(None, self.timings.clone_budget_max)).await {
-            crate::proxmox::TaskEnd::Ended(Ok(())) => {}
+            crate::proxmox::TaskEnd::Ended(Ok(())) => self.journal_clone_volumes(&journal, &mut pending).await,
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 self.abandon_clone(&journal, &pending, "scrub").await;
                 anyhow::bail!("the clone of scrub image {} failed: {exit}", w.image);

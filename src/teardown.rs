@@ -170,8 +170,6 @@ impl Client {
             vmid: u32,
             #[serde(default)]
             tags: Option<String>,
-            #[serde(default)]
-            status: Option<String>,
         }
         let id_tag = crate::names::short_tag(id);
         let tagged = |tags: Option<&str>| {
@@ -181,7 +179,7 @@ impl Client {
         let found: Vec<Claimed> = vms
             .into_iter()
             .filter(|v| tagged(v.tags.as_deref()))
-            .map(|v| Claimed { node: v.node, vm: VmRef { vmid: v.vmid, tags: v.tags, status: v.status } })
+            .map(|v| Claimed { node: v.node, vm: VmRef { vmid: v.vmid, tags: v.tags } })
             .collect();
         if !found.is_empty() {
             return Ok(found);
@@ -226,8 +224,6 @@ impl Client {
             #[serde(default)]
             tags: Option<String>,
             #[serde(default)]
-            status: Option<String>,
-            #[serde(default)]
             pool: Option<String>,
         }
         let pool = if kind == crate::names::TAG_WORKER || kind == crate::names::TAG_SCRUB {
@@ -249,7 +245,7 @@ impl Client {
                 .map_err(|e| anyhow::anyhow!("vm {} on {}: its stamp could not be read: {e}", v.vmid, v.node))?;
             let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
             if first == Some(stamp.as_str()) {
-                found.push(Claimed { node: v.node, vm: VmRef { vmid: v.vmid, tags: v.tags, status: v.status } });
+                found.push(Claimed { node: v.node, vm: VmRef { vmid: v.vmid, tags: v.tags } });
             }
         }
         Ok(found)
@@ -732,7 +728,7 @@ impl Client {
 
     /// Whether a volume a destroyed machine's config named is still in its
     /// storage, after asking it to go once more if no configuration names it.
-    async fn volume_left(&self, node: &str, volid: &str) -> anyhow::Result<bool> {
+    pub(crate) async fn volume_left(&self, node: &str, volid: &str) -> anyhow::Result<bool> {
         let Some((storage, _)) = volid.split_once(':') else { return Ok(false) };
         let content_path = format!("/nodes/{node}/storage/{storage}/content");
         let present = |listed: &[serde_json::Value]| listed.iter().any(|c| c["volid"].as_str() == Some(volid));

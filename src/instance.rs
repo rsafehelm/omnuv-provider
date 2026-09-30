@@ -736,7 +736,7 @@ impl Client {
             // The previous code read `/nodes/{node}/qemu`, which is live, and
             // the cluster-wide lookup lost that without replacing it. One extra
             // read per machine per pass buys a status that is true.
-            let (vm, uptime) = match self
+            let (running_now, uptime) = match self
                 .get_json::<serde_json::Value>(&format!(
                     "/nodes/{node}/qemu/{}/status/current",
                     vm.vmid
@@ -744,10 +744,7 @@ impl Client {
                 .await
             {
                 Ok(live) => (
-                    crate::worker::VmRef {
-                        status: live.get("status").and_then(|s| s.as_str()).map(str::to_string),
-                        ..vm
-                    },
+                    live.get("status").and_then(|s| s.as_str()) == Some("running"),
                     live.get("uptime").and_then(|u| u.as_u64()),
                 ),
                 // **Not looked at, so not acted on (24 September 2026).** This
@@ -760,7 +757,7 @@ impl Client {
                     return Err(NotLookedAt(format!("{node} would not say how machine {} is: {e:#}", vm.vmid)).into());
                 }
             };
-            let mut running = vm.status.as_deref() == Some("running");
+            let mut running = running_now;
             // **What was seen is what is reported (PROVIDER-26).** Everything
             // below acts on a machine whose state was just read. A failure in
             // it — a re-plug, a cloud-init refresh, an API call that did not
@@ -1207,7 +1204,7 @@ impl Client {
             node: node.to_string(),
             upid: None,
             claim: TAG.to_string(),
-            stage: crate::pending::Stage::Cloning,
+            stage: crate::pending::Stage::Cloning, volids: Vec::new(),
         };
         crate::pending::write(&journal, &pending)?;
 
@@ -1235,7 +1232,7 @@ impl Client {
         // decides: a failed clone is rolled back now; one whose end could not
         // be seen stays recorded, and the next pass settles it.
         match self.task_end(node, &upid, Self::clone_polls(spec.budget_secs, self.timings.clone_budget_max)).await {
-            crate::proxmox::TaskEnd::Ended(Ok(())) => {}
+            crate::proxmox::TaskEnd::Ended(Ok(())) => self.journal_clone_volumes(&journal, &mut pending).await,
             crate::proxmox::TaskEnd::Ended(Err(exit)) => {
                 let gone = self.abandon_clone(&journal, &pending, "instance").await;
                 if gone {
@@ -1253,6 +1250,7 @@ impl Client {
         // anything failing in between left a full disk no sweep recognises;
         // the next pass, finding nothing tagged, cloned again. So the claim
         // goes on first, alone, and a failure after the clone undoes the clone.
+        let mut withheld: Option<String> = None;
         let finished: anyhow::Result<()> = async {
             let answer = self.post_form::<serde_json::Value>(
                 &format!("/nodes/{node}/qemu/{vmid}/config"),
@@ -1341,8 +1339,24 @@ impl Client {
             // only once everything handed to it is ready, and when that does
             // not happen in time the create fails like any other step, so the
             // clone and everything made for it are taken away below.
+            //
+            // **On a view read again** (the phase 7 follow-up): the build's
+            // re-read was before the clone, and a clone runs for minutes, so
+            // the buyer may have stopped or deleted the machine since. A
+            // machine that is complete and claimed is left as it is, stopped;
+            // the next pass converges it on the view it then has.
             if spec.intent == Lifecycle::Running {
-                self.start_when_ready(node, vmid).await?;
+                match start_gate.await {
+                    Ok(true) => self.start_when_ready(node, vmid).await?,
+                    Ok(false) => {
+                        audit::record("instance.start", "core", &spec.id, "withheld", Some("the view read again no longer wants it running"));
+                        withheld = Some("Core's view, read again before the start, no longer wants it running".to_string());
+                    }
+                    Err(e) => {
+                        audit::record("instance.start", "core", &spec.id, "withheld", Some(&format!("{e:#}")));
+                        withheld = Some(format!("Core's view to be read again before the start: {e:#}"));
+                    }
+                }
             }
             Ok(())
         }
@@ -1374,9 +1388,13 @@ impl Client {
         Ok(InstanceStatus {
             id: spec.id.clone(),
             rebooted_token: None,
-            state: if spec.intent == Lifecycle::Running { InstanceState::Provisioning } else { InstanceState::Stopped },
+            state: if spec.intent == Lifecycle::Running && withheld.is_none() {
+                InstanceState::Provisioning
+            } else {
+                InstanceState::Stopped
+            },
             retryable: None,
-            waiting_on: None,
+            waiting_on: withheld.clone(),
             local_id: Some(vmid.to_string()),
             node: Some(node.to_string()),
             // Not until first boot has set it, which the running path reports.
@@ -1678,10 +1696,18 @@ impl Client {
             if entry.stage == crate::pending::Stage::Abandoned {
                 match self.vm_at(entry.vmid).await {
                     Err(e) => eprintln!("pending clone {}: cannot list machines, its rollback is still owed: {e:#}", entry.vmid),
-                    Ok(None) => {
-                        audit::record(&format!("{event}.create"), "core", &entry.id, "rollback confirmed", Some(&entry.vmid.to_string()));
-                        crate::pending::remove(&journal, entry.vmid);
-                    }
+                    Ok(None) => match self.clone_volumes_left(&entry).await {
+                        Ok(left) if left.is_empty() => {
+                            audit::record(&format!("{event}.create"), "core", &entry.id, "rollback confirmed", Some(&entry.vmid.to_string()));
+                            crate::pending::remove(&journal, entry.vmid);
+                        }
+                        Ok(left) => eprintln!(
+                            "pending clone {}: the machine is gone but {} stays on its storage; its rollback is still owed",
+                            entry.vmid,
+                            left.join(" ")
+                        ),
+                        Err(e) => eprintln!("pending clone {}: its volumes could not be looked for, its rollback is still owed: {e:#}", entry.vmid),
+                    },
                     Ok(Some(_)) => {
                         self.abandon_clone(&journal, &entry, event).await;
                     }
@@ -1858,15 +1884,58 @@ impl Client {
         let outcome = if gone.is_ok() { "rolled back" } else { "rollback failed" };
         audit::record(&format!("{event}.create"), "core", id, outcome, Some(&vmid.to_string()));
         match gone {
-            Ok(()) => {
-                crate::pending::remove(journal, vmid);
-                true
-            }
+            Ok(()) => match self.clone_volumes_left(entry).await {
+                Ok(left) if left.is_empty() => {
+                    crate::pending::remove(journal, vmid);
+                    true
+                }
+                Ok(left) => {
+                    eprintln!("instance {id}: clone {vmid} is gone but {} stays on its storage; the record stays until it is not", left.join(" "));
+                    audit::record(&format!("{event}.create"), "core", id, "rolled back, volumes left", Some(&left.join(" ")));
+                    false
+                }
+                Err(e) => {
+                    eprintln!("instance {id}: clone {vmid} is gone, but its volumes could not be looked for, so its record stays: {e:#}");
+                    false
+                }
+            },
             Err(e) => {
                 eprintln!("instance {id}: could not remove clone {vmid} after a failed create, and it stays recorded: {e:#}");
                 false
             }
         }
+    }
+
+    /// **The clone's volumes, written down once its task ended** (the phase 7
+    /// follow-up): the configuration Proxmox wrote names them, and a rollback
+    /// that destroys the machine must then see each gone. Best effort, and
+    /// said: a configuration that cannot be read leaves the record as it was,
+    /// which is settled as it always was.
+    pub(crate) async fn journal_clone_volumes(&self, journal: &std::path::Path, pending: &mut crate::pending::PendingClone) {
+        let config: anyhow::Result<serde_json::Value> =
+            self.get_json(&format!("/nodes/{}/qemu/{}/config", pending.node, pending.vmid)).await;
+        match config {
+            Ok(config) => {
+                pending.volids = crate::teardown::disk_volids(&config);
+                if let Err(e) = crate::pending::write(journal, pending) {
+                    eprintln!("vm {}: its volumes were not written down: {e:#}", pending.vmid);
+                }
+            }
+            Err(e) => eprintln!("vm {}: its volumes were not written down; its configuration cannot be read: {e:#}", pending.vmid),
+        }
+    }
+
+    /// The volumes a rolled-back clone's record names that are still on their
+    /// storage after being asked to go once more. An error means a listing
+    /// could not be made, which is not "none left".
+    async fn clone_volumes_left(&self, entry: &crate::pending::PendingClone) -> anyhow::Result<Vec<String>> {
+        let mut left = Vec::new();
+        for volid in &entry.volids {
+            if self.volume_left(&entry.node, volid).await? {
+                left.push(volid.clone());
+            }
+        }
+        Ok(left)
     }
 
     /// **Deletes one machine, under licence (a)** (lifecycle phase 7, RC4,
@@ -2084,10 +2153,126 @@ mod tests {
         assert!(result.is_err(), "the resize failed and the create reported success");
         assert!(mock.called("DELETE", "/nodes/n1/qemu/123"), "the clone was left behind");
         let calls = mock.calls.lock().unwrap();
-        let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/123/config").expect("configured");
+        let first_config = calls.iter().position(|c| c.path == "/nodes/n1/qemu/123/config" && c.method != "GET").expect("configured");
         assert!(calls[first_config].body.starts_with("tags="), "the first write after the clone was not the tag");
         assert!(crate::pending::list(&crate::pending::dir(dir.to_str().unwrap())).is_empty(), "a rolled-back clone stayed recorded");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A rollback that leaves a volume keeps its record** (the phase 7
+    /// follow-up: volume ids journalled at the clone). The clone's config names
+    /// a disk; the resize fails, the machine is destroyed, and the disk stays
+    /// on its storage and will not go. The create fails, the record stays
+    /// owed with the volume named, and it goes on a later pass only once a
+    /// listing finds the volume gone. The control is the test above: nothing
+    /// left, the record goes at once.
+    #[tokio::test]
+    async fn a_rollback_that_leaves_a_volume_keeps_its_record_until_it_is_gone() {
+        use crate::pvemock::{task_ok, Mock};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        const DISK: &str = "vmdata:vm-123-disk-0";
+        let on_storage = Arc::new(AtomicBool::new(true));
+        let seen = on_storage.clone();
+        let vm_gone = Arc::new(AtomicBool::new(false));
+        let destroyed = vm_gone.clone();
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(r) = task_ok(path) {
+                return r;
+            }
+            let gone = destroyed.load(Ordering::SeqCst);
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::Value::Null),
+                ("GET", "/nodes/n1/qemu/123/config") if !gone => (200, serde_json::json!({
+                    "description": crate::names::description(TAG, &spec().id),
+                    "scsi0": format!("{DISK},size=8G"),
+                })),
+                ("PUT", "/nodes/n1/qemu/123/resize") => (500, serde_json::Value::Null),
+                ("POST", "/nodes/n1/qemu/123/status/stop") => (200, serde_json::json!("UPID:n1:stop")),
+                ("DELETE", "/nodes/n1/qemu/123") => {
+                    destroyed.store(true, Ordering::SeqCst);
+                    (200, serde_json::json!("UPID:n1:del"))
+                }
+                ("GET", "/nodes/n1/storage/vmdata/content") => (200, if seen.load(Ordering::SeqCst) {
+                    serde_json::json!([{"volid": DISK}])
+                } else {
+                    serde_json::json!([])
+                }),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let (root, dir) = snippets("rollback-volume");
+        let result = mock.client().ensure_instance("n1", 9000, "local", &dir, &spec()).await;
+        assert!(result.is_err(), "the resize failed and the create reported success");
+        assert!(mock.called("DELETE", "/nodes/n1/qemu/123"), "the clone was not destroyed");
+        let journal = crate::pending::dir(&dir);
+        let owed = crate::pending::list(&journal);
+        assert_eq!(owed.len(), 1, "a rollback that left a volume dropped its record: {owed:?}");
+        assert_eq!((owed[0].stage, owed[0].volids.clone()), (crate::pending::Stage::Abandoned, vec![DISK.to_string()]));
+
+        mock.client().recover_pending(&dir).await;
+        assert_eq!(crate::pending::list(&journal).len(), 1, "a volume still there was taken as gone");
+
+        on_storage.store(false, Ordering::SeqCst);
+        mock.client().recover_pending(&dir).await;
+        assert!(crate::pending::list(&journal).is_empty(), "a volume found gone did not settle the record");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// **A machine just cloned is started only on a view read again** (the
+    /// phase 7 follow-up; G_reread for a start). The build's re-read is before
+    /// the clone, which may run for minutes, so the start asks again. When the
+    /// view no longer wants it running, or could not be read, the machine is
+    /// left complete, claimed and stopped, waiting on the view, and nothing
+    /// is rolled back or started; when it still does, it is started. The
+    /// clone's journal record is gone either way.
+    #[tokio::test]
+    async fn a_machine_just_cloned_is_started_only_on_a_view_read_again() {
+        use crate::pvemock::Mock;
+        for (gate, started) in [(Ok(true), true), (Ok(false), false), (Err("core would not answer"), false)] {
+            let mock = Mock::start(|method, path, _| {
+                if let Some(r) = crate::pvemock::task_ok(path) {
+                    return r;
+                }
+                match (method, path) {
+                    ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([])),
+                    ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                    ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                    ("GET", "/cluster/nextid") => (200, serde_json::json!("123")),
+                    ("POST", p) if p.ends_with("/clone") => (200, serde_json::json!("UPID:n1:clone")),
+                    ("POST", "/nodes/n1/qemu/123/config") => (200, serde_json::json!("UPID:n1:config")),
+                    ("PUT", "/nodes/n1/qemu/123/resize") => (200, serde_json::json!("UPID:n1:resize")),
+                    ("POST", "/nodes/n1/qemu/123/status/start") => (200, serde_json::json!("UPID:n1:start")),
+                    _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+                }
+            })
+            .await;
+            let (root, dir) = snippets("cloned-then-reread");
+            let gate = std::future::ready(gate.map_err(|e: &str| anyhow::anyhow!(e)));
+            let status = mock
+                .client()
+                .ensure_instance_gated("n1", 9000, "local", &dir, &spec(), gate)
+                .await
+                .expect("the create succeeded either way");
+            assert_eq!(mock.called("POST", "/nodes/n1/qemu/123/status/start"), started);
+            assert!(!mock.called("DELETE", "/nodes/n1/qemu/123"), "a complete machine was rolled back");
+            assert!(crate::pending::list(&crate::pending::dir(&dir)).is_empty(), "the clone stayed recorded");
+            assert_eq!(status.local_id.as_deref(), Some("123"), "a built machine must be reported built");
+            if started {
+                assert_eq!(status.state, InstanceState::Provisioning);
+                assert!(status.waiting_on.is_none());
+            } else {
+                assert_eq!(status.state, InstanceState::Stopped);
+                assert!(status.waiting_on.as_deref().unwrap_or_default().contains("read again"), "{status:?}");
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// **The start waits for the resize** (Pluto VM 103, 25 September 2026:
@@ -2725,7 +2910,7 @@ mod tests {
                 node: "n1".into(),
                 upid: Some("UPID:n1:clone".into()),
                 claim: TAG.into(),
-                stage: crate::pending::Stage::Cloning,
+                stage: crate::pending::Stage::Cloning, volids: Vec::new(),
             },
         )
         .unwrap();
@@ -2983,7 +3168,7 @@ mod tests {
         .await;
         let (root, dir) = snippets("unproven");
         let journal = crate::pending::dir(&dir);
-        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None, claim: TAG.to_string(), stage: crate::pending::Stage::Cloning })
+        crate::pending::write(&journal, &crate::pending::PendingClone { vmid: 555, id: "i-x".into(), node: "n1".into(), upid: None, claim: TAG.to_string(), stage: crate::pending::Stage::Cloning, volids: Vec::new() })
             .unwrap();
         mock.client().recover_pending(&dir).await;
         let calls = mock.calls.lock().unwrap();
@@ -3020,7 +3205,7 @@ mod tests {
             &crate::pending::PendingClone {
                 vmid: 777, id: "i-rolled-back".into(), node: "n1".into(),
                 upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
-                stage: crate::pending::Stage::Abandoned,
+                stage: crate::pending::Stage::Abandoned, volids: Vec::new(),
             },
         )
         .unwrap();
@@ -3064,7 +3249,7 @@ mod tests {
             &crate::pending::PendingClone {
                 vmid: 777, id: "i-rolled-back".into(), node: "n1".into(),
                 upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
-                stage: crate::pending::Stage::Abandoned,
+                stage: crate::pending::Stage::Abandoned, volids: Vec::new(),
             },
         )
         .unwrap();
@@ -3110,7 +3295,7 @@ mod tests {
                 &crate::pending::PendingClone {
                     vmid: 777, id: "i-decoy".into(), node: "n1".into(),
                     upid: Some("UPID:n1:clone".into()), claim: TAG.to_string(),
-                    stage: crate::pending::Stage::Cloning,
+                    stage: crate::pending::Stage::Cloning, volids: Vec::new(),
                 },
             )
             .unwrap();
@@ -3168,7 +3353,7 @@ mod tests {
                 node: "n1".into(),
                 upid: Some("UPID:n1:clone".into()),
                 claim: TAG.to_string(),
-                stage: crate::pending::Stage::Cloning,
+                stage: crate::pending::Stage::Cloning, volids: Vec::new(),
             },
         )
         .unwrap();
@@ -3314,7 +3499,7 @@ mod tests {
             node: "n1".into(),
             upid: Some("UPID:n1:clone".into()),
             claim: TAG.to_string(),
-            stage: crate::pending::Stage::Abandoned,
+            stage: crate::pending::Stage::Abandoned, volids: Vec::new(),
         };
         crate::pending::write(&journal, &entry).unwrap();
         let client = mock.client();
@@ -3352,7 +3537,7 @@ mod tests {
                 node: "n1".into(),
                 upid: Some("UPID:n1:clone".into()),
                 claim: TAG.to_string(),
-                stage: crate::pending::Stage::Cloning,
+                stage: crate::pending::Stage::Cloning, volids: Vec::new(),
             },
         )
         .unwrap();
@@ -3403,7 +3588,7 @@ mod tests {
                 node: "n1".into(),
                 upid: Some("UPID:n1:clone".into()),
                 claim: TAG.to_string(),
-                stage: crate::pending::Stage::Cloning,
+                stage: crate::pending::Stage::Cloning, volids: Vec::new(),
             },
         )
         .unwrap();
