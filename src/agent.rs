@@ -813,6 +813,11 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // successor is not made to wait out the takeover lease. Between passes
     // only: a pass in flight finishes first.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // **A destroy that owes its proof asks for the next pass soon**
+    // (`teardown::ProofFollowUp`), so a deleted machine's claim does not wait
+    // a whole poll for the listing that proves it gone.
+    let mut proofs = crate::teardown::ProofFollowUp::default();
+    let mut follow_up_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = terminate.recv() => {
@@ -826,7 +831,17 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             ended = &mut heartbeat => {
                 anyhow::bail!("heartbeat task ended unexpectedly: {ended:?}");
             }
-            _ = nudge.notified() => {
+            _ = async {
+                tokio::select! {
+                    _ = nudge.notified() => {}
+                    _ = async {
+                        match follow_up_at {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                }
+            } => {
                 if let Err(e) = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &mirror_wanted, &mirror_kick, &mut core_poll).await {
                     match refusal(&e) {
                         Refusal::Final => stop_for_good(&e),
@@ -864,6 +879,9 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
                 anyhow::bail!("report task ended unexpectedly: {ended:?}");
             }
         }
+        follow_up_at = proofs
+            .after_pass(crate::teardown::ProofFollowUp::owed(&crate::teardown::tombstones(&cfg.proxmox.snippet_dir)))
+            .map(|wait| tokio::time::Instant::now() + wait);
         // Re-armed, not restarted, when Core's poll moved: the first look at
         // the new period is one period away, so a change costs no extra pass.
         if let Some(period) = repoll(reconcile.period(), core_poll) {

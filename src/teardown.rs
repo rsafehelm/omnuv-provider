@@ -519,6 +519,48 @@ pub(crate) fn list_tombs(dir: &std::path::Path) -> Vec<Tombstone> {
     out
 }
 
+/// **A destroy that owes its proof asks for the next pass soon** (the phase
+/// 12 follow-up). The proof is a later pass's listing, and left to the poll a
+/// deleted machine's claim ended 118 s after its destroy. A pass that leaves
+/// a tombstone destroyed and not yet proven is followed by one after
+/// `timings::PROOF_FOLLOW_UP`, at most `PROOF_FOLLOW_UPS` times for the
+/// same owed set: a blocker that stays (a node that does not answer) is the
+/// poll's to retry, not a loop's. A tombstone newly owed starts the count
+/// again, so an old stuck one never makes a new destroy wait.
+#[derive(Debug, Default)]
+pub(crate) struct ProofFollowUp {
+    seen: std::collections::BTreeSet<String>,
+    streak: u32,
+}
+
+impl ProofFollowUp {
+    /// The ids whose destroy was seen to finish and whose proof no listing has
+    /// yet made.
+    pub(crate) fn owed(dir: &std::path::Path) -> Vec<String> {
+        list_tombs(dir).into_iter().filter(|t| t.destroyed_at.is_some() && t.proven_at.is_none()).map(|t| t.id).collect()
+    }
+
+    /// After a pass: how long until the next one, when a proof is owed and
+    /// this owed set has not used its follow-ups.
+    pub(crate) fn after_pass(&mut self, owed: Vec<String>) -> Option<std::time::Duration> {
+        let now: std::collections::BTreeSet<String> = owed.into_iter().collect();
+        if now.is_empty() {
+            self.seen.clear();
+            self.streak = 0;
+            return None;
+        }
+        if !now.is_subset(&self.seen) {
+            self.streak = 0;
+        }
+        self.seen = now;
+        if self.streak >= crate::timings::PROOF_FOLLOW_UPS {
+            return None;
+        }
+        self.streak += 1;
+        Some(crate::timings::PROOF_FOLLOW_UP.std())
+    }
+}
+
 /// **Never built again** (G_agentTomb): an id this agent destroyed, or
 /// answered deleted for, is refused a create, with the reason.
 pub(crate) fn built_again(snippet_dir: &str, id: &str) -> Option<String> {
@@ -864,6 +906,43 @@ mod tests {
     const ID: &str = "0a1b2c3d-4e5f-4a0b-8c1d-2e3f4a5b6c7d";
     /// Another machine whose id shares ID's first twelve hex digits.
     const TWIN: &str = "0a1b2c3d-4e5f-4fff-8fff-ffffffffffff";
+
+    /// A destroy that owes its proof is followed by an early pass, and a
+    /// blocker that stays is not looped on.
+    #[test]
+    fn a_destroy_owing_its_proof_asks_for_the_next_pass_soon() {
+        let mut f = ProofFollowUp::default();
+        assert_eq!(f.after_pass(vec![]), None, "nothing owed asked for a pass");
+        let soon = Some(crate::timings::PROOF_FOLLOW_UP.std());
+        for i in 0..crate::timings::PROOF_FOLLOW_UPS {
+            assert_eq!(f.after_pass(vec!["a".into()]), soon, "follow-up {i} was not asked for");
+        }
+        assert_eq!(f.after_pass(vec!["a".into()]), None, "a blocker that stays was looped on");
+        assert_eq!(f.after_pass(vec!["a".into(), "b".into()]), soon, "a new destroy waited on an old stuck one");
+        assert_eq!(f.after_pass(vec![]), None);
+        assert_eq!(f.after_pass(vec!["a".into()]), soon, "the count was not reset when nothing was owed");
+    }
+
+    /// Only a destroy seen to finish and not yet proven is owed.
+    #[test]
+    fn only_a_seen_destroy_without_its_proof_is_owed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tomb = |id: &str, destroyed_at: Option<i64>, proven_at: Option<i64>| Tombstone {
+            id: id.into(),
+            claim: "instance".into(),
+            node: None,
+            vmid: None,
+            volids: vec![],
+            destroyed_at,
+            proven_at,
+            residue: vec![],
+            residue_gone: vec![],
+        };
+        write_tomb(dir.path(), &tomb("owed", Some(1), None)).unwrap();
+        write_tomb(dir.path(), &tomb("decided", None, None)).unwrap();
+        write_tomb(dir.path(), &tomb("proven", Some(1), Some(2))).unwrap();
+        assert_eq!(ProofFollowUp::owed(dir.path()), vec!["owed".to_string()]);
+    }
 
     /// The volumes a config names, and the nearest things it must ignore.
     #[test]

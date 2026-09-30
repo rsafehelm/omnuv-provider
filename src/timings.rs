@@ -74,6 +74,13 @@ pub const POLL_WHEN_CORE_SAYS_NONE: Dur = Dur::secs(120);
 pub const POLL_FLOOR: Dur = FASTEST_READ;
 pub const POLL_CEILING: Dur = Dur::mins(30);
 
+/// After a destroy whose proof is owed, the next pass comes after this, at most
+/// `PROOF_FOLLOW_UPS` times for the same owed machines. Unmeasured: the destroy
+/// task has finished and the listing that proves it is a few Proxmox reads, so
+/// the wait only lets the storage settle; the cap is what bounds it.
+pub const PROOF_FOLLOW_UP: Dur = Dur::secs(5);
+pub const PROOF_FOLLOW_UPS: u32 = 6;
+
 /// The poll to keep, given what Core said. Absent and zero are both "not
 /// said", like the heartbeat's interval, because an interval of nothing is
 /// not a period anything can keep; anything else is Core's, held to the range
