@@ -19,7 +19,7 @@ const ROLE_PRIVS: &str = "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,\
 VM.Audit,VM.Allocate,VM.Clone,VM.PowerMgmt,\
 VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,\
 VM.Config.Options,VM.Config.Cloudinit,VM.Config.HWType,VM.Config.CDROM,\
-VM.GuestAgent.Audit,Mapping.Audit,Mapping.Use,SDN.Audit,SDN.Use";
+VM.GuestAgent.Audit,Mapping.Audit,Mapping.Use,SDN.Audit,SDN.Use,Pool.Audit";
 
 /// The pool a gateway lands in, and the pool a buyer's machine lands in. The
 /// agent's extra privileges are granted on these and nowhere else.
@@ -45,6 +45,51 @@ const EGRESS_DNS: &str = "1.1.1.1";
 /// Applying an SDN change is asynchronous: the configuration is accepted and
 /// the interface shows up a moment later. Returning before it exists means the
 /// first machine placed here has nowhere to plug in.
+/// **Where the agent's privileges are granted (PROVIDER-20, 1 October 2026).**
+/// The roles that manage a machine sit on the marketplace's pools, the storages
+/// it writes, the card mappings and the zones it attaches to; `/` holds reads
+/// alone. So the token cannot touch a guest outside its pools whatever the
+/// agent's own claim-tag rule says. The same grants `deploy-agent.yml` writes,
+/// measured there on Titan and Pluto: a clone also needs SDN.Use on
+/// `localnetwork` (the template's net0 is on vmbr0) and on the NAT zone.
+/// A grant of OnvAgent on `/` from an earlier join is taken away.
+fn grants_script(storage: &str) -> String {
+    let roles = [
+        ("OnvAgentRead", "Sys.Audit,Datastore.Audit,VM.Audit,Mapping.Audit,SDN.Audit,Pool.Audit"),
+        ("OnvStorage", "Datastore.AllocateSpace,Datastore.Audit"),
+        ("OnvMapping", "Mapping.Use,Mapping.Audit"),
+        ("OnvNetUse", "SDN.Use,SDN.Audit"),
+    ];
+    let mut paths: Vec<(String, &str)> = vec![
+        (format!("/pool/{GATEWAY_POOL}"), "OnvAgent"),
+        (format!("/pool/{BUYER_POOL}"), "OnvAgent"),
+        (format!("/storage/{storage}"), "OnvStorage"),
+        ("/mapping/pci".to_string(), "OnvMapping"),
+        (format!("/sdn/zones/{EGRESS_ZONE}"), "OnvNetUse"),
+        ("/sdn/zones/localnetwork".to_string(), "OnvNetUse"),
+        ("/".to_string(), "OnvAgentRead"),
+    ];
+    if storage != crate::names::STORAGE_SNIPPETS {
+        paths.push((format!("/storage/{}", crate::names::STORAGE_SNIPPETS), "OnvStorage"));
+    }
+    let mut lines: Vec<String> = roles
+        .iter()
+        .map(|(role, privs)| {
+            format!(
+                "{{ pveum role list --output-format json | grep -q '\"{role}\"' \
+                 && pveum role modify {role} -privs {privs} || pveum role add {role} -privs {privs}; }}"
+            )
+        })
+        .collect();
+    for who in ["-user onv@pve", "-token 'onv@pve!agent'"] {
+        for (path, role) in &paths {
+            lines.push(format!("pveum acl modify {path} {who} -role {role}"));
+        }
+        lines.push(format!("{{ pveum acl delete / {who} -role OnvAgent 2>/dev/null || true; }}"));
+    }
+    lines.join(" && ")
+}
+
 fn egress_script() -> String {
     format!(
         "set -e
@@ -163,7 +208,6 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         "pveum user list --output-format json | grep -q '\"onv@pve\"' || pveum user add onv@pve --comment 'Onv marketplace agent'",
         a.dry_run,
     )?;
-    step("acl", "pveum acl modify / -user onv@pve -role OnvAgent", a.dry_run)?;
 
     let secret = if a.dry_run {
         "<created at run time>".to_string()
@@ -182,7 +226,6 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("pveum created a token and printed no secret: {out}"))
             })?
     };
-    step("token acl", "pveum acl modify / -token 'onv@pve!agent' -role OnvAgent", a.dry_run)?;
 
     // Pools, and roles granted only on those pools. The agent can write files
     // into a gateway it built and open a console on a machine it built, and can
@@ -286,6 +329,10 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         &egress_script(),
         a.dry_run,
     )?;
+
+    // After the egress zone exists: the agent's grants, on its own paths.
+    println!("\nGranting the agent its pools, storage, cards and zones, and reads at /:");
+    step("grants", &grants_script(&storage), a.dry_run)?;
 
     let fingerprint = sh("openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256 | cut -d= -f2")
         .unwrap_or_default();
@@ -551,7 +598,7 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
     // every vnet and subnet in them (the old `onat0` bridge included).
     step(
         "remove pool and SDN roles",
-        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus OnvConsolePassword; do pveum role delete $r 2>/dev/null || true; done",
+        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus OnvConsolePassword OnvAgentRead OnvStorage OnvMapping OnvNetUse; do pveum role delete $r 2>/dev/null || true; done",
         dry_run,
     )?;
     let vnets = if dry_run {
@@ -591,6 +638,30 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+
+    /// **PROVIDER-20: nothing that manages a machine is granted at `/`.**
+    #[test]
+    fn join_grants_manage_only_off_the_root() {
+        let script = super::grants_script("zfs-fast");
+        let grants: Vec<&str> = script.split(" && ").filter(|l| l.starts_with("pveum acl modify")).collect();
+        assert_eq!(grants.len(), 16, "two principals, eight paths each: {grants:#?}");
+        for g in &grants {
+            let path = g.split_whitespace().nth(3).unwrap();
+            if path == "/" {
+                assert!(g.ends_with("-role OnvAgentRead"), "/ holds more than reads: {g}");
+            }
+            if g.ends_with("-role OnvAgent") {
+                assert!(path.starts_with("/pool/"), "OnvAgent granted off the pools: {g}");
+            }
+        }
+        for path in ["/storage/zfs-fast", "/mapping/pci", "/sdn/zones/localnetwork", "/pool/onv-buyers"] {
+            assert!(grants.iter().any(|g| g.contains(&format!(" {path} -token"))), "the token misses {path}");
+        }
+        assert!(script.contains("pveum acl delete / -token 'onv@pve!agent' -role OnvAgent"), "an old / grant is left");
+        // The storage the snippets live on is granted once, not twice.
+        let snip = super::grants_script(crate::names::STORAGE_SNIPPETS);
+        assert_eq!(snip.matches("acl modify /storage/").count(), 2, "{snip}");
+    }
 
     /// The pools that exist, from `pvesh get /pools` — and nothing from a
     /// listing that is not one.
