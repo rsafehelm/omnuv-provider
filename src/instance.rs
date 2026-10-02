@@ -284,14 +284,24 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     //
     // Skipping Docker for these also saves minutes on every gaming machine
     // that was previously spent installing something nothing would use.
+    //
+    // Each is skipped where the image already carries it (a recipe's own
+    // image, as `ubuntu-26.04-ollama` does since 2 October 2026): Docker's
+    // installer, finding Docker, pauses twenty seconds and reinstalls it, and
+    // the toolkit's costs an apt update. Configuring the runtime is not
+    // skipped; it is idempotent and is what makes the GPU visible.
     if has_containers(&recipe.compose) {
-        steps.push("curl -fsSL https://get.docker.com | sh".into());
+        steps.push(
+            "command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh".into(),
+        );
     }
     if recipe.gpu && has_containers(&recipe.compose) {
         steps.push(
-            "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
+            "if ! command -v nvidia-ctk >/dev/null 2>&1; then \
+             curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
              curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
-             apt-get update && apt-get install -y nvidia-container-toolkit && nvidia-ctk runtime configure --runtime=docker && systemctl restart docker"
+             apt-get update && apt-get install -y nvidia-container-toolkit; fi && \
+             nvidia-ctk runtime configure --runtime=docker && systemctl restart docker"
                 .into(),
         );
     }
@@ -3765,6 +3775,78 @@ mod tests {
         // And the opposite: a recipe that does have containers still gets them.
         spec.recipe.as_mut().unwrap().compose = "services:\n  app:\n    image: x\n".into();
         assert!(super::has_containers(&spec.recipe.as_ref().unwrap().compose));
+    }
+
+    /// **Docker and the toolkit are installed only where the image lacks
+    /// them** (2 October 2026, the Ollama image carries both). Run, not read:
+    /// the two steps under `bash` with stubs on PATH that record which of
+    /// them was called, once on an image holding Docker and the toolkit and
+    /// once on one holding neither.
+    #[test]
+    fn docker_and_the_toolkit_are_installed_only_where_missing() {
+        let recipe = omnuv_protocol::RecipeSpec {
+            id: "ollama-openwebui".into(),
+            compose: "services:\n  app:\n    image: x\n".into(),
+            gpu: true,
+            post_up: vec![],
+        };
+        // runcmd carries the whole recipe as one base64 script; its steps are
+        // base64 again inside it.
+        let entry = recipe_runcmd(&recipe);
+        let outer = entry.split("echo ").nth(1).and_then(|s| s.split(' ').next()).expect("one script");
+        let script = {
+            use base64::Engine as _;
+            String::from_utf8(base64::engine::general_purpose::STANDARD.decode(outer).unwrap()).unwrap()
+        };
+        let steps = inner(&script);
+        let (docker, toolkit) = (&steps[1], &steps[2]);
+        assert!(docker.contains("get.docker.com") && toolkit.contains("nvidia-ctk"), "{steps:?}");
+
+        let run = |baked: bool| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("calls");
+            let stub = |name: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> {}\n", log.display())).unwrap();
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            for name in ["curl", "sh", "gpg", "sed", "apt-get", "systemctl"] {
+                stub(name);
+            }
+            if baked {
+                stub("docker");
+                stub("nvidia-ctk");
+            }
+            for step in [docker, toolkit] {
+                // The toolkit's last word is `nvidia-ctk runtime configure`,
+                // which a bare image has no binary for until apt installs it;
+                // the stub for apt-get cannot, so only the baked run asks it.
+                let status = std::process::Command::new("/bin/bash")
+                    .arg("-c")
+                    .arg(step.replace(" > /etc/apt/sources.list.d/nvidia-container-toolkit.list", " >/dev/null")
+                             .replace("-o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg", ""))
+                    .env("PATH", dir.path())
+                    .status()
+                    .unwrap();
+                if baked {
+                    assert!(status.success(), "{step}");
+                }
+            }
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+
+        let baked = run(true);
+        assert!(!baked.contains("curl") && !baked.contains("apt-get"),
+                "an image with Docker and the toolkit fetched them again: {baked}");
+        assert!(baked.contains("nvidia-ctk runtime configure --runtime=docker")
+                    && baked.contains("systemctl restart docker"),
+                "the runtime is configured even when the toolkit is baked: {baked}");
+
+        let bare = run(false);
+        assert!(bare.contains("curl -fsSL https://get.docker.com"), "a bare image got no Docker: {bare}");
+        assert!(bare.contains("apt-get install -y nvidia-container-toolkit"),
+                "a bare image got no toolkit: {bare}");
     }
 
     #[test]
