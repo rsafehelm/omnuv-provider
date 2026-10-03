@@ -4279,7 +4279,7 @@ echo 'single' "double" `backtick` \$escaped
         use base64::Engine as _;
         // The recipe's script is the last encoded line; the status lines
         // before it are the machine's own steps.
-        let line = ci.lines().filter(|l| l.contains("base64 -d")).last().expect("an encoded step");
+        let line = ci.lines().rev().find(|l| l.contains("base64 -d")).expect("an encoded step");
         let b64 = line.split("echo ").nth(1).unwrap().split(' ').next().unwrap();
         let outer = String::from_utf8(
             base64::engine::general_purpose::STANDARD.decode(b64).expect("decodes"),
