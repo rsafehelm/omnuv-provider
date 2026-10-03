@@ -263,7 +263,9 @@ fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment) -> String {
 fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     use base64::Engine as _;
     let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
-    let mut steps: Vec<String> = vec![
+    // Each step with the words a buyer reads while it runs (the Instances
+    // redesign, 3 October 2026; omnuv-protocol v0.25.0 `label`).
+    let mut steps: Vec<(&'static str, String)> = vec![
         // Nothing below works without the internet, and runcmd does not
         // reliably have it. A buyer machine has two interfaces, and
         // `systemd-networkd-wait-online` waits for *every* managed link: the
@@ -273,7 +275,7 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
         //
         // So wait for the thing actually needed rather than for networkd's
         // opinion of the interfaces.
-        WAIT_FOR_INTERNET.into(),
+        ("Waiting for the network", WAIT_FOR_INTERNET.into()),
     ];
 
     // A recipe with no containers needs no container runtime. The gaming
@@ -291,25 +293,27 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     // the toolkit's costs an apt update. Configuring the runtime is not
     // skipped; it is idempotent and is what makes the GPU visible.
     if has_containers(&recipe.compose) {
-        steps.push(
+        steps.push((
+            "Installing Docker",
             "command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh".into(),
-        );
+        ));
     }
     if recipe.gpu && has_containers(&recipe.compose) {
-        steps.push(
+        steps.push((
+            "Preparing the GPU",
             "if ! command -v nvidia-ctk >/dev/null 2>&1; then \
              curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
              curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
              apt-get update && apt-get install -y nvidia-container-toolkit; fi && \
              nvidia-ctk runtime configure --runtime=docker && systemctl restart docker"
                 .into(),
-        );
+        ));
     }
     if has_containers(&recipe.compose) {
-        steps.push(format!("cd {RECIPE_DIR} && docker compose up -d"));
+        steps.push(("Starting the application", format!("cd {RECIPE_DIR} && docker compose up -d")));
     }
     for cmd in &recipe.post_up {
-        steps.push(format!("cd {RECIPE_DIR} && {cmd}"));
+        steps.push(("Finishing setup", format!("cd {RECIPE_DIR} && {cmd}")));
     }
     // One runcmd entry, not one per step, and this is the whole point.
     //
@@ -323,12 +327,69 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     // Collapsing the recipe into one script under `set -e` makes a failing step
     // stop the recipe and makes the failure visible in `cloud-init status`,
     // which is the only thing outside the guest that can see any of this.
+    //
+    // **And it says which step it is on before running it**, in the same
+    // file the EXIT trap writes at the end, so the install's progress can be
+    // read while it runs and not only once it has stopped. No `rc=` line until
+    // the trap: that is how a reader tells running from finished.
+    let script = install_script(&steps, RECIPE_STATUS);
+    format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(&script))
+}
+
+/// The whole install as one bash script: each step labelled and run in turn
+/// under `set -e`, its step and label written to `status` before it runs, and
+/// the EXIT trap writing the step, label and exit code at the end. Pure, so a
+/// test can run it with harmless steps and a status file of its own.
+/// What the install's status file says: `step=3/6\nlabel=…` written before
+/// each step, and `rc=` added by the EXIT trap at the end. `None` when it says
+/// nothing yet. Pure; `recipe_progress` adds the stream login after it.
+pub(crate) fn progress_from(status: &str) -> Option<omnuv_protocol::RecipeProgress> {
+    let mut step = None;
+    let mut label = None;
+    let mut rc = None;
+    for line in status.lines() {
+        match line.split_once('=') {
+            Some(("step", v)) => step = Some(v.trim().to_string()),
+            Some(("label", v)) if !v.trim().is_empty() => label = Some(v.trim().to_string()),
+            Some(("rc", v)) => rc = v.trim().parse::<i32>().ok(),
+            _ => {}
+        }
+    }
+    // "finished" and "starting" are not steps anyone needs to see.
+    let step = step.filter(|s| s != "finished" && s != "starting");
+    // **A step and no exit code is an install under way**: the line written
+    // before each step, not yet overwritten by the trap.
+    let Some(rc) = rc else {
+        return step.map(|step| omnuv_protocol::RecipeProgress {
+            status: "running".to_string(),
+            step: Some(step),
+            label,
+            detail: None,
+            stream_credentials: None,
+        });
+    };
+    Some(omnuv_protocol::RecipeProgress {
+        status: if rc == 0 { "done" } else { "error" }.to_string(),
+        label: step.as_ref().and(label),
+        step,
+        detail: (rc != 0).then(|| {
+            format!("The recipe stopped with exit code {rc}. Its output is in the machine's own /var/log/cloud-init-output.log.")
+        }),
+        stream_credentials: None,
+    })
+}
+
+pub(crate) fn install_script(steps: &[(&'static str, String)], status: &str) -> String {
+    use base64::Engine as _;
+    let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
     let body: String = steps
         .iter()
         .enumerate()
-        .map(|(i, script)| {
+        .map(|(i, (label, script))| {
             format!(
-                "STEP={}/{}\necho \"omnuv: recipe step $STEP\"\necho {} | base64 -d | bash\n",
+                "STEP={}/{}\nLABEL='{label}'\n\
+                 printf 'step=%s\\nlabel=%s\\n' \"$STEP\" \"$LABEL\" > {status}\n\
+                 echo \"omnuv: recipe step $STEP\"\necho {} | base64 -d | bash\n",
                 i + 1,
                 steps.len(),
                 b64(script)
@@ -349,15 +410,15 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     // read is never a reason to run something in the buyer's guest.
     let script = format!(
         "set -e\n\
-         mkdir -p /etc/onv\n\
+         mkdir -p \"$(dirname {status})\"\n\
          STEP=starting\n\
-         trap 'rc=$?; printf \"step=%s\\nrc=%s\\n\" \"$STEP\" \"$rc\" > {RECIPE_STATUS}' EXIT\n\
+         LABEL=\n\
+         trap 'rc=$?; printf \"step=%s\\nlabel=%s\\nrc=%s\\n\" \"$STEP\" \"$LABEL\" \"$rc\" > {status}' EXIT\n\
          {body}\
          STEP=finished\n\
          echo \"omnuv: recipe finished\"\n"
     );
-
-    format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(&script))
+    script
 }
 
 /// cloud-init for a buyer VM. Only public keys go in; Omnuv never has a private
@@ -1521,47 +1582,24 @@ impl Client {
     /// None means "not known", never "failed".
     async fn recipe_progress(&self, node: &str, vmid: u32) -> Option<omnuv_protocol::RecipeProgress> {
         let status = self.read_guest_file(node, vmid, RECIPE_STATUS).await?;
-
-        // step=3/6\nrc=100 — written by the recipe's own EXIT trap.
-        let mut step = None;
-        let mut rc = None;
-        for line in status.lines() {
-            match line.split_once('=') {
-                Some(("step", v)) => step = Some(v.trim().to_string()),
-                Some(("rc", v)) => rc = v.trim().parse::<i32>().ok(),
-                _ => {}
-            }
+        let mut progress = progress_from(&status)?;
+        // Only after the install succeeded: a recipe that failed has no stream
+        // to sign in to, and this is a guest-agent call per poll for as long
+        // as the machine lives.
+        //
+        // Read every time rather than once, because **the agent cannot know
+        // whether Core received it.** A delivery that was lost is not
+        // recoverable — nothing can mint this credential twice — and
+        // re-reporting costs nothing, because Core writes only where
+        // `stream_credential_at is null`. The guest leaves the file in place
+        // for exactly that reason.
+        if progress.status == "done" {
+            progress.stream_credentials = self
+                .read_guest_file(node, vmid, RECIPE_STREAM_CREDENTIAL)
+                .await
+                .and_then(|c| parse_stream_credentials(&c));
         }
-
-        let rc = rc?;
-        Some(omnuv_protocol::RecipeProgress {
-            status: match (rc, step.as_deref()) {
-                (0, _) => "done",
-                _ => "error",
-            }
-            .to_string(),
-            // "finished" is not a step anyone needs to see.
-            step: step.filter(|s| s != "finished" && s != "starting"),
-            detail: (rc != 0)
-                .then(|| format!("The recipe stopped with exit code {rc}. Its output is in the machine's own /var/log/cloud-init-output.log.")),
-            // Only after the install succeeded: a recipe that failed has no
-            // stream to sign in to, and this is a guest-agent call per poll for
-            // as long as the machine lives.
-            //
-            // Read every time rather than once, because **the agent cannot know
-            // whether Core received it.** A delivery that was lost is not
-            // recoverable — nothing can mint this credential twice — and
-            // re-reporting costs nothing, because Core writes only where
-            // `stream_credential_at is null`. The guest leaves the file in
-            // place for exactly that reason.
-            stream_credentials: match rc {
-                0 => self
-                    .read_guest_file(node, vmid, RECIPE_STREAM_CREDENTIAL)
-                    .await
-                    .and_then(|c| parse_stream_credentials(&c)),
-                _ => None,
-            },
-        })
+        Some(progress)
     }
 
     /// One known path out of a guest, or None.
@@ -3782,6 +3820,53 @@ mod tests {
     /// the two steps under `bash` with stubs on PATH that record which of
     /// them was called, once on an image holding Docker and the toolkit and
     /// once on one holding neither.
+    /// **The install says which step it is on while it runs** (the Instances
+    /// redesign, 3 October 2026). Run, not read: the generated script under
+    /// bash, with steps that copy the status file as it is at that moment, and
+    /// a last one that fails.
+    #[test]
+    fn the_install_writes_its_step_before_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("onv/recipe-status");
+        let snap = |n: u32| dir.path().join(format!("seen-{n}"));
+        let steps: Vec<(&'static str, String)> = vec![
+            ("Getting ready", format!("cp {} {}", status.display(), snap(1).display())),
+            ("Starting the application", format!("cp {} {}", status.display(), snap(2).display())),
+        ];
+        let script = install_script(&steps, &status.to_string_lossy());
+        let ran = std::process::Command::new("/bin/bash").arg("-c").arg(&script).status().unwrap();
+        assert!(ran.success(), "{script}");
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
+        assert_eq!(read(&snap(1)), "step=1/2\nlabel=Getting ready\n", "while step 1 ran");
+        assert_eq!(read(&snap(2)), "step=2/2\nlabel=Starting the application\n", "while step 2 ran");
+        assert_eq!(read(&status), "step=finished\nlabel=Starting the application\nrc=0\n");
+
+        let failing: Vec<(&'static str, String)> =
+            vec![("Getting ready", "true".into()), ("Finishing setup", "exit 7".into())];
+        let script = install_script(&failing, &status.to_string_lossy());
+        let ran = std::process::Command::new("/bin/bash").arg("-c").arg(&script).status().unwrap();
+        assert_eq!(ran.code(), Some(7));
+        assert_eq!(read(&status), "step=2/2\nlabel=Finishing setup\nrc=7\n", "the trap names the step that stopped");
+    }
+
+    #[test]
+    fn a_step_without_an_exit_code_is_an_install_under_way() {
+        let running = progress_from("step=2/3\nlabel=Starting the application\n").unwrap();
+        assert_eq!((running.status.as_str(), running.step.as_deref(), running.label.as_deref()),
+                   ("running", Some("2/3"), Some("Starting the application")));
+        let done = progress_from("step=finished\nlabel=Finishing setup\nrc=0\n").unwrap();
+        assert_eq!((done.status.as_str(), done.step, done.label), ("done", None, None));
+        let failed = progress_from("step=2/2\nlabel=Finishing setup\nrc=7\n").unwrap();
+        assert_eq!((failed.status.as_str(), failed.step.as_deref(), failed.label.as_deref()),
+                   ("error", Some("2/2"), Some("Finishing setup")));
+        assert!(failed.detail.unwrap().contains("exit code 7"));
+        // An older guest's file, and one with nothing to say yet.
+        let older = progress_from("step=3/6\nrc=0\n").unwrap();
+        assert_eq!((older.status.as_str(), older.label), ("done", None));
+        assert!(progress_from("step=starting\nlabel=\n").is_none());
+        assert!(progress_from("").is_none());
+    }
+
     #[test]
     fn docker_and_the_toolkit_are_installed_only_where_missing() {
         let recipe = omnuv_protocol::RecipeSpec {
