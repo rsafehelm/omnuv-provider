@@ -32,6 +32,7 @@ mod dur;
 mod timings;
 mod workload_config;
 mod scrub;
+mod installwatch;
 #[cfg(test)]
 mod pvemock;
 

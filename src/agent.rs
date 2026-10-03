@@ -75,6 +75,10 @@ struct Core {
     /// D35: the report period Core last said, and its poll, which the report
     /// task reads (`crate::report`).
     report: crate::report::Heard,
+    /// Which machines are installing a recipe, written by each pass and read
+    /// by the loop, which then looks again sooner than the poll
+    /// (`crate::installwatch`, 3 October 2026).
+    install_watch: std::sync::Arc<std::sync::Mutex<crate::installwatch::InstallWatch>>,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -222,6 +226,7 @@ impl Core {
             lease: Default::default(),
             built: Default::default(),
             report: Default::default(),
+            install_watch: Default::default(),
         })
     }
 
@@ -882,6 +887,12 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         follow_up_at = proofs
             .after_pass(crate::teardown::ProofFollowUp::owed(&crate::teardown::tombstones(&cfg.proxmox.snippet_dir)))
             .map(|wait| tokio::time::Instant::now() + wait);
+        // And sooner while a recipe installs: whichever is owed first.
+        let install = crate::poison::lock(&core.install_watch, "the install watch").due(tokio::time::Instant::now());
+        follow_up_at = match (follow_up_at, install) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         // Re-armed, not restarted, when Core's poll moved: the first look at
         // the new period is one period away, so a change costs no extra pass.
         if let Some(period) = repoll(reconcile.period(), core_poll) {
@@ -1570,7 +1581,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1599,6 +1610,7 @@ mod handshake_tests {
             lease: Default::default(),
             built: Default::default(),
             report: Default::default(),
+            install_watch: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1679,7 +1691,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1708,7 +1720,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1731,6 +1743,78 @@ mod handshake_tests {
         let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
         assert_eq!(core_poll, Some(45), "the view's poll was not kept");
         assert_eq!(repoll(std::time::Duration::from_secs(120), core_poll), Some(std::time::Duration::from_secs(45)));
+    }
+
+    /// **A pass that finds a recipe installing owes a sooner look** (3 October
+    /// 2026). On production every step fell between two 120 s passes: the
+    /// hypervisor's log shows VM 101's status file read twice in its whole
+    /// install. A pass whose machine says `step=1/3` now leaves the loop a
+    /// follow-up `installwatch::EVERY` away; one that says it finished leaves
+    /// none.
+    #[tokio::test]
+    async fn a_pass_that_finds_an_install_running_owes_a_sooner_look() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let desired: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        let mut spec = desired["instances"][0].clone();
+        spec["lifecycle"] = "running".into();
+        spec["network"] = serde_json::Value::Null;
+        spec["reboot_token"] = serde_json::Value::Null;
+        spec["recipe"] = serde_json::json!({"id": "ollama-openwebui", "compose": "services: {}", "post_up": []});
+        let id = spec["id"].as_str().unwrap().to_string();
+        let key = crate::names::short_tag(&id);
+        let view = serde_json::json!({
+            "protocol_version": omnuv_protocol::PROTOCOL_VERSION,
+            "version": 1,
+            "instances": [spec],
+        });
+        let file = Arc::new(Mutex::new("step=1/3\nlabel=Getting ready\n".to_string()));
+        let said = file.clone();
+        let (base, _heard) = core_stub(view).await;
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
+        let pve = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(ok) = crate::pvemock::task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
+                    {"node": "n1", "vmid": 700, "status": "running", "tags": format!("{};{key}", crate::instance::TAG)}
+                ])),
+                ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 60})),
+                ("GET", p) if p.starts_with("/nodes/n1/qemu/700/agent/file-read") && p.contains("recipe-status") => {
+                    (200, serde_json::json!({"content": said.lock().unwrap().clone()}))
+                }
+                ("GET", p) if p.contains("/agent/") => (500, serde_json::Value::Null),
+                ("GET", _) => (200, serde_json::json!({})),
+                _ => (200, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let snippets = tempfile::tempdir().unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippets.path().display()
+        ))
+        .expect("config");
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        let now = tokio::time::Instant::now();
+        let due = core.install_watch.lock().unwrap().due(now);
+        assert!(due.is_some_and(|at| at <= now + crate::installwatch::EVERY),
+                "a pass that read step 1 of 3 left the next look to the poll");
+
+        *file.lock().unwrap() = "step=finished\nlabel=\nrc=0\n".to_string();
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        assert_eq!(core.install_watch.lock().unwrap().due(tokio::time::Instant::now()), None,
+                   "a finished install is still followed closely");
     }
 
     /// One pass against a Core serving `view`, with this agent's head at
@@ -3049,6 +3133,20 @@ async fn reconcile_workers(
     }
     for i in &instances {
         println!("instance {} -> {:?} {}", i.id, i.state, i.private_ip.as_deref().unwrap_or(""));
+    }
+    // **What is installing, for the loop to look again sooner** (3 October
+    // 2026): a step lasts seconds and the poll two minutes.
+    {
+        let seen: Vec<crate::installwatch::Seen<'_>> = instances
+            .iter()
+            .map(|i| crate::installwatch::Seen {
+                id: i.id.as_str(),
+                running: i.state == InstanceState::Running,
+                recipe: desired.instances.iter().any(|s| s.id == i.id && s.recipe.is_some()),
+                progress: i.recipe_progress.as_ref().map(|p| p.status.as_str()),
+            })
+            .collect();
+        crate::poison::lock(&core.install_watch, "the install watch").after_pass(tokio::time::Instant::now(), &seen);
     }
     // What each existing machine's drive refresh did, which was printed and
     // nothing else until 26 September 2026 (gap 4). After the loop, because
