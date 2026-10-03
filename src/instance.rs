@@ -260,9 +260,7 @@ fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment) -> String {
 /// carries the driver), then `compose up` and the recipe's finishing steps.
 /// Each command is a base64 script so nothing the recipe contains can break
 /// the cloud-config it rides in.
-fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
-    use base64::Engine as _;
-    let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
+fn recipe_steps(recipe: &omnuv_protocol::RecipeSpec) -> Vec<(&'static str, String)> {
     // Each step with the words a buyer reads while it runs (the Instances
     // redesign, 3 October 2026; omnuv-protocol v0.25.0 `label`).
     let mut steps: Vec<(&'static str, String)> = vec![
@@ -332,7 +330,48 @@ fn recipe_runcmd(recipe: &omnuv_protocol::RecipeSpec) -> String {
     // file the EXIT trap writes at the end, so the install's progress can be
     // read while it runs and not only once it has stopped. No `rc=` line until
     // the trap: that is how a reader tells running from finished.
-    let script = install_script(&steps, RECIPE_STATUS);
+    steps
+}
+
+/// The recipe's install, as one runcmd entry: `steps` numbered from `first`
+/// out of `total`, the steps before them being the machine's own (see
+/// [`early_steps`]).
+fn recipe_runcmd(steps: &[(&'static str, String)], first: usize, total: usize) -> String {
+    let script = install_script(steps, RECIPE_STATUS, first, total);
+    format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(&script))
+}
+
+fn b64(script: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(script)
+}
+
+/// **The machine's own steps, before the recipe's** (the operator's choice of
+/// 3 October 2026, "option 1"). On a recipe's baked image the install script
+/// runs about ten seconds and starts late: before it, the machine boots,
+/// installs its first packages and joins its network, and the status file did
+/// not exist, so the card said "Installing" with no step for most of the
+/// wait. These are written where they happen: the first from bootcmd, the
+/// second at the start of runcmd, before the network is joined.
+fn early_steps(spec: &InstanceSpec) -> Vec<&'static str> {
+    if spec.recipe.is_none() {
+        return Vec::new();
+    }
+    let mut early = vec!["Starting the machine"];
+    if spec.overlay.is_some() {
+        early.push("Joining your private network");
+    }
+    early
+}
+
+/// One status line, `step=n/total` and its label, as a cloud-init list entry.
+/// `only_if_absent` for bootcmd, which runs on every boot: a later boot must
+/// never overwrite what a finished or failed install wrote.
+fn status_line(n: usize, total: usize, label: &str, only_if_absent: bool) -> String {
+    let guard = if only_if_absent { format!("[ -e {RECIPE_STATUS} ] && exit 0\n") } else { String::new() };
+    let script = format!(
+        "mkdir -p \"$(dirname {RECIPE_STATUS})\"\n{guard}printf 'step=%s\\nlabel=%s\\n' '{n}/{total}' '{label}' > {RECIPE_STATUS}\n"
+    );
     format!("  - [ bash, -c, \"echo {} | base64 -d | bash\" ]\n", b64(&script))
 }
 
@@ -379,9 +418,7 @@ pub(crate) fn progress_from(status: &str) -> Option<omnuv_protocol::RecipeProgre
     })
 }
 
-pub(crate) fn install_script(steps: &[(&'static str, String)], status: &str) -> String {
-    use base64::Engine as _;
-    let b64 = |script: &str| base64::engine::general_purpose::STANDARD.encode(script);
+pub(crate) fn install_script(steps: &[(&'static str, String)], status: &str, first: usize, total: usize) -> String {
     let body: String = steps
         .iter()
         .enumerate()
@@ -390,8 +427,8 @@ pub(crate) fn install_script(steps: &[(&'static str, String)], status: &str) -> 
                 "STEP={}/{}\nLABEL='{label}'\n\
                  printf 'step=%s\\nlabel=%s\\n' \"$STEP\" \"$LABEL\" > {status}\n\
                  echo \"omnuv: recipe step $STEP\"\necho {} | base64 -d | bash\n",
-                i + 1,
-                steps.len(),
+                first + i,
+                total,
                 b64(script)
             )
         })
@@ -500,6 +537,11 @@ fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>, vmid: u32) -> Strin
         }
     };
 
+    // The machine's own steps, then the recipe's, out of one total.
+    let early = early_steps(spec);
+    let steps = spec.recipe.as_ref().map(recipe_steps);
+    let total = early.len() + steps.as_ref().map_or(0, |s| s.len());
+
     format!(
         r#"#cloud-config
 hostname: {name}
@@ -527,17 +569,19 @@ bootcmd:
   # basic.target cannot complete until this very stage finishes; waiting on
   # it is a deadlock that looks like a boot stuck at cloud-init-network.
   - [ sh, -c, "systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true" ]
-{network}
+{recipe_boot}{network}
 # runcmd is the final stage, after packages: the agent is installed by then.
 # Networking already ran in bootcmd, so a slow apt here delays nothing.
 runcmd:
   - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
-{overlay}{network_final}{recipe_final}"#,
+{recipe_join}{overlay}{network_final}{recipe_final}"#,
         apt = apt,
         name = spec.name,
         overlay = spec.overlay.as_ref().map(overlay_runcmd).unwrap_or_default(),
         recipe_files = spec.recipe.as_ref().map(recipe_files).unwrap_or_default(),
-        recipe_final = spec.recipe.as_ref().map(recipe_runcmd).unwrap_or_default(),
+        recipe_boot = early.first().map(|l| status_line(1, total, l, true)).unwrap_or_default(),
+        recipe_join = early.get(1).map(|l| status_line(2, total, l, false)).unwrap_or_default(),
+        recipe_final = steps.as_ref().map(|st| recipe_runcmd(st, early.len() + 1, total)).unwrap_or_default(),
         user = spec.image.default_user,
         // A password is only usable when the account is not locked; without
         // one, the account stays key-only as before.
@@ -3833,7 +3877,7 @@ mod tests {
             ("Getting ready", format!("cp {} {}", status.display(), snap(1).display())),
             ("Starting the application", format!("cp {} {}", status.display(), snap(2).display())),
         ];
-        let script = install_script(&steps, &status.to_string_lossy());
+        let script = install_script(&steps, &status.to_string_lossy(), 1, 2);
         let ran = std::process::Command::new("/bin/bash").arg("-c").arg(&script).status().unwrap();
         assert!(ran.success(), "{script}");
         let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
@@ -3843,10 +3887,48 @@ mod tests {
 
         let failing: Vec<(&'static str, String)> =
             vec![("Getting ready", "true".into()), ("Finishing setup", "exit 7".into())];
-        let script = install_script(&failing, &status.to_string_lossy());
+        let script = install_script(&failing, &status.to_string_lossy(), 1, 2);
         let ran = std::process::Command::new("/bin/bash").arg("-c").arg(&script).status().unwrap();
         assert_eq!(ran.code(), Some(7));
         assert_eq!(read(&status), "step=2/2\nlabel=Finishing setup\nrc=7\n", "the trap names the step that stopped");
+    }
+
+    /// **The machine's own steps come first** (the operator's option 1, 3
+    /// October 2026): "Starting the machine" from bootcmd, which never
+    /// overwrites a status already there (a reboot after the install), then
+    /// the recipe's steps numbered after it, all out of one total. Run, not
+    /// read: the generated lines under bash against a status file of its own.
+    #[test]
+    fn the_machine_says_it_is_starting_before_the_recipe_runs() {
+        let decode = |entry: &str| {
+            use base64::Engine as _;
+            let b = entry.split("echo ").nth(1).and_then(|s| s.split(' ').next()).expect("one script");
+            String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b).unwrap()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("onv/recipe-status");
+        let here = |script: String| script.replace(RECIPE_STATUS, &status.to_string_lossy());
+        let run = |script: &str| {
+            assert!(std::process::Command::new("/bin/bash").arg("-c").arg(script).status().unwrap().success(), "{script}")
+        };
+        let read = || std::fs::read_to_string(&status).unwrap();
+
+        let boot = here(decode(&status_line(1, 5, "Starting the machine", true)));
+        run(&boot);
+        assert_eq!(read(), "step=1/5\nlabel=Starting the machine\n");
+        let join = here(decode(&status_line(2, 5, "Joining your private network", false)));
+        run(&join);
+        assert_eq!(read(), "step=2/5\nlabel=Joining your private network\n");
+        // A later boot, after the install finished, leaves its answer alone.
+        std::fs::write(&status, "step=finished\nlabel=Finishing setup\nrc=0\n").unwrap();
+        run(&boot);
+        assert_eq!(read(), "step=finished\nlabel=Finishing setup\nrc=0\n");
+        assert_eq!(progress_from(&read()).unwrap().status, "done");
+
+        // And the recipe's steps carry on the count: 3 of 5 first.
+        let steps: Vec<(&'static str, String)> = vec![("Getting ready", "true".into()), ("Starting the application", "true".into()), ("Finishing setup", format!("cp {} {}", status.display(), dir.path().join("last").display()))];
+        run(&install_script(&steps, &status.to_string_lossy(), 3, 5));
+        assert_eq!(std::fs::read_to_string(dir.path().join("last")).unwrap(), "step=5/5\nlabel=Finishing setup\n");
     }
 
     #[test]
@@ -3877,7 +3959,8 @@ mod tests {
         };
         // runcmd carries the whole recipe as one base64 script; its steps are
         // base64 again inside it.
-        let entry = recipe_runcmd(&recipe);
+        let steps = recipe_steps(&recipe);
+        let entry = recipe_runcmd(&steps, 1, steps.len());
         let outer = entry.split("echo ").nth(1).and_then(|s| s.split(' ').next()).expect("one script");
         let script = {
             use base64::Engine as _;
@@ -3997,7 +4080,9 @@ mod tests {
         assert!(!script.contains("{RECIPE_STATUS}"), "the path must be interpolated");
         assert!(script.contains("trap ") && script.contains("EXIT"),
                 "written whatever happens, including on failure");
-        assert!(script.contains("STEP=1/"), "each step names itself for the trap");
+        // Numbered after the machine's own steps (starting, joining).
+        let first = early_steps(&spec).len() + 1;
+        assert!(script.contains(&format!("STEP={first}/")), "each step names itself for the trap");
         // Without a GPU, no toolkit.
         spec.recipe.as_mut().unwrap().gpu = false;
         assert!(!cloud_init(&spec, None, 103).contains(&{
@@ -4192,7 +4277,9 @@ echo 'single' "double" `backtick` \$escaped
         // Two layers now — the recipe is one script under `set -e`, and each of
         // its steps is encoded inside that.
         use base64::Engine as _;
-        let line = ci.lines().find(|l| l.contains("base64 -d")).expect("an encoded step");
+        // The recipe's script is the last encoded line; the status lines
+        // before it are the machine's own steps.
+        let line = ci.lines().filter(|l| l.contains("base64 -d")).last().expect("an encoded step");
         let b64 = line.split("echo ").nth(1).unwrap().split(' ').next().unwrap();
         let outer = String::from_utf8(
             base64::engine::general_purpose::STANDARD.decode(b64).expect("decodes"),
