@@ -164,10 +164,9 @@ pub(crate) mod tunnel_rules {
     /// user, query, fragment or path but `/`.
     fn origin(raw: &str) -> bool {
         let Ok(u) = reqwest::Url::parse(raw) else { return false };
-        let host = match u.host_str() {
-            Some(h) if !h.is_empty() => h,
-            _ => return false,
-        };
+        // Go's `u.Host == ""`. The WHATWG parser refuses an http(s) URL with
+        // no host, so an empty one never reaches here.
+        let Some(host) = u.host_str() else { return false };
         if !u.username().is_empty() || u.password().is_some() || u.query().is_some() || u.fragment().is_some() {
             return false;
         }
@@ -534,6 +533,10 @@ mod tests {
             (with("management_url", "http://api.omnuv.com".into()), "https origin"),
             (with("management_url", "https://api.omnuv.com/api".into()), "https origin"),
             (with("management_url", "https://u@api.omnuv.com".into()), "https origin"),
+            (with("management_url", "https://:p@api.omnuv.com".into()), "https origin"),
+            (with("management_url", "https://api.omnuv.com?x=1".into()), "https origin"),
+            (with("management_url", "https://api.omnuv.com#f".into()), "https origin"),
+            (with("management_url", "https://".into()), "https origin"),
             (with("setup_key", "<redacted>".into()), "setup key's shape"),
             (with("hostname", "rig.example".into()), "DNS label"),
             (with("hostname", "-rig".into()), "DNS label"),
@@ -549,6 +552,10 @@ mod tests {
         // And what it accepts besides: a BOM, no hostname (the default peer),
         // a port, a trailing slash, http to loopback.
         assert_eq!(tunnel_rules::accepts(&format!("\u{feff}{good}")), Ok(()));
+        // The size limit is the tunnel's: 16384 bytes pass, one more does not.
+        let padded = format!("{good}{}", " ".repeat(16384 - good.len()));
+        assert_eq!(tunnel_rules::accepts(&padded), Ok(()));
+        assert!(tunnel_rules::accepts(&format!("{padded} ")).is_err());
         let mut v2 = v.clone();
         v2.as_object_mut().unwrap().remove("hostname");
         assert_eq!(tunnel_rules::accepts(&v2.to_string()), Ok(()));
