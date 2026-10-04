@@ -167,11 +167,70 @@ fn parse_stream_credentials(content: &str) -> Option<omnuv_protocol::StreamCrede
 /// The recipe's compose file, written before any package runs. Base64: a
 /// compose file is YAML inside YAML, and escaping it would be a bug farm.
 fn recipe_files(recipe: &omnuv_protocol::RecipeSpec) -> String {
+    write_file(&format!("{RECIPE_DIR}/compose.yaml"), "0644", &recipe.compose)
+}
+
+/// One `write_files` entry, its content as base64 so nothing in it can break
+/// the cloud-config it rides in.
+fn write_file(path: &str, permissions: &str, content: &str) -> String {
     use base64::Engine as _;
     format!(
-        "write_files:\n  - path: {RECIPE_DIR}/compose.yaml\n    permissions: \"0644\"\n    encoding: b64\n    content: {}\n",
-        base64::engine::general_purpose::STANDARD.encode(&recipe.compose)
+        "  - path: {path}\n    permissions: \"{permissions}\"\n    encoding: b64\n    content: {}\n",
+        base64::engine::general_purpose::STANDARD.encode(content)
     )
+}
+
+/// Where the machine's certificate fetch reads Core's origin and its bootstrap.
+const CERT_PULL_ENV: &str = "/etc/onv/certificate/pull.env";
+const CERT_SCRIPT: &str = include_str!("guest/onv-certificate.sh");
+const CERT_SERVICE: &str = include_str!("guest/onv-certificate.service");
+const CERT_TIMER: &str = include_str!("guest/onv-certificate.timer");
+
+/// **A web machine's certificate fetch** (omnuv-protocol v0.26.0; omnuv's
+/// private names a browser trusts, D-2: pulled by the machine). The fetch
+/// itself, its unit and its timer, and the file it reads: Core's origin and
+/// the bootstrap, root's alone. The bootstrap is worth one trade at Core for a
+/// token the machine keeps, and Core stops accepting it once that token has
+/// fetched, so this file on a disk the provider can read is spent within
+/// minutes of first boot, as the overlay's setup key is. The certificate's key
+/// never passes through here: the machine fetches it over TLS.
+fn certificate_files(pull: &omnuv_protocol::CertificatePull) -> String {
+    let env = format!(
+        "ONV_CORE_URL={}\nONV_BOOTSTRAP={}\n",
+        pull.core_url.trim().trim_end_matches('/'),
+        // `.expose()`: `Display` would write `<redacted>` here and the fetch
+        // would be refused at every run, behind a machine that looks fine.
+        pull.bootstrap_token.expose()
+    );
+    [
+        write_file(CERT_PULL_ENV, "0600", &env),
+        write_file("/usr/local/sbin/onv-certificate", "0755", CERT_SCRIPT),
+        write_file("/etc/systemd/system/onv-certificate.service", "0644", CERT_SERVICE),
+        write_file("/etc/systemd/system/onv-certificate.timer", "0644", CERT_TIMER),
+    ]
+    .concat()
+}
+
+/// Every file first boot writes, under one `write_files` key: YAML keeps the
+/// last of two, so a second key would drop the first's files.
+fn first_boot_files(spec: &InstanceSpec) -> String {
+    let files = [
+        spec.recipe.as_ref().map(recipe_files),
+        spec.certificate.as_ref().map(certificate_files),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<String>();
+    if files.is_empty() { String::new() } else { format!("write_files:\n{files}") }
+}
+
+/// The timer that keeps the certificate current, and one fetch now rather
+/// than a minute from now. `|| true`: a machine whose timer cannot start still
+/// boots and serves its page over plain HTTP, as before.
+fn certificate_runcmd(_: &omnuv_protocol::CertificatePull) -> String {
+    "  - [ sh, -c, \"systemctl daemon-reload && systemctl enable --now onv-certificate.timer \
+     && systemctl start --no-block onv-certificate.service || true\" ]\n"
+        .to_string()
 }
 
 /// Whether a recipe actually runs containers.
@@ -606,11 +665,12 @@ bootcmd:
 # in bootcmd, so an apt here, on an older image, delays nothing else.
 runcmd:
   - [ sh, -c, "command -v qemu-ga >/dev/null 2>&1 || {{ apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent; }}; systemctl enable --now qemu-guest-agent || true" ]
-{recipe_join}{overlay}{network_final}{recipe_final}"#,
+{recipe_join}{overlay}{network_final}{certificate}{recipe_final}"#,
         apt = apt,
         name = guest_hostname(spec),
         overlay = spec.overlay.as_ref().map(|o| overlay_runcmd(o, &spec.id)).unwrap_or_default(),
-        recipe_files = spec.recipe.as_ref().map(recipe_files).unwrap_or_default(),
+        recipe_files = first_boot_files(spec),
+        certificate = spec.certificate.as_ref().map(certificate_runcmd).unwrap_or_default(),
         recipe_boot = early.first().map(|l| status_line(1, total, l, true)).unwrap_or_default(),
         recipe_join = early.get(1).map(|l| status_line(2, total, l, false)).unwrap_or_default(),
         recipe_final = steps.as_ref().map(|st| recipe_runcmd(st, early.len() + 1, total)).unwrap_or_default(),
@@ -4078,6 +4138,56 @@ mod tests {
                 "a bare image got no toolkit: {bare}");
     }
 
+    /// **A web machine is given its certificate fetch** (omnuv-protocol
+    /// v0.26.0): the recipe's compose file and the fetch's four files under
+    /// one `write_files`, the bootstrap's own bytes in a file only root reads,
+    /// the script byte for byte, and its timer started before the recipe's
+    /// install, which reads the same file to decide on its TLS front. Without
+    /// a pull, nothing of it.
+    #[test]
+    fn a_web_machine_is_given_its_certificate_fetch() {
+        use base64::Engine as _;
+        const BOOTSTRAP: &str = "cbt_0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let mut spec = spec_with_network();
+        spec.recipe = Some(omnuv_protocol::RecipeSpec {
+            id: "ollama-openwebui".into(),
+            compose: "services:\n  app:\n    image: x\n".into(),
+            gpu: false,
+            post_up: vec!["true".into()],
+        });
+        let plain = cloud_init(&spec, None, 103);
+        assert!(!plain.contains("onv-certificate"), "a machine with no pull was given the fetch");
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&plain).expect("valid cloud-config");
+        assert_eq!(parsed["write_files"].as_sequence().expect("write_files").len(), 1);
+
+        spec.certificate = Some(omnuv_protocol::CertificatePull {
+            core_url: "https://api.omnuv.com/".into(),
+            bootstrap_token: BOOTSTRAP.into(),
+        });
+        let ci = cloud_init(&spec, None, 103);
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid cloud-config");
+        let files = parsed["write_files"].as_sequence().expect("one write_files");
+        let file = |path: &str| {
+            let f = files.iter().find(|f| f["path"].as_str() == Some(path)).unwrap_or_else(|| panic!("no {path}"));
+            let body = base64::engine::general_purpose::STANDARD.decode(f["content"].as_str().unwrap()).unwrap();
+            (f["permissions"].as_str().unwrap().to_string(), String::from_utf8(body).unwrap())
+        };
+        assert_eq!(file("/opt/onv/recipe/compose.yaml").0, "0644", "the recipe's file was dropped");
+        let (mode, env) = file("/etc/onv/certificate/pull.env");
+        assert_eq!(mode, "0600");
+        assert_eq!(env, format!("ONV_CORE_URL=https://api.omnuv.com\nONV_BOOTSTRAP={BOOTSTRAP}\n"));
+        assert_eq!(file("/usr/local/sbin/onv-certificate"), ("0755".into(), CERT_SCRIPT.to_string()));
+        assert_eq!(file("/etc/systemd/system/onv-certificate.timer").1, CERT_TIMER);
+        assert_eq!(file("/etc/systemd/system/onv-certificate.service").1, CERT_SERVICE);
+        // Only in the file: base64 in the document, never in clear.
+        assert!(!ci.contains(BOOTSTRAP), "the bootstrap is in clear in the cloud-config");
+
+        let run = ci.find("runcmd:").expect("runcmd");
+        let timer = ci[run..].find("enable --now onv-certificate.timer").expect("the timer is started");
+        let recipe = ci[run..].rfind("base64 -d | bash").expect("the recipe runs");
+        assert!(timer < recipe, "the timer must start before the recipe's install");
+    }
+
     #[test]
     fn recipe_is_written_and_brought_up_at_first_boot() {
         let mut spec = spec_with_network();
@@ -4320,6 +4430,7 @@ mod tests {
             // No overlay: this fixture is about the marketplace NIC.
             overlay: None,
             attempt: None,
+            certificate: None,
         }
     }
 
