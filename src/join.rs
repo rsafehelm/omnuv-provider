@@ -35,7 +35,7 @@ const EGRESS_ZONE: &str = crate::names::SDN_ZONE_NAT;
 // host joined by hand got a NAT bridge no machine used, and the first buyer
 // machine failed with "bridge 'onvnat0' does not exist".
 const EGRESS_VNET: &str = crate::names::NAT_VNET;
-const EGRESS_SUBNET: &str = "10.201.0.0/24";
+pub(crate) const EGRESS_SUBNET: &str = "10.201.0.0/24";
 const EGRESS_GATEWAY: &str = "10.201.0.1";
 const EGRESS_DHCP: &str = "start-address=10.201.0.100,end-address=10.201.0.250";
 const EGRESS_DNS: &str = "1.1.1.1";
@@ -125,6 +125,9 @@ pub struct JoinArgs {
     pub disk_gib: u64,
     pub storage: Option<String>,
     pub gpus: Vec<String>,
+    /// **The provider opening** (`crate::opening`), off unless
+    /// `--opening-reach` is given: written into agent.yaml as every other key.
+    pub opening: crate::opening::OpeningConfig,
     pub dry_run: bool,
 }
 
@@ -172,6 +175,11 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
             "onv-provider is not installed from its package ({PACKAGED_UNIT} is missing). \
              Install the .deb (packaging/build-deb.sh builds it), then run join again; nothing was changed"
         );
+    }
+    // The opening, checked before anything is changed: a host told to open
+    // with nothing to reach it by is refused here, in the agent's own words.
+    if let Err(bad) = a.opening.check() {
+        anyhow::bail!("the opening was refused, and nothing was changed:\n  {}", bad.join("\n  "));
     }
     let version = sh("pveversion").unwrap_or_default();
     if !version.contains("pve-manager/9.") {
@@ -344,7 +352,7 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let config = config_file(&a.core, &node, &fingerprint, &storage, a.cpu_cores, a.memory_mib, a.disk_gib, &gpus)?;
+    let config = config_file(&a.core, &node, &fingerprint, &storage, a.cpu_cores, a.memory_mib, a.disk_gib, &gpus, &a.opening)?;
     let secrets = secrets_file(&a.token, &secret);
 
     println!("\nWriting /etc/onv/agent.yaml (0640 root:onv) and /etc/onv/{} (0600 onv:onv)", crate::config::SECRETS_FILE);
@@ -396,6 +404,14 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     println!("\nStarting the service");
     if !a.dry_run {
         sh("systemctl daemon-reload && systemctl enable --now onv-provider")?;
+        // The opening's applier, once, so the kernel holds what agent.yaml
+        // says from now on (off removes the table); its verdict is printed.
+        let applied = Command::new("systemctl").args(["start", "onv-opening.service"]).status()?;
+        let said = sh("journalctl -u onv-opening.service -n 1 -o cat --no-pager").unwrap_or_default();
+        println!("  {said}");
+        if !applied.success() {
+            anyhow::bail!("onv-opening.service failed; the opening is not applied ({said})");
+        }
         audit::record("join.complete", "agent", &node, "ok", Some(&a.region));
     } else if !packaged {
         println!("  (not installed from the package: a real run refuses at the start)");
@@ -424,7 +440,9 @@ fn config_file(
     memory_mib: u64,
     disk_gib: u64,
     gpus: &str,
+    opening: &crate::opening::OpeningConfig,
 ) -> anyhow::Result<String> {
+    let opening: String = serde_yaml_ng::to_string(opening)?.lines().map(|l| format!("  {l}\n")).collect();
     let timings: String = serde_yaml_ng::to_string(&crate::timings::Timings::default())?
         .lines()
         .map(|l| format!("  {l}\n"))
@@ -450,6 +468,11 @@ proxmox:
     gpus:
 {gpus}
 
+# The provider opening: one UDP port of this host's public side per buyer
+# machine, so peers reach it directly. Off unless `join` was given
+# --opening-reach.
+opening:
+{opening}
 # How long, how often, how many: every key, at the values this build ships
 # with. `onv-provider check-config` checks a change before a restart.
 timings:
@@ -717,7 +740,8 @@ mod tests {
     fn what_join_writes_the_agent_loads() {
         use std::os::unix::fs::PermissionsExt as _;
         let gpus = "      - \"0000:21:00.0\"";
-        let config = config_file("https://api.omnuv.com", "n1", "AB:CD", "local", 8, 16_384, 200, gpus).unwrap();
+        let off = crate::opening::OpeningConfig::default();
+        let config = config_file("https://api.omnuv.com", "n1", "AB:CD", "local", 8, 16_384, 200, gpus, &off).unwrap();
         let secrets = secrets_file(&"prov_x_\"quoted\"".into(), "pve-SEKRET");
         assert!(!config.contains("prov_x") && !config.contains("SEKRET"), "a credential in agent.yaml: {config}");
         assert!(config.contains("  tunnelPing: 20s\n"), "the timings are not written out: {config}");
@@ -735,6 +759,19 @@ mod tests {
         assert_eq!(cfg.timings, crate::timings::Timings::default());
         assert_eq!(cfg.proxmox.contribute.gpus, vec!["0000:21:00.0"]);
         assert!(matches!(cfg.credentials, crate::config::CredentialSource::SecretsFile(_)));
+        assert_eq!(cfg.opening, off, "the opening is off unless join is told");
+
+        // Told, it is written as given and loads on.
+        let on = crate::opening::OpeningConfig {
+            enabled: true,
+            reach: Some(crate::opening::Reach::Forwarded),
+            public_address: Some("193.137.26.160".into()),
+            ..off
+        };
+        let config = config_file("https://api.omnuv.com", "n1", "AB:CD", "local", 8, 16_384, 200, gpus, &on).unwrap();
+        std::fs::write(&path, &config).unwrap();
+        let cfg = crate::config::load_agent(path.to_str().unwrap()).expect("join's opened file loads");
+        assert_eq!(cfg.opening, on);
     }
 
     /// Eight characters is the Proxmox limit for a vnet name. Exceeding it

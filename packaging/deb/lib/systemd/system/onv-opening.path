@@ -1,0 +1,13 @@
+[Unit]
+Description=Omnuv provider opening: re-apply when the agent's ports change
+Documentation=https://github.com/rsafehelm/omnuv-provider
+
+[Path]
+# The agent writes the file beside it and renames it over, so a change is
+# one event and the applier never reads half a file. It writes only when the
+# bytes move, so an unchanged pass wakes nothing.
+PathChanged=/var/lib/onv/opening.json
+Unit=onv-opening.service
+
+[Install]
+WantedBy=paths.target

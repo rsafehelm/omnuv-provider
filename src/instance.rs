@@ -325,8 +325,27 @@ fn guest_hostname(spec: &InstanceSpec) -> String {
     }
 }
 
-fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment, instance_id: &str) -> String {
+/// The machine's enrolment. **Opened** (`crate::opening`), its WireGuard
+/// listens on the port this host forwards to it and announces the public
+/// address; otherwise it is the line it always was, byte for byte, so a
+/// provider that never turns the opening on refreshes no machine's drive.
+fn overlay_runcmd(
+    o: &omnuv_protocol::OverlayEnrolment,
+    instance_id: &str,
+    opened: Option<&crate::opening::Opened>,
+) -> String {
     let host_arg = format!(" --hostname {}", peer_name(o, instance_id));
+    if let Some(opened) = opened {
+        return crate::opening::netbird_up(
+            &format!(
+                "netbird up --management-url {url} --setup-key {key}{host_arg}",
+                url = o.management_url,
+                key = o.setup_key.expose()
+            ),
+            opened,
+            &egress_mac(instance_id),
+        );
+    }
     format!(
         "  - [ sh, -c, \"netbird up --management-url {url} --setup-key {key}{host_arg} \
          >/var/log/onv-overlay.log 2>&1 || true\" ]\n",
@@ -598,7 +617,19 @@ fn network_config(spec: &InstanceSpec, vmid: u32) -> String {
     )
 }
 
+/// The first boot of a machine that is not opened: every test's, and none of
+/// production's, which says whether it is opened.
+#[cfg(test)]
 fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>, vmid: u32) -> String {
+    cloud_init_opened(spec, apt_mirror, vmid, None)
+}
+
+fn cloud_init_opened(
+    spec: &InstanceSpec,
+    apt_mirror: Option<&str>,
+    vmid: u32,
+    opened: Option<crate::opening::Opened>,
+) -> String {
     // Written before anything installs, so cloud-init rewrites sources.list
     // first: the guest agent's fallback install and a recipe's use it.
     // Empty when the provider has not named one, which leaves the image's own
@@ -669,7 +700,7 @@ runcmd:
 {recipe_join}{overlay}{network_final}{certificate}{recipe_final}"#,
         apt = apt,
         name = guest_hostname(spec),
-        overlay = spec.overlay.as_ref().map(|o| overlay_runcmd(o, &spec.id)).unwrap_or_default(),
+        overlay = spec.overlay.as_ref().map(|o| overlay_runcmd(o, &spec.id, opened.as_ref())).unwrap_or_default(),
         recipe_files = first_boot_files(spec),
         certificate = spec.certificate.as_ref().map(certificate_runcmd).unwrap_or_default(),
         recipe_boot = early.first().map(|l| status_line(1, total, l, true)).unwrap_or_default(),
@@ -1070,7 +1101,15 @@ impl Client {
                             vm.vmid,
                             snippet_dir,
                             &crate::names::snippet_instance(&spec.id),
-                            &cloud_init(spec, self.apt_mirror.as_deref(), vm.vmid),
+                            // The port it was built with, if it holds one:
+                            // never given here, so the opening turned on
+                            // later opens no existing machine.
+                            &cloud_init_opened(
+                                spec,
+                                self.apt_mirror.as_deref(),
+                                vm.vmid,
+                                self.opening.opened(&spec.id),
+                            ),
                         )
                         .await;
                     if let Err(e) = &refreshed {
@@ -1396,8 +1435,16 @@ impl Client {
         // to get this far while anything was still owed for this machine.
         let vmid: u32 = self.get_json::<String>("/cluster/nextid").await?.parse()?;
 
+        // **Its port, if this host opens machines** (`crate::opening`): given
+        // by the machine's id and on disk before the machine exists, so the
+        // port its first boot names is never given to another. Only a machine
+        // that joins the overlay has a WireGuard to reach.
+        let opened = match &spec.overlay {
+            Some(_) => self.opening.allocate(&spec.id)?,
+            None => None,
+        };
         let user_data = match spec.image.first_boot {
-            FirstBoot::CloudInit => cloud_init(spec, self.apt_mirror.as_deref(), vmid),
+            FirstBoot::CloudInit => cloud_init_opened(spec, self.apt_mirror.as_deref(), vmid, opened),
             FirstBoot::CloudbaseInit => anyhow::bail!(
                 "image {}: Cloudbase-Init first boot is not implemented in this agent version",
                 spec.image.id
@@ -4391,9 +4438,77 @@ mod tests {
             management_url: "https://example.invalid".into(),
             hostname: None,
         };
-        let frag = overlay_runcmd(&o, "abcdef12-0000-0000-0000-000000000000");
-        assert!(frag.ends_with('\n'), "overlay fragment does not end a line");
-        assert!(!frag.starts_with('\n'), "overlay fragment starts a line it did not open");
+        let opened = crate::opening::Opened { port: 31820, public: std::net::Ipv4Addr::new(203, 0, 113, 7) };
+        for frag in [
+            overlay_runcmd(&o, "abcdef12-0000-0000-0000-000000000000", None),
+            overlay_runcmd(&o, "abcdef12-0000-0000-0000-000000000000", Some(&opened)),
+        ] {
+            assert!(frag.ends_with('\n'), "overlay fragment does not end a line");
+            assert!(!frag.starts_with('\n'), "overlay fragment starts a line it did not open");
+        }
+    }
+
+    /// **The provider opening, in the machine's first boot** (`crate::opening`).
+    /// Unopened, the enrolment is the line it always was, so turning nothing on
+    /// refreshes no drive; opened, it is still valid cloud-config, still
+    /// carries the key's own bytes, and the shell it runs, run here against a
+    /// stand-in `ip` and `netbird`, finds the egress interface by its MAC and
+    /// passes NetBird the port and `<public>/<that interface>`.
+    #[test]
+    fn an_opened_machine_listens_on_its_port_and_announces_the_public_address() {
+        let sp = spec_enrolled_on_a_network();
+        let plain = cloud_init(&sp, None, 103);
+        assert_eq!(plain, cloud_init_opened(&sp, None, 103, None));
+        assert!(!plain.contains("--wireguard-port") && !plain.contains("--external-ip-map"));
+
+        let opened = crate::opening::Opened { port: 31845, public: std::net::Ipv4Addr::new(203, 0, 113, 7) };
+        let ci = cloud_init_opened(&sp, None, 103, Some(opened));
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("opened cloud-init must be valid YAML");
+        let seq = doc.get("runcmd").and_then(|r| r.as_sequence()).expect("runcmd is a list");
+        let up: Vec<&str> = seq.iter().filter_map(|e| e.as_str()).filter(|s| s.contains("netbird up")).collect();
+        assert_eq!(up.len(), 1, "one enrolment: {seq:?}");
+        let up = up[0];
+        assert!(up.contains("0E38B183-B8B6-45CE-B93B-2EF63F3D14E4"), "the key's own bytes reach the guest");
+        assert!(up.contains("--wireguard-port 31845") && up.contains("--external-ip-map 203.0.113.7/$DEV"), "{up}");
+        // Everything else is as it was: only the enrolment moved.
+        let without = |s: &str| s.lines().filter(|l| !l.contains("netbird up") && !l.trim_start().starts_with("- |") && !l.contains("DEV=")).collect::<Vec<_>>().join("\n");
+        assert_eq!(without(&plain), without(&ci));
+
+        // Run it. A stand-in `ip` lists the egress NIC as ens18 beside the
+        // segment NIC, and a stand-in `netbird` writes its arguments down.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path();
+        let mac = egress_mac(&sp.id).to_lowercase();
+        let seg = sp.network.as_ref().unwrap().mac.to_lowercase();
+        let args = bin.join("args");
+        std::fs::write(
+            bin.join("ip"),
+            format!(
+                "#!/bin/sh\necho '2: ens18: <BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\\    link/ether {mac} brd ff:ff:ff:ff:ff:ff'\n\
+                 echo '3: ens19: <BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\\    link/ether {seg} brd ff:ff:ff:ff:ff:ff'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(bin.join("netbird"), format!("#!/bin/sh\necho \"$@\" > {}\n", args.display())).unwrap();
+        for f in ["ip", "netbird"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(bin.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = up.replace("/var/log/onv-overlay.log", &bin.join("log").to_string_lossy());
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let st = std::process::Command::new("sh").arg("-c").arg(&script).env("PATH", &path).status().unwrap();
+        assert!(st.success());
+        let said = std::fs::read_to_string(&args).expect("netbird was run");
+        assert!(
+            said.contains("--wireguard-port 31845 --external-ip-map 203.0.113.7/ens18"),
+            "the egress interface, not the segment's: {said}"
+        );
+        // And with no such interface: enrolled, unopened, never refused.
+        std::fs::write(bin.join("ip"), "#!/bin/sh\necho '2: lo: <LOOPBACK> link/loopback 00:00:00:00:00:00'\n").unwrap();
+        std::fs::remove_file(&args).unwrap();
+        assert!(std::process::Command::new("sh").arg("-c").arg(&script).env("PATH", &path).status().unwrap().success());
+        let said = std::fs::read_to_string(&args).expect("netbird was still run");
+        assert!(said.contains("--wireguard-port 31845") && !said.contains("--external-ip-map"), "{said}");
     }
 
     /// **The peer is never named after the buyer's machine name** (the

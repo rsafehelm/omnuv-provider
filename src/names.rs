@@ -49,6 +49,10 @@ pub const EGRESS_UNIT: &str = "onv-egress";
 /// Our nftables table. A table of our own, so removing it cannot reach the
 /// host's rules or Proxmox's.
 pub const EGRESS_TABLE: &str = "onv_egress";
+/// The provider opening's table (`opening.rs`): one DNAT per opened machine,
+/// replaced whole by `onv-provider apply-opening`, which this unit runs.
+pub const OPENING_TABLE: &str = "onv_opening";
+pub const OPENING_UNIT: &str = "onv-opening";
 
 /// Configuration, state, and the audit log the provider keeps.
 pub const ETC: &str = "/etc/onv";
@@ -451,7 +455,8 @@ mod tests {
         assert_eq!(snippet_worker_legacy("x"), "onv-x.yaml");
         assert!(vnet("c4d90fd2-be3d").starts_with("onv"));
         for n in [POOL, POOL_BUYERS, STORAGE_SNIPPETS, SDN_ZONE, SDN_ZONE_NAT,
-                  TAG_INSTANCE, TAG_GATEWAY, TAG_WORKER, AGENT, EGRESS_TABLE] {
+                  TAG_INSTANCE, TAG_GATEWAY, TAG_WORKER, AGENT, EGRESS_TABLE,
+                  OPENING_TABLE, OPENING_UNIT] {
             assert!(n.starts_with(PREFIX), "{n} does not start with {PREFIX}");
         }
         for p in [ETC, VAR, LOG, RUN] {
