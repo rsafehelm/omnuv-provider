@@ -35,6 +35,8 @@ const EGRESS_ZONE: &str = crate::names::SDN_ZONE_NAT;
 // host joined by hand got a NAT bridge no machine used, and the first buyer
 // machine failed with "bridge 'onvnat0' does not exist".
 const EGRESS_VNET: &str = crate::names::NAT_VNET;
+const EGRESS_TABLE: &str = crate::names::EGRESS_TABLE;
+const EGRESS_UNIT: &str = crate::names::EGRESS_UNIT;
 const EGRESS_SUBNET: &str = "10.201.0.0/24";
 const EGRESS_GATEWAY: &str = "10.201.0.1";
 const EGRESS_DHCP: &str = "start-address=10.201.0.100,end-address=10.201.0.250";
@@ -90,10 +92,118 @@ fn grants_script(storage: &str) -> String {
     lines.join(" && ")
 }
 
+/// The buyer egress policy `join` installs: the same table `deploy-agent.yml`
+/// renders from `templates/egress.nft.j2` in the omnuv repository, with this
+/// file's constants for its two variables. It is the whole of a buyer's way
+/// out: what may leave, what the host answers, and the address translation.
+///
+/// **The translation is here, not in Proxmox SDN (4 October 2026).** The
+/// subnet's `snat` flag made Proxmox write `post-up iptables -t nat -A …` and
+/// `post-up iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1` into the
+/// bridge's stanza, and ifupdown2 re-runs every `post-up` on every
+/// `ifreload -a` (each SDN apply, which the agent makes whenever it creates or
+/// reaps a segment) while it runs a `post-down` only for an interface it
+/// removes (`ifreload_down_changed=0` on Proxmox). So every apply left one
+/// more copy of both: 183 SNAT and 267 CT on Pluto that day. This table is
+/// loaded whole in one `nft -f` transaction that first deletes it, so it
+/// holds one copy however often it is loaded.
+///
+/// Before this, `join` left the egress bridge with Proxmox's translation and
+/// no policy at all: a buyer machine on a joined host could reach the
+/// provider's LAN, which a host `deploy-agent.yml` provisioned never could.
+fn egress_nft() -> String {
+    format!(
+        r#"#!/usr/sbin/nft -f
+# Omnuv buyer egress policy for {EGRESS_VNET}. Written by onv-provider join.
+table inet {EGRESS_TABLE}
+delete table inet {EGRESS_TABLE}
+
+table inet {EGRESS_TABLE} {{
+    set private {{
+        type ipv4_addr
+        flags interval
+        elements = {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }}
+    }}
+
+    chain forward {{
+        type filter hook forward priority filter - 10; policy accept;
+        iifname "{EGRESS_VNET}" ip daddr @private drop
+        iifname "{EGRESS_VNET}" ip6 daddr {{ fc00::/7, fe80::/10 }} drop
+        oifname "{EGRESS_VNET}" ct state new drop
+    }}
+
+    chain input {{
+        type filter hook input priority filter - 10; policy accept;
+        iifname "{EGRESS_VNET}" udp dport 67 accept
+        iifname "{EGRESS_VNET}" ip daddr {EGRESS_GATEWAY} udp dport 53 accept
+        iifname "{EGRESS_VNET}" ip daddr {EGRESS_GATEWAY} tcp dport 53 accept
+        iifname "{EGRESS_VNET}" ip daddr {EGRESS_GATEWAY} icmp type echo-request accept
+        iifname "{EGRESS_VNET}" drop
+    }}
+
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        meta nfproto ipv4 iifname "{EGRESS_VNET}" oifname != "{EGRESS_VNET}" masquerade
+    }}
+
+    chain prerouting {{
+        type filter hook prerouting priority raw; policy accept;
+        meta nfproto ipv4 iifname "fwbr*" ct zone set 1
+    }}
+}}
+"#
+    )
+}
+
+/// The unit that loads it at boot. No `nft delete table` before the load: the
+/// file deletes its own table inside the transaction that defines it again,
+/// so there is no moment without a policy.
+fn egress_unit() -> String {
+    format!(
+        "[Unit]
+Description=Omnuv buyer egress policy (nftables table {EGRESS_TABLE})
+After=network-online.target pve-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/onv/egress.nft
+ExecStop=-/usr/sbin/nft delete table inet {EGRESS_TABLE}
+
+[Install]
+WantedBy=multi-user.target
+"
+    )
+}
+
+/// Every copy of the SNAT the flag left for the egress subnet, and the CT rule
+/// down to none, or to one if another stanza still generates it. The same
+/// rules as `deployment/ansible/files/egress-nat-handover.sh` in the omnuv
+/// repository, whose hermetic test reloads both shapes many times; this copy
+/// is pinned by the tests below. Reads the SDN file from `$sdn`.
+fn egress_handover() -> String {
+    format!(
+        "for r in $(iptables-save -t nat | awk '$1 == \"-A\" && $2 == \"POSTROUTING\" && $3 == \"-s\" && $4 == \"{EGRESS_SUBNET}\" && $5 == \"-o\" && $7 == \"-j\" && $8 == \"SNAT\" && $9 == \"--to-source\" && NF == 10 {{ print $6 \",\" $10 }}'); do
+  iptables -t nat -D POSTROUTING -s {EGRESS_SUBNET} -o \"${{r%,*}}\" -j SNAT --to-source \"${{r#*,}}\"
+done
+keep=0
+grep -qF -- 'post-up iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1' \"$sdn\" && keep=1
+have=$(iptables-save -t raw | grep -cxF -- '-A PREROUTING -i fwbr+ -j CT --zone 1' || true)
+while [ \"$have\" -gt \"$keep\" ]; do iptables -t raw -D PREROUTING -i 'fwbr+' -j CT --zone 1; have=$((have - 1)); done
+[ \"$(iptables-save -t nat | grep -c -- '-s {EGRESS_SUBNET} .*-j SNAT' || true)\" = 0 ] || {{ echo 'SNAT copies for {EGRESS_SUBNET} are still there'; exit 1; }}
+"
+    )
+}
+
 fn egress_script() -> String {
+    let nft = egress_nft();
+    let unit = egress_unit();
+    let handover = egress_handover();
     format!(
         "set -e
 changed=no
+sdn=/etc/network/interfaces.d/sdn
 pvesh get /cluster/sdn/zones --output-format json | grep -q '\"zone\":\"{EGRESS_ZONE}\"' || {{
   pvesh create /cluster/sdn/zones --type simple --zone {EGRESS_ZONE} --ipam pve --dhcp dnsmasq
   changed=yes
@@ -104,15 +214,36 @@ pvesh get /cluster/sdn/vnets --output-format json | grep -q '\"vnet\":\"{EGRESS_
 }}
 pvesh get /cluster/sdn/vnets/{EGRESS_VNET}/subnets --output-format json 2>/dev/null | grep -q '{EGRESS_SUBNET}' || {{
   pvesh create /cluster/sdn/vnets/{EGRESS_VNET}/subnets --type subnet \
-    --subnet {EGRESS_SUBNET} --gateway {EGRESS_GATEWAY} --snat 1 \
+    --subnet {EGRESS_SUBNET} --gateway {EGRESS_GATEWAY} \
     --dhcp-range {EGRESS_DHCP} --dhcp-dns-server {EGRESS_DNS}
   changed=yes
 }}
+# The policy and its translation first, so turning the flag off below never
+# leaves a moment with no way out.
+install -d -m 0755 /etc/onv
+cat > /etc/onv/egress.nft <<'ONV_EGRESS_NFT'
+{nft}ONV_EGRESS_NFT
+cat > /etc/systemd/system/{EGRESS_UNIT}.service <<'ONV_EGRESS_UNIT'
+{unit}ONV_EGRESS_UNIT
+systemctl daemon-reload
+systemctl enable {EGRESS_UNIT} >/dev/null 2>&1
+systemctl restart {EGRESS_UNIT}
+nft list chain inet {EGRESS_TABLE} postrouting | grep -q masquerade
+# A subnet an earlier join made carries Proxmox's snat flag: off.
+read -r id snat < <(pvesh get /cluster/sdn/vnets/{EGRESS_VNET}/subnets --output-format json \
+  | python3 -c 'import json, sys; s = next(s for s in json.load(sys.stdin) if s.get(\"cidr\") == \"{EGRESS_SUBNET}\"); print(s[\"subnet\"], int(s.get(\"snat\") or 0))')
+if [ \"$snat\" != 0 ]; then
+  pvesh set /cluster/sdn/vnets/{EGRESS_VNET}/subnets/$id --snat 0
+  changed=yes
+fi
 if [ \"$changed\" = yes ] || [ ! -d /sys/class/net/{EGRESS_VNET} ]; then
   pvesh set /cluster/sdn
   for _ in $(seq 1 20); do [ -d /sys/class/net/{EGRESS_VNET} ] && break; sleep 1; done
 fi
-[ -d /sys/class/net/{EGRESS_VNET} ] || {{ echo '{EGRESS_VNET} did not appear'; exit 1; }}"
+[ -d /sys/class/net/{EGRESS_VNET} ] || {{ echo '{EGRESS_VNET} did not appear'; exit 1; }}
+for _ in $(seq 1 30); do grep -qF -- \"-A POSTROUTING -s '{EGRESS_SUBNET}' \" \"$sdn\" || break; sleep 1; done
+if grep -qF -- \"-A POSTROUTING -s '{EGRESS_SUBNET}' \" \"$sdn\"; then echo 'the SDN file still generates the SNAT'; exit 1; fi
+{handover}"
     )
 }
 
@@ -581,10 +712,10 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
         // `omnuv-snippets` recreated the directory it pointed at, a minute
         // after that directory was deleted.
         ("remove legacy storage", "pvesm remove omnuv-snippets 2>/dev/null || true; pvesm remove omnu-snippets 2>/dev/null || true"),
-        ("remove legacy units", "for u in omnuv-provider omnu-provider omnuv-egress omnu-egress; do systemctl disable --now $u 2>/dev/null || true; rm -f /etc/systemd/system/$u.service; done; systemctl daemon-reload"),
+        ("remove egress and legacy units", "for u in onv-egress omnuv-provider omnu-provider omnuv-egress omnu-egress; do systemctl disable --now $u 2>/dev/null || true; rm -f /etc/systemd/system/$u.service; done; systemctl daemon-reload"),
         ("remove legacy identity", "for u in omnuv omnu; do pveum user token remove $u@pve agent 2>/dev/null || true; pveum user delete $u@pve 2>/dev/null || true; done; for r in OmnuvAgent OmnuAgent; do pveum role delete $r 2>/dev/null || true; done"),
         ("remove legacy pools", "for p in omnuv-buyers omnuv omnu-buyers omnu; do pveum pool delete $p 2>/dev/null || true; done"),
-        ("remove legacy nftables", "for t in onv_egress omnuv_egress omnu_egress; do nft delete table inet $t 2>/dev/null || true; done"),
+        ("remove egress nftables", "for t in onv_egress omnuv_egress omnu_egress; do nft delete table inet $t 2>/dev/null || true; done; rm -f /etc/onv/egress.nft"),
         ("remove legacy config", "rm -rf /etc/omnuv /etc/omnu"),
     ] {
         println!("  {label}\n    $ {cmd}");
@@ -757,7 +888,123 @@ mod tests {
         // The bridge join builds is the one a buyer machine attaches to.
         assert_eq!(EGRESS_VNET, crate::instance::EGRESS_BRIDGE);
         assert!(s.contains("sleep 1"), "does not wait");
-        assert!(s.contains("--snat 1"), "no NAT, so a machine has no way out");
+        assert!(!s.contains("--snat 1"), "Proxmox's snat flag is back: every SDN apply appends another SNAT copy");
+        assert!(!s.contains("--gateway {EGRESS_GATEWAY} --snat"), "the subnet is created with the flag");
+        assert!(s.contains("--snat 0"), "a subnet an earlier join made keeps the flag on");
+        assert!(s.contains("systemctl restart onv-egress"), "the policy that carries the translation is never loaded");
         assert!(s.contains("--isolate-ports 1"), "tenants would see each other on the bridge");
+        // The policy is written before the flag is turned off, and the copies
+        // are removed only after: no moment without a translation, and no
+        // reload left that could add one back.
+        let load = s.find("systemctl restart onv-egress").expect("loaded");
+        let off = s.find("--snat 0").expect("turned off");
+        let strip = s.find("iptables -t nat -D POSTROUTING").expect("removed");
+        assert!(load < off && off < strip, "out of order: load {load}, flag {off}, removal {strip}");
+        // Two heredocs and a process substitution: parsed, not only grepped.
+        let parsed = std::process::Command::new("bash").arg("-n").arg("-c").arg(&s).output().unwrap();
+        assert!(parsed.status.success(), "{}", String::from_utf8_lossy(&parsed.stderr));
+        assert!(s.contains(&format!("\n{}ONV_EGRESS_NFT\n", egress_nft())), "the table is not written whole");
+    }
+
+    /// The table join writes replaces itself in one transaction and carries
+    /// one translation, the conntrack zone Proxmox's flag used to add, and the
+    /// policy's drops.
+    #[test]
+    fn the_egress_table_replaces_itself_and_carries_the_translation() {
+        let t = egress_nft();
+        let lines: Vec<&str> = t.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).collect();
+        assert_eq!(&lines[..2], &["table inet onv_egress", "delete table inet onv_egress"],
+                   "not replaced in one transaction: loading it twice would duplicate every rule");
+        assert_eq!(t.matches("masquerade").count(), 1);
+        assert!(t.contains(r#"meta nfproto ipv4 iifname "onvnat0" oifname != "onvnat0" masquerade"#), "{t}");
+        assert!(t.contains("type nat hook postrouting priority srcnat"));
+        assert!(t.contains(r#"meta nfproto ipv4 iifname "fwbr*" ct zone set 1"#));
+        assert!(t.contains("type filter hook prerouting priority raw"));
+        assert!(t.contains(r#"iifname "onvnat0" ip daddr @private drop"#), "a buyer machine could reach the provider LAN");
+        assert!(t.contains(r#"oifname "onvnat0" ct state new drop"#));
+        assert!(t.contains(r#"iifname "onvnat0" ip daddr 10.201.0.1 udp dport 53 accept"#));
+        let u = egress_unit();
+        assert!(u.contains("ExecStart=/usr/sbin/nft -f /etc/onv/egress.nft"));
+        assert!(!u.contains("ExecStartPre"), "a delete before the load opens a moment with no policy");
+    }
+
+    /// **The handover against stand-ins for iptables**: a table of copies the
+    /// flag left, beside rules that are not ours, run twice. Fixtures, not a
+    /// host: `iptables` here edits a text file, and the omnuv repository's
+    /// `tests/egress_nat/run.sh` runs the same rules against a real kernel.
+    #[test]
+    fn the_handover_removes_exactly_ours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let bin = d.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // `iptables-save -t <table>` prints the table's file; `iptables -t
+        // <table> -D <rule>` removes the first line equal to `-A <rule>`.
+        std::fs::write(bin.join("iptables-save"), "#!/bin/bash\ncat \"$STATE/$2\"\n").unwrap();
+        std::fs::write(
+            bin.join("iptables"),
+            "#!/bin/bash\nt=$2; shift 3; want=\"-A $*\"\n\
+             awk -v w=\"$want\" 'done || $0 != w {print; next} {done = 1}' \"$STATE/$t\" > \"$STATE/$t.new\"\n\
+             cmp -s \"$STATE/$t\" \"$STATE/$t.new\" && { echo \"no such rule: $want\" >&2; exit 1; }\n\
+             mv \"$STATE/$t.new\" \"$STATE/$t\"\n",
+        )
+        .unwrap();
+        for f in ["iptables-save", "iptables"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(bin.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ours = "-A POSTROUTING -s 10.201.0.0/24 -o vmbr0 -j SNAT --to-source 192.168.100.78";
+        let ct = "-A PREROUTING -i fwbr+ -j CT --zone 1";
+        let foreign = [
+            "-A POSTROUTING -s 10.99.0.0/24 -o vmbr0 -j SNAT --to-source 192.168.100.78",
+            "-A POSTROUTING -s 10.201.0.0/24 -o vmbr0 -j MASQUERADE",
+        ];
+        let mut nat = vec!["*nat".to_string()];
+        nat.extend(std::iter::repeat_n(ours.to_string(), 5));
+        nat.extend(foreign.iter().map(|s| s.to_string()));
+        // A copy whose uplink address changed is ours too.
+        nat.push("-A POSTROUTING -s 10.201.0.0/24 -o vmbr1 -j SNAT --to-source 10.0.0.9".into());
+        nat.push("COMMIT".into());
+        let mut raw = vec!["*raw".to_string()];
+        raw.extend(std::iter::repeat_n(ct.to_string(), 4));
+        raw.push("-A PREROUTING -i fwbr9100i0 -j CT --zone 2".into());
+        raw.push("COMMIT".into());
+
+        let run = |sdn: &str, nat: &[String], raw: &[String]| -> (std::process::Output, String, String) {
+            std::fs::write(d.join("nat"), nat.join("\n") + "\n").unwrap();
+            std::fs::write(d.join("raw"), raw.join("\n") + "\n").unwrap();
+            std::fs::write(d.join("sdn"), sdn).unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("set -e\nsdn={}\n{}", d.join("sdn").display(), egress_handover()))
+                .env("STATE", d)
+                .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+                .output()
+                .unwrap();
+            (out, std::fs::read_to_string(d.join("nat")).unwrap(), std::fs::read_to_string(d.join("raw")).unwrap())
+        };
+
+        let off = "auto onvnat0\niface onvnat0\n\taddress 10.201.0.1/24\n";
+        let (out, n, r) = run(off, &nat, &raw);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!n.contains("-s 10.201.0.0/24 -o vmbr0 -j SNAT") && !n.contains("--to-source 10.0.0.9"), "copies left:\n{n}");
+        for f in foreign {
+            assert!(n.contains(f), "removed a rule that is not ours: {f}\n{n}");
+        }
+        assert!(!r.lines().any(|l| l == ct), "CT copies left with no stanza generating it:\n{r}");
+        assert!(r.contains("-A PREROUTING -i fwbr9100i0 -j CT --zone 2"), "another raw rule was removed");
+
+        // A second run over what the first left changes nothing.
+        let n2: Vec<String> = n.lines().map(str::to_string).collect();
+        let r2: Vec<String> = r.lines().map(str::to_string).collect();
+        let (out, n3, r3) = run(off, &n2, &r2);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!((n3.trim(), r3.trim()), (n.trim(), r.trim()));
+
+        // Another stanza still generating the CT rule keeps one copy.
+        let other = format!("{off}auto other0\niface other0\n\tpost-up iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1\n");
+        let (out, _, r) = run(&other, &nat, &raw);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(r.lines().filter(|l| *l == ct).count(), 1, "{r}");
     }
 }
