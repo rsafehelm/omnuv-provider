@@ -49,6 +49,8 @@ want() { case ",$sections," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 SEMGREP_IMAGE=semgrep/semgrep:1.177.0
 SHELLCHECK_IMAGE=koalaman/shellcheck:v0.11.0
+# omnuv's own pin for its PowerShell checks (deployment/check.sh).
+PWSH_IMAGE=mcr.microsoft.com/powershell:7.5-ubuntu-24.04
 
 if want crate; then
 step "Build"
@@ -85,6 +87,16 @@ docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
 # against a fake Core over TLS, every case of it (tests/guest/).
 step "The guest's certificate fetch, run against a fake Core"
 python3 tests/guest/onv_certificate_test.py
+
+# A Windows machine's first-boot script rides on its drive too
+# (guest_windows.rs): the golden copy, run under pwsh against stand-ins for
+# Windows' own commands, every case of it (tests/windows/harness.ps1). The
+# verdict is the harness's exit status; its last line says so as well.
+step "A Windows machine's first boot, run under pwsh"
+docker run --rm --network none -v "$PWD:/a:ro" -w /a "$PWSH_IMAGE" \
+    pwsh -NoLogo -NoProfile -NonInteractive -File /a/tests/windows/harness.ps1 > "$out/windows.log" 2>&1 \
+    || { cat "$out/windows.log"; exit 1; }
+test "$(tail -1 "$out/windows.log")" = "all checks passed"
 
 step "Build the package as a release is built"
 ONV_PACKAGE_OUT="$out" ./packaging/build-deb.sh

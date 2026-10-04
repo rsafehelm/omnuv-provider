@@ -5,7 +5,9 @@
 //! state survives an agent restart, and nothing the marketplace did not create
 //! is ever touched.
 
-use omnuv_protocol::{FirstBoot, InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment, StartReadiness};
+use omnuv_protocol::{InstanceSpec, InstanceState, InstanceStatus, Lifecycle, NetworkAttachment, StartReadiness};
+
+use crate::guest_windows::GuestKind;
 
 use crate::audit;
 use crate::proxmox::Client;
@@ -241,7 +243,7 @@ fn certificate_runcmd(_: &omnuv_protocol::CertificatePull) -> String {
 /// pattern-matched, because "does this compose file have any services" is a
 /// question about YAML and guessing at it with string matching is how a recipe
 /// that works becomes one that mysteriously does not.
-fn has_containers(compose: &str) -> bool {
+pub(crate) fn has_containers(compose: &str) -> bool {
     let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(compose) else {
         // Unparseable: assume it means something and let compose say why.
         return true;
@@ -309,7 +311,7 @@ exit 1"#;
 /// hostname, which is the buyer's name: a machine made again under a deleted
 /// one's name enrolled as a namesake peer, and anything finding peers by name
 /// found the wrong one.
-fn peer_name(o: &omnuv_protocol::OverlayEnrolment, instance_id: &str) -> String {
+pub(crate) fn peer_name(o: &omnuv_protocol::OverlayEnrolment, instance_id: &str) -> String {
     o.hostname.clone().filter(|h| !h.trim().is_empty()).unwrap_or_else(|| format!("onv-m-{instance_id}"))
 }
 
@@ -615,6 +617,22 @@ fn network_config(spec: &InstanceSpec, vmid: u32) -> String {
         address = crate::names::segment_address(vmid),
         prefix = SEGMENT_PREFIX,
     )
+}
+
+/// **The user-data a machine's first boot reads, by its guest kind**: the
+/// image's OS family chooses (`guest_windows::guest_kind`). Linux's is the
+/// cloud-config below, byte for byte what it was; Windows' is cloudbase-init's
+/// (`guest_windows::user_data`), and `opened` is not given to it.
+fn first_boot_user_data(
+    spec: &InstanceSpec,
+    apt_mirror: Option<&str>,
+    vmid: u32,
+    opened: Option<crate::opening::Opened>,
+) -> anyhow::Result<String> {
+    Ok(match crate::guest_windows::guest_kind(&spec.image)? {
+        GuestKind::Linux => cloud_init_opened(spec, apt_mirror, vmid, opened),
+        GuestKind::Windows => crate::guest_windows::user_data(spec)?,
+    })
 }
 
 /// The first boot of a machine that is not opened: every test's, and none of
@@ -1095,23 +1113,36 @@ impl Client {
                 // what it means is that a generator change has not reached a
                 // buyer's machine. See `survey::Refreshes`.
                 if spec.intent != Lifecycle::Absent {
-                    let refreshed = self
-                        .sync_cloud_init(
-                            node,
+                    let refreshed: anyhow::Result<bool> = async {
+                        // The port it was built with, if it holds one: never
+                        // given here, so the opening turned on later opens no
+                        // existing machine.
+                        let user_data = first_boot_user_data(
+                            spec,
+                            self.apt_mirror.as_deref(),
                             vm.vmid,
-                            snippet_dir,
-                            &crate::names::snippet_instance(&spec.id),
-                            // The port it was built with, if it holds one:
-                            // never given here, so the opening turned on
-                            // later opens no existing machine.
-                            &cloud_init_opened(
-                                spec,
-                                self.apt_mirror.as_deref(),
-                                vm.vmid,
-                                self.opening.opened(&spec.id),
-                            ),
-                        )
-                        .await;
+                            self.opening.opened(&spec.id),
+                        )?;
+                        let mut changed = self
+                            .sync_cloud_init(node, vm.vmid, snippet_dir, &crate::names::snippet_instance(&spec.id), &user_data)
+                            .await?;
+                        // A Windows machine's meta-data too: the same bytes
+                        // every pass, so this writes only a file that went
+                        // missing, and its instance-id never moves.
+                        if crate::guest_windows::guest_kind(&spec.image)? == crate::guest_windows::GuestKind::Windows {
+                            changed |= self
+                                .sync_cloud_init(
+                                    node,
+                                    vm.vmid,
+                                    snippet_dir,
+                                    &crate::names::snippet_meta(&spec.id),
+                                    &crate::guest_windows::meta_data(spec),
+                                )
+                                .await?;
+                        }
+                        Ok(changed)
+                    }
+                    .await;
                     if let Err(e) = &refreshed {
                         eprintln!("instance {}: cloud-init not refreshed: {e:#}", spec.id);
                     }
@@ -1262,7 +1293,7 @@ impl Client {
                     // Only asked for a machine that was given a recipe, and only
                     // while it is up: there is nothing to ask otherwise.
                     recipe_progress: if running && spec.recipe.is_some() {
-                        self.recipe_progress(node, vm.vmid).await
+                        self.recipe_progress(node, vm.vmid, &spec.image).await
                     } else {
                         None
                     },
@@ -1422,9 +1453,11 @@ impl Client {
         };
         let node = node_owned.as_str();
 
-        // The image decides how first boot is rendered. Only cloud-init is
-        // implemented; a Cloudbase-Init image is refused here with the reason
-        // reported, never built wrong. Adding Windows is this one arm.
+        // **The image's OS family decides the guest kind** (`guest_windows`):
+        // a Linux machine's drive is cloud-init's, a Windows machine's is
+        // cloudbase-init's, and an image whose family and first boot disagree
+        // is refused here with the reason, never built wrong.
+        let kind = crate::guest_windows::guest_kind(&spec.image)?;
         // **The VMID first, because the machine's segment address is derived
         // from it.** Protocol 5 stopped Core numbering a provider's segment: an
         // address there needs to be unique on one wire, and the hypervisor's
@@ -1439,22 +1472,37 @@ impl Client {
         // by the machine's id and on disk before the machine exists, so the
         // port its first boot names is never given to another. Only a machine
         // that joins the overlay has a WireGuard to reach.
-        let opened = match &spec.overlay {
-            Some(_) => self.opening.allocate(&spec.id)?,
-            None => None,
+        //
+        // **Not for a Windows machine, yet**: the opening is `netbird up
+        // --wireguard-port N --external-ip-map …`, and a Windows machine joins
+        // through the tunnel's machine mode, whose join file has no port to
+        // name. No port is held for one, so none is withheld from a Linux
+        // machine that could use it. Queued in omnuv's TODO.
+        let opened = match (&spec.overlay, kind) {
+            (Some(_), GuestKind::Linux) => self.opening.allocate(&spec.id)?,
+            _ => None,
         };
-        let user_data = match spec.image.first_boot {
-            FirstBoot::CloudInit => cloud_init_opened(spec, self.apt_mirror.as_deref(), vmid, opened),
-            FirstBoot::CloudbaseInit => anyhow::bail!(
-                "image {}: Cloudbase-Init first boot is not implemented in this agent version",
-                spec.image.id
-            ),
-        };
+        // The image's OS family chose the kind above; the kind chooses the
+        // first boot. A Windows drive that would be refused (a join file the
+        // tunnel would not read, a recipe with containers) is refused here,
+        // before anything is written or cloned.
+        let user_data = first_boot_user_data(spec, self.apt_mirror.as_deref(), vmid, opened)?;
         let file = crate::names::snippet_instance(&spec.id);
         // 0600: the user data carries the overlay setup key. Written through
         // `write_private` so no other user on the hypervisor can read it.
         crate::names::write_private(&format!("{snippet_dir}/{file}"), user_data.as_bytes(), 0o600)
             .map_err(|e| anyhow::anyhow!("writing cloud-init snippet: {e}"))?;
+        // A Windows machine's meta-data: its instance-id held to its id, and
+        // its NetBIOS name (`guest_windows::meta_data`).
+        let metafile = crate::names::snippet_meta(&spec.id);
+        if kind == GuestKind::Windows {
+            crate::names::write_private(
+                &format!("{snippet_dir}/{metafile}"),
+                crate::guest_windows::meta_data(spec).as_bytes(),
+                0o600,
+            )
+            .map_err(|e| anyhow::anyhow!("writing cloudbase-init meta-data: {e}"))?;
+        }
         // The network, in its own file because cloud-init reads it in
         // `init-local` — before networkd, and before the user data's `bootcmd`.
         // See `network_config`.
@@ -1539,16 +1587,44 @@ impl Client {
                 // A display as well as the serial port: the serial console is
                 // where a Linux machine logs in, the screen is what the buyer
                 // opens to watch it boot or rescue it, and what a Windows machine
-                // uses for everything.
-                ("vga".into(), "std".into()),
+                // uses for everything. **A Windows machine with a card has
+                // none** (W1, `guest_windows::vga`): the virtual display on the
+                // card is then its only screen.
+                (
+                    "vga".into(),
+                    match kind {
+                        GuestKind::Linux => "std",
+                        GuestKind::Windows => crate::guest_windows::vga(spec),
+                    }
+                    .into(),
+                ),
                 (
                     "cicustom".into(),
-                    format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}"),
+                    match kind {
+                        GuestKind::Linux => {
+                            format!("user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile}")
+                        }
+                        GuestKind::Windows => format!(
+                            "user=onv-snippets:snippets/{file},network=onv-snippets:snippets/{netfile},\
+                             meta=onv-snippets:snippets/{metafile}"
+                        ),
+                    },
                 ),
                 ("tags".into(), crate::names::tags(TAG, &spec.id, self.environment.as_deref())),
                 ("description".into(), crate::names::description(TAG, &spec.id)),
             ];
             let mut config = config;
+            if kind == GuestKind::Windows {
+                // NoCloud, said per clone rather than trusted from the
+                // template: Proxmox gives a Windows ostype ConfigDrive v2
+                // unless told otherwise (Cloudinit.pm get_cloudinit_format),
+                // and cloudbase-init's NoCloud service reads only `cidata`.
+                config.push(("citype".into(), "nocloud".into()));
+                // **A TPM of its own** (plan B2): the template has none, so no
+                // two clones share an endorsement key. Made on the clone's own
+                // storage, and journalled below with its disks.
+                config.push(("tpmstate0".into(), format!("{storage}:1,version=v2.0")));
+            }
             // The GPUs the marketplace allocated, by the host's published
             // mappings: a non-root token may only attach a device the host has
             // explicitly offered. The template is already q35/UEFI, which PCIe
@@ -1578,6 +1654,11 @@ impl Client {
             }
             let answer = self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
             self.settle(node, answer).await?;
+            // The TPM's volume, written down beside the clone's disks, so a
+            // rollback that leaves it keeps its record (`journal_clone_volumes`).
+            if kind == GuestKind::Windows {
+                self.journal_clone_volumes(&journal, &mut pending).await;
+            }
 
             let answer = self.put_form::<serde_json::Value>(
                 &format!("/nodes/{node}/qemu/{vmid}/resize"),
@@ -1777,9 +1858,29 @@ impl Client {
     /// Best-effort by construction: a guest with no agent, a machine still
     /// installing, or an image that never wrote the file all return None, and
     /// None means "not known", never "failed".
-    async fn recipe_progress(&self, node: &str, vmid: u32) -> Option<omnuv_protocol::RecipeProgress> {
-        let status = self.read_guest_file(node, vmid, RECIPE_STATUS).await?;
+    ///
+    /// **Where, by the guest kind**: a Windows machine's first boot writes the
+    /// same two files, in the same `key=value` lines, under
+    /// `C:\ProgramData\onv` (`guest_windows`). An image whose kind cannot be
+    /// told is not looked at.
+    pub(crate) async fn recipe_progress(
+        &self,
+        node: &str,
+        vmid: u32,
+        image: &omnuv_protocol::ImageSpec,
+    ) -> Option<omnuv_protocol::RecipeProgress> {
+        let (status_path, credential_path) = match crate::guest_windows::guest_kind(image).ok()? {
+            GuestKind::Linux => (RECIPE_STATUS, RECIPE_STREAM_CREDENTIAL),
+            GuestKind::Windows => (crate::guest_windows::STATUS, crate::guest_windows::STREAM_CREDENTIAL),
+        };
+        let status = self.read_guest_file(node, vmid, status_path).await?;
         let mut progress = progress_from(&status)?;
+        if status_path == crate::guest_windows::STATUS {
+            // Where a Windows machine's install wrote its output.
+            progress.detail = progress
+                .detail
+                .map(|d| d.replace("/var/log/cloud-init-output.log", crate::guest_windows::FIRST_BOOT_LOG));
+        }
         // Only after the install succeeded: a recipe that failed has no stream
         // to sign in to, and this is a guest-agent call per poll for as long
         // as the machine lives.
@@ -1792,7 +1893,7 @@ impl Client {
         // for exactly that reason.
         if progress.status == "done" {
             progress.stream_credentials = self
-                .read_guest_file(node, vmid, RECIPE_STREAM_CREDENTIAL)
+                .read_guest_file(node, vmid, credential_path)
                 .await
                 .and_then(|c| parse_stream_credentials(&c));
         }
@@ -1812,7 +1913,12 @@ impl Client {
         }
 
         let read: FileRead = self
-            .get_json(&format!("/nodes/{node}/qemu/{vmid}/agent/file-read?file={path}"))
+            // A Windows path's `:` and `\` are encoded; `/` is left, so a
+            // Linux path is the request it always was, byte for byte.
+            .get_json(&format!(
+                "/nodes/{node}/qemu/{vmid}/agent/file-read?file={}",
+                crate::proxmox::urlencode(path).replace("%2F", "/")
+            ))
             .await
             .ok()?;
         Some(read.content)
@@ -2234,7 +2340,7 @@ impl Client {
         // Removed first, and best-effort: a snippet left behind must never stop
         // a machine being deleted, because a VM that outlives its delete is far
         // worse than a file that does.
-        for name in [crate::names::snippet_instance(id), crate::names::snippet_network(id)] {
+        for name in [crate::names::snippet_instance(id), crate::names::snippet_network(id), crate::names::snippet_meta(id)] {
             let snippet = format!("{snippet_dir}/{name}");
             if let Err(e) = std::fs::remove_file(&snippet)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -2258,7 +2364,7 @@ impl Client {
         // **And only the one guest licence (a) names** (lifecycle phase 7):
         // every guest carrying the claim is listed, and a copy, a twelve-digit
         // twin or a tag a live machine shares is refused rather than taken.
-        let snippets: Vec<String> = [crate::names::snippet_instance(id), crate::names::snippet_network(id)]
+        let snippets: Vec<String> = [crate::names::snippet_instance(id), crate::names::snippet_network(id), crate::names::snippet_meta(id)]
             .iter()
             .map(|name| format!("{snippet_dir}/{name}"))
             .collect();

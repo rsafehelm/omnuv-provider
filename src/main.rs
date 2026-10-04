@@ -5,6 +5,7 @@ mod audit;
 mod config;
 mod images;
 mod instance;
+mod guest_windows;
 mod join;
 mod diagnostics;
 mod driver;
