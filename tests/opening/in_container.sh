@@ -9,8 +9,9 @@
 #   guest  10.201.0.105   on onvnat0, opened on 31820   (host: 10.201.0.1)
 #   other  10.201.0.106   on onvnat0, holds 31821 but not yet seen
 #
-# Loaded: the egress policy omnuv's play installs (/t/egress.nft), a SNAT of
-# the bridge's subnet as Proxmox's SDN writes it, and the agent's table, by
+# Loaded: the egress policy omnuv's play installs (/t/egress.nft), which owns
+# the bridge's NAT, a stand-in that moves two probe ports (below), and the
+# agent's table, by
 # the packaged binary's own `apply-opening`. Every verdict is a packet sent
 # and an answer heard or not heard.
 set -uo pipefail
@@ -46,16 +47,19 @@ peer lan vmbr0 192.168.100.50/24 10.201.0.0/24 192.168.100.78 203.0.113.0/24 192
 peer guest onvnat0 10.201.0.105/24 default 10.201.0.1
 peer other onvnat0 10.201.0.106/24 default 10.201.0.1
 
-# Proxmox SDN's SNAT for the egress subnet (`--snat 1`), at the priority
-# iptables' nat table holds: the opening's own masquerade runs ahead of it.
-# fully-random, which Proxmox's is not: so a source port that survives is
-# the opening's doing and nothing else's (the control below shows one that
-# does not).
+# **A stand-in that would move the two probe ports**, ahead of the egress
+# policy's own masquerade (srcnat) and behind the opening's (srcnat - 5).
+# The egress masquerade keeps a free source port by itself (it has owned the
+# bridge's NAT since omnuv 45d71126; Proxmox's iptables SNAT is gone), so
+# without this a kept port would prove nothing about the opening. It matches
+# only the guest's UDP from 31820 and 31899: every other flow meets the real
+# masquerade. 31820 kept is then the opening's doing; 31899 moved is the
+# control that the stand-in moves what the opening does not hold.
 nft -f - <<'NFT'
-table ip pvelike {
+table ip standin {
     chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 10.201.0.0/24 oifname "vmbr0" snat ip to 203.0.113.1 fully-random
+        type nat hook postrouting priority srcnat - 2; policy accept;
+        ip saddr 10.201.0.105 udp sport { 31820, 31899 } oifname "vmbr0" snat ip to 203.0.113.1 fully-random
     }
 }
 NFT
@@ -143,7 +147,8 @@ ask guest 203.0.113.50 40000 31820 > /dev/null
 ask guest 203.0.113.50 40000 31899 > /dev/null
 wait "$hear_pid"
 expect "the guest's port leaves as the public port" "heard 203.0.113.1:31820 probe*" "$(sed -n 1p /tmp/wan.heard)"
-expect "a port it was not given does not (control)" "heard 203.0.113.1:* probe" "$(sed -n 2p /tmp/wan.heard | grep -v ':31899 ')"
+second="$(sed -n 2p /tmp/wan.heard)"
+expect "a port it was not given is moved (control): $second" "heard 203.0.113.1:* probe" "$(grep -v ':31899 ' <<< "$second")"
 ip netns exec guest python3 /t/udp.py echo 31820 /tmp/guest.heard & echo_pid=$!
 bound guest 31820
 
