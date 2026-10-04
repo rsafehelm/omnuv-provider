@@ -273,6 +273,9 @@ pub struct Client {
     /// arguments; and empty is a working default, meaning a provider that
     /// offers no images and reports holding none.
     images: std::collections::BTreeMap<String, u32>,
+    /// Which of `images` are Windows images (`config::ProxmoxRuntime::windows_images`):
+    /// the shape the mirror imports each into, and the shape `held` holds it to.
+    windows_images: std::collections::BTreeSet<String>,
     /// `timings` in `agent.yaml`: the start gate, the clone budget's cap, and
     /// what workers are told. The defaults until `with_timings`, which are the
     /// values these were compiled in as.
@@ -479,6 +482,7 @@ impl Client {
             alloc: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             workload: crate::workload::Store::new(),
             images: Default::default(),
+            windows_images: Default::default(),
             timings: Default::default(),
             refreshes: Default::default(),
             started_destroys: Default::default(),
@@ -510,6 +514,21 @@ impl Client {
     pub fn with_images(mut self, images: std::collections::BTreeMap<String, u32>) -> Self {
         self.images = images;
         self
+    }
+
+    /// Which of the offered images are Windows images.
+    pub fn with_windows_images(mut self, windows: std::collections::BTreeSet<String>) -> Self {
+        self.windows_images = windows;
+        self
+    }
+
+    /// The template shape an image is mirrored into and held to.
+    pub(crate) fn template_shape(&self, id: &str) -> crate::images::TemplateShape {
+        if self.windows_images.contains(id) {
+            crate::images::TemplateShape::Windows
+        } else {
+            crate::images::TemplateShape::Linux
+        }
     }
 
     /// Development-inventory constructor, used by the `discover` debug command.

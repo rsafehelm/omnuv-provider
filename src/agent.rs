@@ -627,6 +627,7 @@ pub fn driver_of(cfg: &AgentConfig) -> anyhow::Result<proxmox::Client> {
         cfg.proxmox.apt_mirror.clone(),
     )?
     .with_images(cfg.proxmox.image_map())
+    .with_windows_images(cfg.proxmox.windows_images.clone())
     .with_environment(cfg.environment.clone())
     .with_timings(cfg.timings.clone())
     // Read, never written here: the host timer builds its driver this way too.
