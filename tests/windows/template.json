@@ -1,0 +1,32 @@
+{
+  "about": [
+    "The Windows image's template, as the mirror makes it and as omnuv's build-template-windows.yml leaves it.",
+    "Read by images.rs's the_windows_import_is_the_build_plays_template (every value import asks Proxmox for, and nothing more)",
+    "and by omnuv's deployment/ansible/tests/publish_image_windows_test.py (the play's qm create, then its qm set).",
+    "{id} is the catalogue id, {storage} the disk's storage, {import} the artefact's volume, {environment} the deployment.",
+    "A disk's size, and import-from, are compared by neither side against the play: the play allocates, the mirror imports.",
+    "The description is its first line's opening, the identity both write and the mirror's guard reads."
+  ],
+  "template": {
+    "name": "onv-{id}",
+    "description": "Onv marketplace base image - {id}.",
+    "tags": "onv-{environment}",
+    "pool": "onv",
+    "machine": "q35",
+    "bios": "ovmf",
+    "efidisk0": "{storage}:1,efitype=4m,pre-enrolled-keys=1",
+    "cpu": "host",
+    "ostype": "win11",
+    "scsihw": "virtio-scsi-single",
+    "scsi0": "{storage}:0,import-from={import},iothread=1,discard=on,ssd=1",
+    "net0": "virtio,bridge=vmbr0",
+    "ide2": "{storage}:cloudinit",
+    "citype": "nocloud",
+    "boot": "order=scsi0",
+    "vga": "std",
+    "serial0": "socket",
+    "agent": "enabled=1"
+  },
+  "per_clone": ["cores", "sockets", "memory"],
+  "absent": ["tpmstate0", "ide0"]
+}

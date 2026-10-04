@@ -59,6 +59,122 @@ fn description(id: &str, sha256: &str) -> String {
     )
 }
 
+/// **The template an image is imported into**: the Linux cloud images' shape,
+/// or the Windows image's, which is `build-template-windows.yml`'s.
+///
+/// Which one is the provider's configuration (`proxmox.windowsImages`), never
+/// guessed from an id. What differs, and why it matters on a clone:
+///
+/// ```text
+///                 Linux                  Windows
+/// ostype          l26                    win11: Hyper-V enlightenments, the
+///                                        clock Windows expects
+/// efidisk0        no enrolled keys       Microsoft's keys: Secure Boot on, as
+///                                        the build ran it
+/// scsi0           discard, ssd           and iothread, as the build's disk
+/// vga             serial0                std: the console a buyer opens
+/// citype          (Proxmox's default)    nocloud: a Windows ostype otherwise
+///                                        gets ConfigDrive v2, which
+///                                        cloudbase-init's NoCloud never reads
+/// tpmstate0       none                   none: each clone gets its own
+/// ```
+///
+/// **The Windows shape is held to the build play's** by a fixture both
+/// repositories read: `tests/windows/template.json` here, compared with
+/// `build-template-windows.yml`'s `qm create` and `qm set` by omnuv's
+/// `publish_image_windows_test.py`, and with what `import` asks Proxmox for
+/// by `the_windows_import_is_the_build_plays_template` below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateShape {
+    Linux,
+    Windows,
+}
+
+impl TemplateShape {
+    /// Whether a template's configuration is of this shape, by its `ostype`:
+    /// what decides how Proxmox runs every clone. A Linux template is any
+    /// that is not a Windows one, so a template built before `ostype` was
+    /// written keeps being held.
+    pub fn holds(self, cfg: &serde_json::Value) -> bool {
+        let ostype = cfg.get("ostype").and_then(serde_json::Value::as_str).unwrap_or_default();
+        match self {
+            TemplateShape::Linux => !ostype.starts_with("win"),
+            TemplateShape::Windows => ostype == "win11",
+        }
+    }
+}
+
+/// **Every value `import` gives the template**, in the three calls it makes:
+/// the create, the disk's import, and the rest once the disk is there. A
+/// function of its inputs alone, so a test reads the whole shape without a
+/// hypervisor.
+pub fn template_requests(
+    shape: TemplateShape,
+    id: &str,
+    vmid: u32,
+    sha256: &str,
+    storage: &str,
+    import_volid: &str,
+    environment: Option<&str>,
+) -> [Vec<(String, String)>; 3] {
+    let kv = |k: &str, v: String| (k.to_string(), v);
+    let mut create = vec![
+        kv("vmid", vmid.to_string()),
+        kv("name", format!("{}-{}", crate::names::PREFIX, id)),
+        // Per clone, whatever the template says: the machine's own size.
+        kv("memory", "4096".into()),
+        kv("cores", "2".into()),
+        kv("cpu", "host".into()),
+        kv("machine", "q35".into()),
+        kv("bios", "ovmf".into()),
+        kv("scsihw", "virtio-scsi-single".into()),
+        kv(
+            "ostype",
+            match shape {
+                TemplateShape::Linux => "l26",
+                TemplateShape::Windows => "win11",
+            }
+            .into(),
+        ),
+        kv("agent", "enabled=1".into()),
+        kv("net0", "virtio,bridge=vmbr0".into()),
+        kv("pool", crate::names::POOL.into()),
+        kv("description", description(id, sha256)),
+    ];
+    // The deployment it belongs to, as every machine this agent makes says
+    // it (`names::tags`); never a claim, so a template stays a template.
+    if let Some(env) = environment.map(str::trim).filter(|e| !e.is_empty()) {
+        create.push(kv("tags", format!("{}-{env}", crate::names::PREFIX)));
+    }
+    let disk = vec![kv(
+        "scsi0",
+        match shape {
+            TemplateShape::Linux => format!("{storage}:0,import-from={import_volid},discard=on,ssd=1"),
+            TemplateShape::Windows => {
+                format!("{storage}:0,import-from={import_volid},iothread=1,discard=on,ssd=1")
+            }
+        },
+    )];
+    let finish = match shape {
+        TemplateShape::Linux => vec![
+            kv("efidisk0", format!("{storage}:0,efitype=4m,pre-enrolled-keys=0")),
+            kv("ide2", format!("{storage}:cloudinit")),
+            kv("boot", "order=scsi0".into()),
+            kv("serial0", "socket".into()),
+            kv("vga", "serial0".into()),
+        ],
+        TemplateShape::Windows => vec![
+            kv("efidisk0", format!("{storage}:1,efitype=4m,pre-enrolled-keys=1")),
+            kv("ide2", format!("{storage}:cloudinit")),
+            kv("citype", "nocloud".into()),
+            kv("boot", "order=scsi0".into()),
+            kv("serial0", "socket".into()),
+            kv("vga", "std".into()),
+        ],
+    };
+    [create, disk, finish]
+}
+
 /// Whether a VM's configuration is **this image's template and nothing else's**
 /// (the assets-by-id audit of 3 October 2026): the only thing an import may
 /// destroy to make room. The test it replaced answered "ours at all", and
@@ -263,6 +379,13 @@ pub async fn held(
         if cfg.get("template").and_then(serde_json::Value::as_u64) != Some(1) {
             continue;
         }
+        // **Of the shape this provider configures for the id.** A template
+        // imported in the other shape boots every clone wrong (a Windows guest
+        // as `l26`, without Secure Boot's keys), so it is not held, and the
+        // next pass imports it again in the right one.
+        if !px.template_shape(id).holds(&cfg) {
+            continue;
+        }
         let desc = cfg.get("description").and_then(serde_json::Value::as_str).unwrap_or_default();
         if let Some(sha256) = digest_in(desc) {
             out.push(HeldImage { id: id.clone(), sha256 });
@@ -273,10 +396,11 @@ pub async fn held(
 
 /// Turns a verified artefact on disk into a template at `vmid`.
 ///
-/// The shape matches what `build-template.yml` produces, because a buyer's
-/// machine is cloned from either and must not be able to tell which: UEFI and
-/// q35 (the 26.04 cloud image is UEFI-only and silently never boots under
-/// SeaBIOS), a serial console, and a cloud-init drive.
+/// The shape matches what the build plays produce, because a buyer's machine
+/// is cloned from either and must not be able to tell which: UEFI and q35 (the
+/// 26.04 cloud image is UEFI-only and silently never boots under SeaBIOS), a
+/// serial console, and a cloud-init drive; for a Windows image, the template
+/// `build-template-windows.yml` makes (`TemplateShape`, `template_requests`).
 ///
 /// **Proxmox's own guard is what protects linked clones.** An earlier draft
 /// reimplemented `build-template.yml`'s ZFS origin check here; it does not
@@ -363,59 +487,24 @@ pub async fn import(
         px.wait_task(node, &upid).await?;
     }
 
-    let upid: String = px
-        .post_form(
-            &format!("/nodes/{node}/qemu"),
-            &[
-                ("vmid".to_string(), vmid.to_string()),
-                ("name".to_string(), format!("{}-{}", crate::names::PREFIX, id)),
-                ("memory".to_string(), "4096".to_string()),
-                ("cores".to_string(), "2".to_string()),
-                ("cpu".to_string(), "host".to_string()),
-                ("machine".to_string(), "q35".to_string()),
-                ("bios".to_string(), "ovmf".to_string()),
-                ("scsihw".to_string(), "virtio-scsi-single".to_string()),
-                ("ostype".to_string(), "l26".to_string()),
-                ("agent".to_string(), "enabled=1".to_string()),
-                ("net0".to_string(), "virtio,bridge=vmbr0".to_string()),
-                ("pool".to_string(), crate::names::POOL.to_string()),
-                ("description".to_string(), description(id, sha256)),
-            ],
-        )
-        .await?;
+    let [create, disk, finish] = template_requests(
+        px.template_shape(id),
+        id,
+        vmid,
+        sha256,
+        storage,
+        &artefact_volid(import_storage, id),
+        px.environment.as_deref(),
+    );
+    let upid: String = px.post_form(&format!("/nodes/{node}/qemu"), &create).await?;
     px.wait_task(node, &upid).await?;
 
     // The import itself, and the only step that moves gigabytes. Proxmox reads
     // the volume, converts it onto `storage`, and owns every part of that — we
     // do not write an image importer, we ask the one that exists.
-    let _: serde_json::Value = px
-        .put_form(
-            &format!("/nodes/{node}/qemu/{vmid}/config"),
-            &[(
-                "scsi0".to_string(),
-                format!(
-                    "{storage}:0,import-from={},discard=on,ssd=1",
-                    artefact_volid(import_storage, id)
-                ),
-            )],
-        )
-        .await?;
+    let _: serde_json::Value = px.put_form(&format!("/nodes/{node}/qemu/{vmid}/config"), &disk).await?;
 
-    let _: serde_json::Value = px
-        .put_form(
-            &format!("/nodes/{node}/qemu/{vmid}/config"),
-            &[
-                (
-                    "efidisk0".to_string(),
-                    format!("{storage}:0,efitype=4m,pre-enrolled-keys=0"),
-                ),
-                ("ide2".to_string(), format!("{storage}:cloudinit")),
-                ("boot".to_string(), "order=scsi0".to_string()),
-                ("serial0".to_string(), "socket".to_string()),
-                ("vga".to_string(), "serial0".to_string()),
-            ],
-        )
-        .await?;
+    let _: serde_json::Value = px.put_form(&format!("/nodes/{node}/qemu/{vmid}/config"), &finish).await?;
 
     let _: serde_json::Value =
         px.post_form(&format!("/nodes/{node}/qemu/{vmid}/template"), &[] as &[(String, String)]).await?;
@@ -513,6 +602,134 @@ mod tests {
             assert!(result.is_ok() && deleted, "this image's own {why} template was not replaced: {result:?}");
         }
     }
+    /// Every call an import makes against a hypervisor with nothing at the
+    /// vmid, for a client of the given Windows ids and environment: the
+    /// merged form values, and whether the template flag was set.
+    async fn imported(
+        windows: &[&str],
+        environment: Option<&str>,
+        id: &str,
+    ) -> (std::collections::BTreeMap<String, String>, bool) {
+        use crate::pvemock::{task_ok, Mock};
+        let mock = Mock::start(move |method, path, _| {
+            if let Some(ok) = task_ok(path) {
+                return ok;
+            }
+            match (method, path) {
+                ("GET", "/nodes/n1/qemu/9005/config") => (404, serde_json::Value::Null),
+                ("POST", _) => (200, serde_json::json!("UPID:n1:post")),
+                ("GET", _) | ("PUT", _) => (200, serde_json::json!({})),
+                _ => (404, serde_json::Value::Null),
+            }
+        })
+        .await;
+        let px = mock
+            .client()
+            .with_windows_images(windows.iter().map(|s| s.to_string()).collect())
+            .with_environment(environment.map(str::to_string));
+        super::import(&px, "n1", "local-zfs", "onv-snippets", id, 9005, A).await.expect("the import");
+        let calls = mock.calls.lock().unwrap().clone();
+        let mut merged = std::collections::BTreeMap::new();
+        for c in calls.iter().filter(|c| {
+            (c.method == "POST" && c.path == "/nodes/n1/qemu") || (c.method == "PUT" && c.path == "/nodes/n1/qemu/9005/config")
+        }) {
+            let pairs: Vec<(String, String)> =
+                reqwest::Url::parse(&format!("http://x/?{}", c.body)).unwrap().query_pairs().into_owned().collect();
+            for (k, v) in pairs {
+                assert!(merged.insert(k.clone(), v).is_none(), "{k} was set twice");
+            }
+        }
+        let templated = calls.iter().any(|c| c.method == "POST" && c.path == "/nodes/n1/qemu/9005/template");
+        (merged, templated)
+    }
+
+    /// **The Windows template the mirror makes is the one the build play
+    /// makes** (omnuv's build-template-windows.yml, through the fixture both
+    /// repositories read): every key the fixture names, at its value, and no
+    /// key it does not, beyond the vmid and the per-clone size.
+    #[tokio::test]
+    async fn the_windows_import_is_the_build_plays_template() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/windows/template.json")).expect("the fixture parses");
+        let id = "windows-11-gaming";
+        let (got, templated) = imported(&[id], Some("prod"), id).await;
+        assert!(templated, "never made a template");
+        let fill = |v: &str| {
+            v.replace("{id}", id)
+                .replace("{storage}", "local-zfs")
+                .replace("{import}", &artefact_volid("onv-snippets", id))
+                .replace("{environment}", "prod")
+        };
+        let want = fixture["template"].as_object().expect("a template");
+        for (k, v) in want {
+            let v = fill(v.as_str().expect("a string"));
+            let have = got.get(k).unwrap_or_else(|| panic!("{k} is not set; the build play sets it to {v}"));
+            if k == "description" {
+                // What `is_this_images_template` reads: the first line opens
+                // with the whole id, whatever follows it.
+                assert!(have.lines().next().is_some_and(|l| l.starts_with(&v)), "the description's first line: {have}");
+            } else {
+                assert_eq!(have, &v, "{k}");
+            }
+        }
+        let per_clone: Vec<&str> = fixture["per_clone"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        for k in got.keys() {
+            assert!(
+                want.contains_key(k) || per_clone.contains(&k.as_str()) || k == "vmid",
+                "{k} is set by the mirror and not by the build play"
+            );
+        }
+        for k in fixture["absent"].as_array().unwrap().iter().filter_map(|v| v.as_str()) {
+            assert!(!got.contains_key(k), "{k} is on the template: no clone may share it");
+        }
+        // The digest the mirror is held to, on the template itself.
+        assert_eq!(digest_in(&got["description"]).as_deref(), Some(A));
+    }
+
+    /// The Linux shape is unchanged by Windows existing, and an environment
+    /// is a tag on either, never a claim.
+    #[tokio::test]
+    async fn a_linux_import_keeps_the_linux_shape() {
+        let (got, templated) = imported(&["windows-11-gaming"], None, "ubuntu-26.04").await;
+        assert!(templated);
+        assert_eq!(got["ostype"], "l26");
+        assert_eq!(got["efidisk0"], "local-zfs:0,efitype=4m,pre-enrolled-keys=0");
+        assert_eq!(got["vga"], "serial0");
+        assert_eq!(got["scsi0"], "local-zfs:0,import-from=onv-snippets:import/ubuntu-26.04.qcow2,discard=on,ssd=1");
+        assert!(!got.contains_key("citype") && !got.contains_key("tags"), "{got:?}");
+        let (got, _) = imported(&[], Some("test"), "ubuntu-26.04").await;
+        assert_eq!(got["tags"], "onv-test");
+        assert!(super::is_this_images_template(
+            &serde_json::json!({"name": got["name"], "template": 1, "description": got["description"], "tags": got["tags"]}),
+            "ubuntu-26.04"
+        ), "the environment's tag made the mirror's own template unrecognisable");
+    }
+
+    /// **A template is held only in the shape configured for its id**: a
+    /// Windows image imported as Linux (a provider whose `windowsImages`
+    /// missed it) is not held, so the next pass imports it again; and the
+    /// reverse.
+    #[tokio::test]
+    async fn a_template_is_held_only_in_its_shape() {
+        use crate::pvemock::Mock;
+        let held_with = |ostype: &'static str, windows: &'static [&'static str]| async move {
+            let mock = Mock::start(move |method, path, _| match (method, path) {
+                ("GET", "/nodes/n1/qemu/9005/config") => (200, serde_json::json!({
+                    "template": 1, "ostype": ostype, "name": "onv-windows-11-gaming",
+                    "description": super::description("windows-11-gaming", A)})),
+                _ => (404, serde_json::Value::Null),
+            })
+            .await;
+            let px = mock.client().with_windows_images(windows.iter().map(|s| s.to_string()).collect());
+            let offered = std::collections::BTreeMap::from([("windows-11-gaming".to_string(), 9005u32)]);
+            super::held(&px, "n1", &offered).await
+        };
+        assert_eq!(held_with("win11", &["windows-11-gaming"]).await.len(), 1, "the right shape was not held");
+        assert!(held_with("l26", &["windows-11-gaming"]).await.is_empty(), "a Linux-shaped Windows template was held");
+        assert!(held_with("win11", &[]).await.is_empty(), "a Windows-shaped template held for a Linux id");
+        assert_eq!(held_with("l26", &[]).await.len(), 1, "a Linux template stopped being held");
+    }
+
     /// The guard alone, for what `import`'s own "a machine, not a template"
     /// check would otherwise hide: our words on a machine are not a template.
     #[test]

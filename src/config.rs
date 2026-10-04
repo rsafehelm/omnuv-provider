@@ -225,6 +225,26 @@ proxmox:
         assert!(super::load_agent(path.to_str().unwrap()).is_ok(), "the default must still load");
     }
 
+    /// `windowsImages` names offered images only: a stray id is refused at
+    /// load, and an offered one loads as a Windows shape.
+    #[test]
+    fn a_windows_image_must_be_one_the_provider_offers() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("agent.yaml");
+        let body = |windows: &str| format!(
+            "core:\n  url: https://api.omnuv.com\n  token: t\nproxmox:\n  apiUrl: https://127.0.0.1:8006\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  images:\n    ubuntu-26.04: 9000\n    windows-11-gaming: 9005\n  windowsImages: [{windows}]\n"
+        );
+        std::fs::write(&path, body("windows-11-gamin")).unwrap();
+        let refused = super::load_agent(path.to_str().unwrap()).expect_err("a stray Windows id loaded");
+        assert!(refused.to_string().contains("windowsImages names windows-11-gamin"), "{refused}");
+        std::fs::write(&path, body("windows-11-gaming")).unwrap();
+        let cfg = super::load_agent(path.to_str().unwrap()).expect("an offered Windows id must load");
+        assert!(cfg.proxmox.windows_images.contains("windows-11-gaming"));
+        // Unset is every image Linux, as before the key existed.
+        std::fs::write(&path, body("").replace("  windowsImages: []\n", "")).unwrap();
+        assert!(super::load_agent(path.to_str().unwrap()).unwrap().proxmox.windows_images.is_empty());
+    }
+
     #[test]
     fn debug_on_the_agent_config_redacts_both_credentials() {
         let cfg: super::AgentConfig = serde_yaml_ng::from_str(
@@ -533,6 +553,20 @@ pub struct ProxmoxRuntime {
     /// and a licensed template, nothing more.
     #[serde(default)]
     pub images: std::collections::BTreeMap<String, u32>,
+    /// **Which of `images` are Windows images**, so the mirror imports each
+    /// into a template of the shape `build-template-windows.yml` gives it
+    /// (`images::TemplateShape`). Written by deploy-agent.yml from omnuv's
+    /// `onv_windows_templates`, the list that play builds from. An id here
+    /// that `images` does not offer is refused at load.
+    ///
+    /// **Here, because the catalogue entry does not say.** The OS family
+    /// reaches the agent in `ImageSpec`, attached to a machine; the artefact a
+    /// mirror fetches is bytes and a digest (`omnuv_protocol::ImageArtefact`).
+    /// A Windows id missing here is mirrored in the Linux shape, and `held`
+    /// then reports it held only while its template's `ostype` agrees with
+    /// this list, so correcting the list makes the next pass import it again.
+    #[serde(default)]
+    pub windows_images: std::collections::BTreeSet<String>,
     /// Where the agent writes cloud-init user-data. Must be a Proxmox storage
     /// with `snippets` content, owned by the agent's user.
     #[serde(default = "default_snippet_dir")]
@@ -679,6 +713,17 @@ pub fn load_agent_with(path: &str, secrets: &str) -> anyhow::Result<AgentConfig>
         anyhow::ensure!(secs > 0, "{path}: inventoryEverySecs is 0; it must be at least 1");
         cfg.timings.inventory_every = crate::dur::Dur::secs(secs);
     }
+
+    // A Windows image the provider does not offer would be a shape for a
+    // template that is never mirrored: a typo, said rather than ignored.
+    let offered = cfg.proxmox.image_map();
+    let strays: Vec<&str> =
+        cfg.proxmox.windows_images.iter().filter(|id| !offered.contains_key(*id)).map(String::as_str).collect();
+    anyhow::ensure!(
+        strays.is_empty(),
+        "{path} refused: proxmox.windowsImages names {} that proxmox.images does not offer",
+        strays.join(", ")
+    );
 
     cfg.timings
         .check()
