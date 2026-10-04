@@ -531,7 +531,8 @@ fn network_config(spec: &InstanceSpec, vmid: u32) -> String {
 }
 
 fn cloud_init(spec: &InstanceSpec, apt_mirror: Option<&str>, vmid: u32) -> String {
-    // Written before `packages:` so cloud-init rewrites sources.list first.
+    // Written before anything installs, so cloud-init rewrites sources.list
+    // first: the guest agent's fallback install and a recipe's use it.
     // Empty when the provider has not named one, which leaves the image's own
     // default — correct for a provider who has not been asked yet, and slow
     // where the default pool is slow.
@@ -579,9 +580,7 @@ users:
 # Applies to the default user.
 ssh_authorized_keys:
 {top}
-{password}{apt}packages:
-  - qemu-guest-agent
-{recipe_files}# The marketplace network is configured in bootcmd, which cloud-init runs in
+{password}{apt}{recipe_files}# The marketplace network is configured in bootcmd, which cloud-init runs in
 # the init stage on EVERY boot — before the config stage where apt runs, and
 # unlike runcmd, which runs only once. A slow first-boot apt used to leave the
 # private network unconfigured forever; here it comes up regardless.
@@ -591,10 +590,14 @@ bootcmd:
   # it is a deadlock that looks like a boot stuck at cloud-init-network.
   - [ sh, -c, "systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true" ]
 {recipe_boot}{network}
-# runcmd is the final stage, after packages: the agent is installed by then.
-# Networking already ran in bootcmd, so a slow apt here delays nothing.
+# The guest agent is baked into every template (build-template.yml), so apt
+# runs only for an image that lacks it. It was `packages: [qemu-guest-agent]`,
+# which makes cloud-init run `apt-get update` first even when the package is
+# already there: 8.0 s of every first boot, measured on an Ollama install on
+# production on 4 October 2026, for a no-op install. Networking already ran
+# in bootcmd, so an apt here, on an older image, delays nothing else.
 runcmd:
-  - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
+  - [ sh, -c, "command -v qemu-ga >/dev/null 2>&1 || {{ apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent; }}; systemctl enable --now qemu-guest-agent || true" ]
 {recipe_join}{overlay}{network_final}{recipe_final}"#,
         apt = apt,
         name = guest_hostname(spec),
@@ -4351,6 +4354,25 @@ echo 'single' "double" `backtick` \$escaped
         assert!(steps.iter().any(|s| s.contains("docker")
             || s.contains("nvidia")
             || s.contains("APPS")));
+    }
+
+    /// **No apt at first boot for an image that has the guest agent.**
+    /// `packages:` made cloud-init run `apt-get update` before a no-op install:
+    /// 8.0 s of every first boot (an Ollama install on production, 4 October
+    /// 2026). The agent is installed only where `qemu-ga` is missing, and
+    /// started either way, before anything else runcmd does.
+    #[test]
+    fn the_guest_agent_costs_no_apt_run_when_the_image_has_it() {
+        for ci in [cloud_init(&spec(), None, 103), cloud_init(&spec_with_network(), Some("http://mirrors.up.pt/ubuntu"), 103)] {
+            let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&ci).expect("valid YAML");
+            assert!(doc.get("packages").is_none(), "a packages: list runs apt-get update on every first boot");
+            assert!(doc.get("package_update").is_none() && doc.get("package_upgrade").is_none());
+            let first = doc["runcmd"][0][2].as_str().expect("runcmd's first entry is a shell line");
+            let (guard, rest) = first.split_once(" || ").expect("the install is guarded");
+            assert_eq!(guard, "command -v qemu-ga >/dev/null 2>&1");
+            assert!(rest.starts_with("{ apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent; };"));
+            assert!(first.ends_with("systemctl enable --now qemu-guest-agent || true"));
+        }
     }
 
     /// The bug this whole fix exists for: the marketplace address must be set in
