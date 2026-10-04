@@ -1,0 +1,9 @@
+[Unit]
+Description=Omnuv: fetch this machine's project web certificate from Core
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/onv/certificate/pull.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/onv-certificate

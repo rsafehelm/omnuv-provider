@@ -1,0 +1,13 @@
+[Unit]
+Description=Omnuv: ask Core for this machine's project web certificate
+
+[Timer]
+# Soon after boot, then every fifteen minutes: a certificate is issued some
+# minutes after the machine asks first, and a renewal is picked up within the
+# quarter hour. An unchanged one costs a 204.
+OnBootSec=1min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+
+[Install]
+WantedBy=timers.target

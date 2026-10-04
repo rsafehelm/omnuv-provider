@@ -77,7 +77,13 @@ if want package; then
 step "Maintainer scripts and the build script pass shellcheck"
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm packaging/deb/DEBIAN/postrm \
-    packaging/build-deb.sh packaging/check.sh
+    packaging/build-deb.sh packaging/check.sh src/guest/onv-certificate.sh
+
+# The script a web machine runs to fetch its project's certificate rides in
+# its first-boot data, so this package never installs it: it is run instead,
+# against a fake Core over TLS, every case of it (tests/guest/).
+step "The guest's certificate fetch, run against a fake Core"
+python3 tests/guest/onv_certificate_test.py
 
 step "Build the package as a release is built"
 ONV_PACKAGE_OUT="$out" ./packaging/build-deb.sh
