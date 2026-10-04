@@ -59,24 +59,49 @@ fn description(id: &str, sha256: &str) -> String {
     )
 }
 
-/// Whether a VM's configuration is a template the marketplace built, mirrored
-/// or by `build-template.yml`, in either generation of wording ("Omnuv" or
-/// "Onv" marketplace base image). Loose on the wording for the reason
-/// `destroy-templates.yml` gives; strict on being a template at all.
-pub fn is_marketplace_template(cfg: &serde_json::Value) -> bool {
-    cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1)
-        && cfg
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|d| d.contains("marketplace base image"))
+/// Whether a VM's configuration is **this image's template and nothing else's**
+/// (the assets-by-id audit of 3 October 2026): the only thing an import may
+/// destroy to make room. The test it replaced answered "ours at all", and
+/// an import used it, so the template of another image at a vmid the
+/// configuration names for this one, or an operator's template described in
+/// our words, was destroyed for an import. (That looser test, "a template
+/// whose description says marketplace base image", is still the one
+/// `destroy-templates.yml` applies, on purpose: a removal must not refuse.)
+///
+/// ```text
+/// a template                      a machine is never retired for an image
+/// no claim tag                    a buyer's or a worker's guest is not a template of ours
+/// named onv-…                     everything the marketplace creates is; an operator's is not
+/// first line names this whole id  "Onv marketplace base image - <id>.", which the
+///                                 mirror and build-template.yml both write
+/// ```
+///
+/// The name is checked by prefix, not as `onv-<id>`: `build-template.yml`
+/// names its templates for people (`onv-ubuntu-2604-gaming` holds
+/// `ubuntu-26.04-gaming`), so the description's whole id is the identity and
+/// the name only says the marketplace made it. A template whose description
+/// names no id — the first wording, "Omnuv marketplace base image - Ubuntu
+/// 26.04 cloud-init." — cannot be proved to be this image and is refused.
+pub fn is_this_images_template(cfg: &serde_json::Value, id: &str) -> bool {
+    let text = |k: &str| cfg.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let a_template = cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1);
+    let our_name = text("name").starts_with(&format!("{}-", crate::names::PREFIX));
+    let this_id = text("description")
+        .lines()
+        .next()
+        .is_some_and(|l| l.trim_end().starts_with(&format!("Onv marketplace base image - {id}.")));
+    let claimed = text("tags").split(&[';', ','][..]).map(str::trim).any(|t| {
+        [crate::names::TAG_INSTANCE, crate::names::TAG_WORKER, crate::names::TAG_GATEWAY, crate::names::TAG_SCRUB]
+            .contains(&t)
+    }) || crate::instance::is_legacy_marketplace_tag(text("tags"));
+    a_template && our_name && this_id && !claimed
 }
 
 /// Whether a guest at this image's vmid is **this import's own unfinished
 /// work** (PROVIDER-9): created with the name and description the mirror gives
 /// this image, never made a template, carrying no claim. The import is five
 /// calls and a template flag is the last of them; a failure anywhere in
-/// between left a guest that `is_marketplace_template` rightly refuses to call
-/// a template, and so every later retry refused with "is a machine, not a
+/// between left a guest that is rightly refused as "not a template", and so every later retry refused with "is a machine, not a
 /// template" — the mirror wedged on its own debris for ever.
 ///
 /// Strict on purpose, because the answer licenses a destroy. Anything short of
@@ -323,14 +348,16 @@ pub async fn import(
             ours_unfinished || cfg.get("template").and_then(serde_json::Value::as_u64) == Some(1),
             "vmid {vmid} on {node} is a machine, not a template — refusing to import over it"
         );
-        // **A template, and ours.** Being a template was the only check, so an
-        // operator's own template at a vmid the configuration names would have
-        // been destroyed. Ours say so in their description, in the words the
-        // mirror and `build-template.yml` both write, the same test
-        // `destroy-templates.yml` applies before it destroys one.
+        // **A template, and this image's.** Being a template was once the only
+        // check, so an operator's own template at a vmid the configuration
+        // names would have been destroyed; then "the marketplace's", so
+        // another image's template was. Now the whole catalogue id its
+        // description names, on a template named by the marketplace and
+        // carrying no claim (`is_this_images_template`).
         anyhow::ensure!(
-            ours_unfinished || is_marketplace_template(&cfg),
-            "vmid {vmid} on {node} is a template the marketplace did not build — refusing to import over it"
+            ours_unfinished || is_this_images_template(&cfg, id),
+            "vmid {vmid} on {node} is not this image's template ({id}): its name, description or tags say \
+             another image's, an operator's or a claimed guest's — refusing to import over it"
         );
         let upid: String = px.delete_task(&format!("/nodes/{node}/qemu/{vmid}?purge=1")).await?;
         px.wait_task(node, &upid).await?;
@@ -458,25 +485,45 @@ mod tests {
         let operators = serde_json::json!({"name": "db-1", "template": 0, "description": "production database"});
         let (result, deleted) = run(operators, "stopped").await;
         assert!(result.is_err() && !deleted, "an operator's machine was destroyed for an import");
-    }
-    use super::is_marketplace_template;
-    use serde_json::json;
 
-    #[test]
-    fn only_a_marketplace_template_is_replaced() {
-        for ours in [
-            "Onv marketplace base image - ubuntu-26.04. Mirrored by the provider agent",
-            "Omnuv marketplace base image - Ubuntu 26.04 cloud-init. Managed by Ansible; do not edit.",
+        // **Only this image's template is retired** (the assets-by-id audit):
+        // a template of another image at this vmid, or one in our words that
+        // the marketplace did not name or that carries a claim, is refused.
+        let template = |name: &str, description: String, tags: &str| {
+            serde_json::json!({"name": name, "template": 1, "description": description, "tags": tags})
+        };
+        for (why, cfg) in [
+            ("another image's", template("onv-ubuntu-2604-gaming", super::description("ubuntu-26.04-gaming", "old"), "")),
+            ("an id this one prefixes", template("onv-ubuntu-2604", super::description("ubuntu-2604-nvidia", "old"), "")),
+            ("an operator's in our words", template("golden", super::description("ubuntu-2604", "old"), "")),
+            ("a claimed guest's", template("onv-ubuntu-2604", super::description("ubuntu-2604", "old"), "onv-instance;onv-0a0b0c0d0e0f")),
+            ("the first wording, naming no id", template("onv-ubuntu-2604",
+                "Omnuv marketplace base image - Ubuntu 26.04 cloud-init. Managed by Ansible; do not edit.".into(), "")),
+            ("an operator's", template("golden", "my golden image".into(), "")),
         ] {
-            assert!(is_marketplace_template(&json!({"template": 1, "description": ours})), "{ours}");
+            let (result, deleted) = run(cfg, "stopped").await;
+            assert!(result.is_err() && !deleted, "{why} template was destroyed for this import: {result:?}");
         }
-        // Negative: an operator's template, a template with no description, and
-        // our wording on something that is not a template.
-        assert!(!is_marketplace_template(&json!({"template": 1, "description": "my golden image"})));
-        assert!(!is_marketplace_template(&json!({"template": 1})));
-        assert!(!is_marketplace_template(
-            &json!({"template": 0, "description": "Onv marketplace base image - x"})
-        ));
+        for (why, cfg) in [
+            ("mirrored", template("onv-ubuntu-2604", super::description("ubuntu-2604", "old"), "")),
+            ("built by build-template.yml", template("onv-ubuntu-2604-built",
+                "Onv marketplace base image - ubuntu-2604.\nBuilt on this host by build-template.yml; do not edit.\n\nonv-artefact-sha256: old".into(), "onv-prod")),
+        ] {
+            let (result, deleted) = run(cfg, "stopped").await;
+            assert!(result.is_ok() && deleted, "this image's own {why} template was not replaced: {result:?}");
+        }
+    }
+    /// The guard alone, for what `import`'s own "a machine, not a template"
+    /// check would otherwise hide: our words on a machine are not a template.
+    #[test]
+    fn this_images_template_is_a_template() {
+        let cfg = |template: u64| {
+            serde_json::json!({"name": "onv-ubuntu-2604", "template": template,
+                               "description": super::description("ubuntu-2604", "ab12")})
+        };
+        assert!(super::is_this_images_template(&cfg(1), "ubuntu-2604"));
+        assert!(!super::is_this_images_template(&cfg(0), "ubuntu-2604"), "a machine was taken for a template");
+        assert!(!super::is_this_images_template(&cfg(1), "ubuntu-26"), "a prefix of the id was taken for it");
     }
 
     /// A partial for an id still being fetched survives, a partial for any

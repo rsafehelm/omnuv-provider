@@ -1021,15 +1021,34 @@ impl Client {
     /// a clean one, and "could not look" must never look like "nothing there".
     /// Offline nodes are outside `placement_nodes` and so outside this survey;
     /// a guest there is reported when its node comes back.
+    ///
+    /// **A guest carrying a claim is read for its stamp** (the assets-by-id
+    /// audit of 3 October 2026): the tag holds twelve hex digits of the id,
+    /// and the comparison is by the whole id the clone stamped
+    /// (`names::stamped`). One configuration read per claimed guest per pass;
+    /// one that cannot be read fails the survey like a node that cannot be
+    /// listed, since an unread stamp proves nothing either way.
     pub(crate) async fn guests(&self) -> anyhow::Result<Vec<crate::survey::ClaimedGuest>> {
         let mut out = Vec::new();
         for node in self.placement_nodes().await? {
             let vms: Vec<VmEntry> = self.get(&format!("/nodes/{node}/qemu")).await?;
-            out.extend(vms.into_iter().map(|v| crate::survey::ClaimedGuest {
-                node: node.clone(),
-                vmid: v.vmid,
-                tags: v.tags.unwrap_or_default(),
-            }));
+            for v in vms {
+                let tags = v.tags.unwrap_or_default();
+                let stamp = if crate::survey::claim_of(&tags).is_some() {
+                    let config: serde_json::Value = self
+                        .get(&format!("/nodes/{node}/qemu/{}/config", v.vmid))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("vm {} on {node}: its stamp could not be read: {e}", v.vmid))?;
+                    config
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .and_then(|d| d.lines().next())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                out.push(crate::survey::ClaimedGuest { node: node.clone(), vmid: v.vmid, tags, stamp });
+            }
         }
         Ok(out)
     }

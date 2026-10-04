@@ -53,9 +53,14 @@ pub(crate) fn vnet_candidates(network_id: &str) -> Vec<String> {
 
 /// Which segment a network has or gets, among the vnets the cluster reports:
 /// the one whose alias is this network, wherever it sits; else the first free
-/// candidate name. A vnet with no alias is adopted only under the first name,
-/// the one a segment from before the alias would have. `Err` names the
-/// networks holding every candidate.
+/// candidate name. **A vnet with no alias is never joined** (the assets-by-id
+/// audit of 3 October 2026): its name carries five hex digits of some
+/// network's id, and adopting it under the first name put this network on
+/// whatever bridge another network with those five digits had made before the
+/// alias existed. It is passed over like a held name; an unused one is the
+/// reaper's (`reap_unused_segments`). Measured that day: no buyer segment on
+/// any provider lacked its alias, so nothing in the estate was adopted. `Err`
+/// names the networks holding every candidate.
 pub(crate) fn choose(vnets: &[serde_json::Value], network_id: &str) -> Result<(String, Segment), Vec<String>> {
     if let Some(v) = vnets.iter().find(|v| {
         v["alias"].as_str().map(str::trim) == Some(network_id)
@@ -65,11 +70,10 @@ pub(crate) fn choose(vnets: &[serde_json::Value], network_id: &str) -> Result<(S
     }
     let candidates = vnet_candidates(network_id);
     let mut owners = Vec::new();
-    for (i, name) in candidates.iter().enumerate() {
+    for name in &candidates {
         match segment(vnets.iter().find(|v| v["vnet"] == name.as_str()), network_id) {
             Segment::Create => return Ok((name.clone(), Segment::Create)),
-            Segment::Adopt if i == 0 => return Ok((name.clone(), Segment::Adopt)),
-            Segment::Adopt => owners.push(format!("{name} (no alias)")),
+            Segment::Unowned => owners.push(format!("{name} (no alias: whose it is cannot be read)")),
             Segment::Collision(owner) => owners.push(format!("{name} ({owner})")),
             // An alias naming this network was found above.
             Segment::Ready | Segment::Pending => {}
@@ -102,8 +106,8 @@ fn bridges_of(cfg: &serde_json::Value) -> Vec<String> {
 /// share those bits get the same name, and reusing a vnet by name alone would
 /// put two tenants on one bridge without a word. So the vnet records the whole
 /// network id in its `alias`, and a vnet whose alias names another network is
-/// refused rather than joined. A vnet with no alias predates this and is
-/// adopted: nothing can say whose it was, which is no worse than before.
+/// refused rather than joined. A vnet with no alias predates this, and nothing
+/// can say whose it was, so it is refused too.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Segment {
     /// No vnet of that name: create it, with the alias.
@@ -112,8 +116,8 @@ pub(crate) enum Segment {
     Ready,
     /// Ours, with a change still pending: apply.
     Pending,
-    /// Ours by name only, from before the alias: write the alias, then apply.
-    Adopt,
+    /// No alias, so nobody's that can be proved: never joined.
+    Unowned,
     /// Another network's segment. Carries that network's id.
     Collision(String),
 }
@@ -122,7 +126,7 @@ pub(crate) fn segment(existing: Option<&serde_json::Value>, network_id: &str) ->
     let Some(v) = existing else { return Segment::Create };
     match v.get("alias").and_then(|a| a.as_str()).map(str::trim).filter(|a| !a.is_empty()) {
         Some(owner) if owner != network_id => Segment::Collision(owner.to_string()),
-        None => Segment::Adopt,
+        None => Segment::Unowned,
         Some(_) if v.get("state").is_some() => Segment::Pending,
         Some(_) => Segment::Ready,
     }
@@ -148,14 +152,7 @@ impl Client {
         match found {
             Segment::Ready if self.vnet_available(node, vnet).await? => return Ok(vnet.to_string()),
             Segment::Ready | Segment::Pending => {}
-            Segment::Collision(_) => unreachable!("choose never returns a collision"),
-            Segment::Adopt => {
-                self.put_form::<Option<serde_json::Value>>(
-                    &format!("/cluster/sdn/vnets/{vnet}"),
-                    &[("alias".to_string(), network_id.to_string())],
-                )
-                .await?;
-            }
+            Segment::Collision(_) | Segment::Unowned => unreachable!("choose returns only a segment of this network or a free name"),
             Segment::Create => {
                 self.post_form::<Option<serde_json::Value>>(
                     "/cluster/sdn/vnets",
@@ -319,11 +316,19 @@ mod tests {
         let body = taken.body_of("POST", "/cluster/sdn/vnets").expect("a vnet was created");
         assert!(body.contains(&format!("vnet={}", names[1])) && body.contains(&format!("alias={net}")), "{body}");
         assert!(!taken.called("PUT", "/cluster/sdn/vnets/onvc4d90"), "the other network's segment was written to");
+
+        // **An unaliased vnet under the first name is not joined** (the
+        // assets-by-id audit): its five digits may be another network's, and
+        // writing this network's alias onto it put both on one bridge.
+        let unaliased = Mock::start(route(json!([{"vnet": "onvc4d90", "zone": "onv"}]), names.clone())).await;
+        let got = unaliased.client().ensure_vnet("n1", net).await.expect("placed under another name");
+        assert_eq!(got, names[1], "an unaliased vnet was joined by five digits of the id");
+        assert!(!unaliased.called("PUT", "/cluster/sdn/vnets/onvc4d90"), "this network's alias was written onto it");
     }
 
     /// The choice itself: this network's alias wins wherever it sits, a taken
-    /// name is passed over, an unaliased vnet is adopted only under the first
-    /// name, and every name held is an error that names the holders.
+    /// name is passed over, an unaliased vnet is never joined under any name,
+    /// and every name held is an error that names the holders.
     #[test]
     fn a_network_finds_its_segment_by_alias_and_takes_the_first_free_name() {
         let net = "c4d90fd2-be3d-4225-a4a6-265138a76e49";
@@ -336,7 +341,8 @@ mod tests {
         let mine_elsewhere = json!({"vnet": names[2], "zone": "onv", "alias": net});
         assert_eq!(choose(&[held.clone(), mine_elsewhere], net), Ok((names[2].clone(), Segment::Ready)));
         assert_eq!(choose(std::slice::from_ref(&held), net), Ok((names[1].clone(), Segment::Create)));
-        assert_eq!(choose(&[json!({"vnet": "onvc4d90", "zone": "onv"})], net), Ok(("onvc4d90".into(), Segment::Adopt)));
+        assert_eq!(choose(&[json!({"vnet": "onvc4d90", "zone": "onv"})], net), Ok((names[1].clone(), Segment::Create)),
+                   "an unaliased vnet under the first name was joined");
         let unaliased_second = json!({"vnet": names[1], "zone": "onv"});
         assert_eq!(choose(&[held.clone(), unaliased_second], net), Ok((names[2].clone(), Segment::Create)),
                    "an unaliased vnet under a later name was adopted");
@@ -420,8 +426,8 @@ mod tests {
         assert_eq!(segment(Some(&ours), other), Segment::Collision(net.to_string()));
         // From before the alias, as `onvaca8e` on the test cluster is today.
         let legacy = json!({"vnet": "onvc4d90", "zone": "onv"});
-        assert_eq!(segment(Some(&legacy), net), Segment::Adopt);
-        assert_eq!(segment(Some(&json!({"vnet": "onvc4d90", "alias": " "})), net), Segment::Adopt);
+        assert_eq!(segment(Some(&legacy), net), Segment::Unowned);
+        assert_eq!(segment(Some(&json!({"vnet": "onvc4d90", "alias": " "})), net), Segment::Unowned);
     }
 
     #[test]

@@ -16,7 +16,10 @@
 //! Three answers, on the checks channel the report already carries:
 //!
 //! ```text
-//! guest.unclaimed   fail      one per guest, subject = its key tag
+//! guest.unclaimed   fail      one per guest, subject = its key tag (the
+//!                             hypervisor's handle, which Core's unknown_guests
+//!                             and adopt-unknown.yml key on); compared by the
+//!                             whole id its stamp names, never by the tag
 //! guests.surveyed   pass      the listing worked; says how many were compared
 //! guests.surveyed   unknown   the listing failed — could not look, which is
 //!                             never the same as nothing there
@@ -30,6 +33,17 @@ pub struct ClaimedGuest {
     pub node: String,
     pub vmid: u32,
     pub tags: String,
+    /// The first line of its description, read only for a guest carrying a
+    /// claim: the clone's stamp, naming the whole id (`names::stamped`).
+    pub stamp: Option<String>,
+}
+
+/// The claim a guest's tags carry, of the two this survey compares.
+pub fn claim_of(tags: &str) -> Option<&'static str> {
+    let tokens: Vec<&str> = tags.split(&[';', ','][..]).map(str::trim).collect();
+    [crate::names::TAG_INSTANCE, crate::names::TAG_WORKER]
+        .into_iter()
+        .find(|c| tokens.contains(c))
 }
 
 /// The checks this survey contributes to a report.
@@ -46,15 +60,19 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
             }];
         }
     };
-    let wanted: Vec<(&str, String)> = desired
+    // **By the whole id** (the assets-by-id audit of 3 October 2026): a
+    // guest is asked for when its stamp names a machine Core asked for under
+    // its claim. Twelve hex digits in a tag matched a twin as well — a guest
+    // made for another id that shares them — and hid it from this survey.
+    let wanted: Vec<String> = desired
         .instances
         .iter()
-        .map(|s| (crate::names::TAG_INSTANCE, crate::names::short_tag(&s.id)))
+        .map(|s| crate::names::stamped(crate::names::TAG_INSTANCE, &s.id))
         .chain(
             desired
                 .inference_workers
                 .iter()
-                .map(|s| (crate::names::TAG_WORKER, crate::names::short_tag(&s.id))),
+                .map(|s| crate::names::stamped(crate::names::TAG_WORKER, &s.id)),
         )
         .collect();
 
@@ -62,10 +80,7 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
     let (mut compared, mut older) = (0usize, 0usize);
     for g in guests {
         let tokens: Vec<&str> = g.tags.split(&[';', ','][..]).map(str::trim).collect();
-        let claim = [crate::names::TAG_INSTANCE, crate::names::TAG_WORKER]
-            .into_iter()
-            .find(|c| tokens.contains(c));
-        let Some(claim) = claim else {
+        let Some(claim) = claim_of(&g.tags) else {
             // An earlier generation's claim cannot be keyed against this
             // desired state. Counted and said, rather than compared wrongly.
             if crate::instance::is_legacy_marketplace_tag(&g.tags) {
@@ -74,9 +89,9 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
             continue;
         };
         compared += 1;
-        let asked_for = wanted
-            .iter()
-            .any(|(kind, key)| *kind == claim && tokens.contains(&key.as_str()));
+        // The stamp's words name the kind too ("Omnuv instance <id>"), so a
+        // worker's stamp never matches an instance Core asked for.
+        let asked_for = g.stamp.as_deref().is_some_and(|s| wanted.iter().any(|w| w == s));
         if !asked_for {
             let key = tokens
                 .iter()
@@ -87,8 +102,11 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
                 kind: CheckKind::Presence,
                 result: CheckResult::Fail,
                 detail: Some(format!(
-                    "VM {} on {} carries the {claim} claim, and Core's desired state names no such machine",
-                    g.vmid, g.node
+                    "VM {} on {} carries the {claim} claim, and Core's desired state names no such machine \
+                     (its stamp reads {:?})",
+                    g.vmid,
+                    g.node,
+                    g.stamp.as_deref().unwrap_or("")
                 )),
                 subject: Some(key.unwrap_or_else(|| format!("vmid-{}", g.vmid))),
             });
@@ -122,7 +140,7 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
 /// every other check here.
 ///
 /// ```text
-/// instance.cloud_init   fail   one per machine whose refresh failed, subject = its key tag
+/// instance.cloud_init   fail   one per machine whose refresh failed, subject = its whole id
 /// instances.refreshed   pass   how many were refreshed, said every pass
 /// ```
 ///
@@ -164,7 +182,10 @@ impl Refreshes {
                         "this machine's first-boot drive could not be brought up to date, \
                          so a generator change has not reached it: {why}"
                     )),
-                    subject: Some(crate::names::short_tag(id)),
+                    // The whole id, never twelve digits of it (the assets-by-id
+                    // audit): Core links a subject that parses as a uuid to
+                    // the resource it names.
+                    subject: Some(id.to_string()),
                 })
             })
             .collect();
@@ -206,7 +227,12 @@ mod tests {
     }
 
     fn guest(vmid: u32, tags: &str) -> ClaimedGuest {
-        ClaimedGuest { node: "pve1".into(), vmid, tags: tags.into() }
+        ClaimedGuest { node: "pve1".into(), vmid, tags: tags.into(), stamp: None }
+    }
+
+    /// A guest as a clone for `id` leaves it: the claim's tags and its stamp.
+    fn made_for(vmid: u32, claim: &str, id: &str) -> ClaimedGuest {
+        ClaimedGuest { stamp: Some(crate::names::stamped(claim, id)), ..guest(vmid, &crate::names::tags(claim, id, Some("test"))) }
     }
 
     /// **Both directions** (gap 4). A pass where every drive refresh worked
@@ -231,7 +257,7 @@ mod tests {
         let red = store.drain();
         let failed: Vec<_> = red.iter().filter(|c| c.name == "instance.cloud_init").collect();
         assert_eq!(failed.len(), 1, "{red:?}");
-        assert_eq!(failed[0].subject.as_deref(), Some(crate::names::short_tag(GONE).as_str()));
+        assert_eq!(failed[0].subject.as_deref(), Some(GONE), "the subject is not the whole id");
         assert!(failed[0].detail.as_deref().unwrap().contains("the hypervisor said no"));
         let summary = red.iter().find(|c| c.name == "instances.refreshed").expect("a summary");
         assert_eq!(summary.result, CheckResult::Fail);
@@ -247,8 +273,8 @@ mod tests {
     #[test]
     fn a_claimed_guest_core_did_not_ask_about_is_reported_and_nothing_else_is() {
         let guests = [
-            guest(100, &crate::names::tags(crate::names::TAG_INSTANCE, ASKED, Some("test"))),
-            guest(101, &crate::names::tags(crate::names::TAG_INSTANCE, GONE, Some("test"))),
+            made_for(100, crate::names::TAG_INSTANCE, ASKED),
+            made_for(101, crate::names::TAG_INSTANCE, GONE),
             guest(102, "onv-test"),            // an environment tag is not a claim
             guest(103, ""),                    // the provider's own
             guest(104, "onv-dev;omnuv-lab"),   // a build rig
@@ -268,9 +294,38 @@ mod tests {
     /// under the other claim is not the machine Core asked for.
     #[test]
     fn a_claim_is_matched_by_its_kind_as_well_as_its_key() {
-        let guests = [guest(200, &crate::names::tags(crate::names::TAG_WORKER, ASKED, None))];
+        let guests = [made_for(200, crate::names::TAG_WORKER, ASKED)];
         let found = checks(Ok(&guests), &desired(&[ASKED]));
         assert!(found.iter().any(|c| c.name == "guest.unclaimed"), "a worker was taken for an instance: {found:?}");
+        // And an instance's tags over a worker's stamp of the same id.
+        let crossed = [ClaimedGuest { stamp: Some(crate::names::stamped(crate::names::TAG_WORKER, ASKED)),
+                                      ..made_for(201, crate::names::TAG_INSTANCE, ASKED) }];
+        let found = checks(Ok(&crossed), &desired(&[ASKED]));
+        assert!(found.iter().any(|c| c.name == "guest.unclaimed"), "a worker's stamp was taken for an instance: {found:?}");
+    }
+
+    /// **A twin is not the machine Core asked for** (the assets-by-id audit of
+    /// 3 October 2026). `TWIN` shares `ASKED`'s first twelve hex digits, so
+    /// its guest carries the same tag; only the stamp tells them apart. A
+    /// guest whose stamp is missing proves nothing and is reported too.
+    #[test]
+    fn a_guest_is_asked_for_by_its_whole_id_not_its_tag() {
+        const TWIN: &str = "3f2a1b4c-5d6e-4fff-8fff-ffffffffffff";
+        assert_eq!(crate::names::short_tag(TWIN), crate::names::short_tag(ASKED), "the fixture must share the tag");
+        let guests = [
+            made_for(100, crate::names::TAG_INSTANCE, ASKED),
+            made_for(101, crate::names::TAG_INSTANCE, TWIN),
+            ClaimedGuest { stamp: None, ..made_for(102, crate::names::TAG_INSTANCE, ASKED) },
+        ];
+        let found = checks(Ok(&guests), &desired(&[ASKED]));
+        let reported: Vec<u32> = found
+            .iter()
+            .filter(|c| c.name == "guest.unclaimed")
+            .map(|c| if c.detail.as_deref().unwrap().contains("VM 101") { 101 } else if c.detail.as_deref().unwrap().contains("VM 102") { 102 } else { 0 })
+            .collect();
+        assert_eq!(reported, [101, 102], "{found:?}");
+        assert!(found.iter().find(|c| c.detail.as_deref().unwrap_or("").contains("VM 101")).unwrap()
+            .detail.as_deref().unwrap().contains(TWIN), "the twin's report does not name the id it carries");
     }
 
     /// **Could not look is not nothing there.** A failed listing yields one
@@ -300,7 +355,7 @@ mod tests {
     /// clean pass.
     #[tokio::test]
     async fn the_survey_covers_every_node_or_says_it_could_not() {
-        let listing = |fail_second: bool| {
+        let listing = |fail_second: bool, unreadable_stamp: bool| {
             move |method: &str, path: &str, _: &str| match (method, path) {
                 ("GET", "/nodes") => (200, serde_json::json!([
                     {"node": "pve1", "status": "online"},
@@ -315,17 +370,27 @@ mod tests {
                 ("GET", "/nodes/pve2/qemu") => (200, serde_json::json!([
                     {"vmid": 200, "status": "running", "tags": "onv-worker;onv-111122223333"},
                 ])),
+                ("GET", "/nodes/pve1/qemu/100/config") => (200, serde_json::json!({
+                    "description": "Omnuv instance 0a0b0c0d-0e0f-4011-8213-141516171819\nManaged by onv-provider. Do not edit."})),
+                ("GET", "/nodes/pve2/qemu/200/config") if unreadable_stamp => (500, serde_json::json!(null)),
+                ("GET", "/nodes/pve2/qemu/200/config") => (200, serde_json::json!({})),
                 _ => (404, serde_json::json!(null)),
             }
         };
-        let mock = crate::pvemock::Mock::start(listing(false)).await;
+        let mock = crate::pvemock::Mock::start(listing(false, false)).await;
         let guests = mock.client().guests().await.expect("the survey");
         let seen: Vec<(String, u32)> = guests.iter().map(|g| (g.node.clone(), g.vmid)).collect();
         assert_eq!(seen, [("pve1".into(), 100), ("pve1".into(), 101), ("pve2".into(), 200)]);
         assert_eq!(guests[1].tags, "", "a guest with no tags is listed, untagged");
+        assert_eq!(guests[0].stamp.as_deref(), Some("Omnuv instance 0a0b0c0d-0e0f-4011-8213-141516171819"));
+        assert_eq!(guests[2].stamp, None, "a claimed guest with no description has no stamp");
+        assert!(!mock.called("GET", "/nodes/pve1/qemu/101/config"), "an unclaimed guest's configuration was read");
         assert!(!mock.called("GET", "/nodes/pve3/qemu"), "an offline node was asked");
 
-        let mock = crate::pvemock::Mock::start(listing(true)).await;
+        let mock = crate::pvemock::Mock::start(listing(true, false)).await;
         assert!(mock.client().guests().await.is_err(), "a node that could not be listed was left out silently");
+
+        let mock = crate::pvemock::Mock::start(listing(false, true)).await;
+        assert!(mock.client().guests().await.is_err(), "a claimed guest whose stamp could not be read was compared anyway");
     }
 }

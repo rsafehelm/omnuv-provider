@@ -3773,7 +3773,7 @@ mod tests {
         let checks = client.refreshes.drain();
         let failed = checks.iter().find(|c| c.name == "instance.cloud_init").expect("no check said the refresh failed");
         assert_eq!(failed.result, omnuv_protocol::CheckResult::Fail);
-        assert_eq!(failed.subject.as_deref(), Some(key.as_str()));
+        assert_eq!(failed.subject.as_deref(), Some(sp.id.as_str()), "the subject is not the whole id");
         let summary = checks.iter().find(|c| c.name == "instances.refreshed").expect("no summary");
         assert_eq!(summary.result, omnuv_protocol::CheckResult::Fail);
         assert!(client.refreshes.drain().is_empty(), "a pass's checks outlived the pass");
