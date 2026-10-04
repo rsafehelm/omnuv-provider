@@ -284,6 +284,9 @@ pub struct Client {
     /// (lifecycle phase 8, TD9; `timings.startedDestroysPerHour`). In memory:
     /// a restart forgets it, which the cap's hour absorbs.
     pub(crate) started_destroys: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>,
+    /// **The provider opening's ports** (`crate::opening`): off, and writing
+    /// nowhere, until `with_opening`.
+    pub(crate) opening: std::sync::Arc<crate::opening::Book>,
 }
 
 impl ComputeDriver for Client {
@@ -479,7 +482,14 @@ impl Client {
             timings: Default::default(),
             refreshes: Default::default(),
             started_destroys: Default::default(),
+            opening: Default::default(),
         })
+    }
+
+    /// The provider opening's book, read from its file and not yet settled.
+    pub fn with_opening(mut self, opening: crate::opening::Book) -> Self {
+        self.opening = std::sync::Arc::new(opening);
+        self
     }
 
     /// The agent's `timings`. The Workload Agents' store is rebuilt with the

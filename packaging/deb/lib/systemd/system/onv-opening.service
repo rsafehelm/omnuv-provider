@@ -1,0 +1,37 @@
+[Unit]
+Description=Omnuv provider opening: table inet onv_opening, from the agent's ports
+Documentation=https://github.com/rsafehelm/omnuv-provider
+# The provider opening (opening.rs): one UDP port of this host's public side
+# per buyer machine, off unless agent.yaml's `opening` block turns it on.
+# `apply-opening` reads that block and the ports the agent gave in
+# /var/lib/onv/opening.json, never the credentials, and replaces the table in
+# one nft transaction; off, or anything it cannot trust, removes it.
+# Started at boot, by onv-opening.path when the agent rewrites the file, and
+# by deploy-agent.yml after it writes agent.yaml.
+After=network-online.target onv-egress.service
+Wants=network-online.target
+ConditionPathExists=/etc/onv/agent.yaml
+
+[Service]
+Type=oneshot
+# Not RemainAfterExit: the path unit starts it again on each change.
+ExecStart=/usr/bin/onv-provider apply-opening --config /etc/onv/agent.yaml
+# Root, for nftables, and nothing else: netlink to the kernel, reading the
+# agent's file (owned by onv, so CAP_DAC_READ_SEARCH), writing nothing on
+# disk. Its record is this unit's journal.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_NETLINK AF_UNIX AF_INET
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# ceiling: one nft transaction of at most 1024 rule pairs, and a listing;
+# unmeasured, both are milliseconds.
+TimeoutStartSec=60s
+
+[Install]
+WantedBy=multi-user.target

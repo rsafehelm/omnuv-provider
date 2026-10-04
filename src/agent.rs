@@ -575,7 +575,9 @@ async fn runtime_checks(cfg: &AgentConfig, driver: &crate::proxmox::Client) -> V
         }),
         subject: None,
     };
-    vec![runtime, tls]
+    // The provider opening: on or off, and how many machines are opened. All
+    // Core is told of it; no port, no address (`crate::opening`).
+    vec![runtime, tls, driver.opening.check()]
 }
 
 /// A check as the start-up log prints it.
@@ -626,7 +628,9 @@ pub fn driver_of(cfg: &AgentConfig) -> anyhow::Result<proxmox::Client> {
     )?
     .with_images(cfg.proxmox.image_map())
     .with_environment(cfg.environment.clone())
-    .with_timings(cfg.timings.clone()))
+    .with_timings(cfg.timings.clone())
+    // Read, never written here: the host timer builds its driver this way too.
+    .with_opening(crate::opening::Book::load(&cfg.opening, crate::opening::file(&cfg.proxmox.snippet_dir))))
 }
 
 pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
@@ -634,6 +638,13 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // but does outlive every reconcile pass.
     let cfg = Arc::new(cfg);
     let driver = Arc::new(driver_of(&cfg)?);
+    // **The provider opening, settled at start** (`crate::opening`): off
+    // releases every port, on drops the ports outside its range, and the file
+    // is written either way so the applier converges on it. A start is how a
+    // change of the setting arrives: deploy-agent.yml restarts the agent.
+    if let Err(e) = driver.opening.settle() {
+        eprintln!("opening: not settled at start, every pass retries what it writes: {e:#}");
+    }
     let core = Core::new(&cfg.core.url, &cfg.core.token)?
         .with_restore_head(crate::restore::head_file(&cfg.proxmox.snippet_dir));
     // What every heartbeat says this agent runs, computed once: the file does
@@ -2990,6 +3001,11 @@ async fn reconcile_workers(
                     // or its stamp, so its run lease has nothing left to stop.
                     if !matches!(gone, crate::teardown::Gone::NotYet(_)) {
                         crate::lease::forget(&core.lease, &spec.id);
+                        // And its port of the opening is free (released on
+                        // Absent): nothing is left for it to reach.
+                        if let Err(e) = driver.opening.release(&spec.id) {
+                            eprintln!("instance {}: its opening port not released, will retry: {e:#}", spec.id);
+                        }
                     }
                 })
                 .map(|gone| InstanceStatus {
@@ -3156,6 +3172,36 @@ async fn reconcile_workers(
     // nothing else until 26 September 2026 (gap 4). After the loop, because
     // that is what fills it.
     checks.extend(driver.refreshes.drain());
+    // **The provider opening** (`crate::opening`): each opened machine's
+    // egress address, from the host's neighbour table by its egress MAC; then
+    // the port of every machine that is neither wanted by this view nor
+    // listed on this host released. Only on a listing that worked: "could not
+    // ask" is never "gone" (R1 rule 9), and a machine being built has no guest
+    // yet, which is why the view's wanted ids are kept too. A change rewrites
+    // opening.json, which wakes the applier; no change writes nothing.
+    {
+        let neighbours = crate::neighbours::Neighbours::read();
+        if let Err(e) = driver.opening.observe(|mac| neighbours.get(mac).to_vec()) {
+            eprintln!("opening: addresses not recorded, will retry: {e:#}");
+        }
+        if let Ok(guests) = &surveyed {
+            let stamps: std::collections::HashSet<&str> = guests.iter().filter_map(|g| g.stamp.as_deref()).collect();
+            let wanted: std::collections::HashSet<&str> = desired
+                .instances
+                .iter()
+                .filter(|s| s.intent != Lifecycle::Absent)
+                .map(|s| s.id.as_str())
+                .collect();
+            let keep = |id: &str| {
+                wanted.contains(id) || stamps.contains(crate::names::stamped(crate::names::TAG_INSTANCE, id).as_str())
+            };
+            match driver.opening.sweep(keep) {
+                Ok(gone) if !gone.is_empty() => println!("opening: {} port(s) released, their machines gone", gone.len()),
+                Ok(_) => {}
+                Err(e) => eprintln!("opening: ports not released, will retry: {e:#}"),
+            }
+        }
+    }
     // **Residues, retried every pass and reported** (lifecycle phase 7, RC9):
     // volumes a deleted machine left, which Core no longer sends once it ended
     // the compute claim on them.

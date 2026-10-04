@@ -383,6 +383,35 @@ proxmox:
 
     /// **A timing out of its bounds stops the load**, naming the key as the
     /// file spells it; before `timings` existed the section was ignored.
+    /// **The opening arrives under the keys the template writes**, off and
+    /// on, and an opening on with nothing to reach it by stops the load, so
+    /// `check-config` refuses it before deploy-agent.yml installs the file.
+    /// The two blocks are what `templates/agent.yaml.j2` renders for
+    /// `onv_opening` unset and for one declaring a forward.
+    #[test]
+    fn the_opening_arrives_under_the_names_the_template_writes() {
+        let off = "opening:\n  enabled: false\n  reach: null\n  publicAddress: null\n  interface: \"vmbr0\"\n  ports: \"31820-31970\"\n";
+        let (_dir, path) = files(&format!("{WITHOUT_CREDENTIALS}{off}"), Some((SECRETS, 0o600)));
+        let cfg = super::load_agent(&path).expect("off loads");
+        assert_eq!(cfg.opening, crate::opening::OpeningConfig::default());
+        assert_eq!(cfg.effective()["opening"]["enabled"], false, "said at start");
+
+        let on = "opening:\n  enabled: true\n  reach: \"forwarded\"\n  publicAddress: \"193.137.26.160\"\n  interface: \"vmbr0\"\n  ports: \"31820-31829\"\n";
+        let (_dir, path) = files(&format!("{WITHOUT_CREDENTIALS}{on}"), Some((SECRETS, 0o600)));
+        let cfg = super::load_agent(&path).expect("on loads");
+        let c = cfg.opening.check().unwrap().expect("on");
+        assert_eq!((c.first, c.last, c.reach), (31820, 31829, crate::opening::Reach::Forwarded));
+
+        let nothing = on.replace("reach: \"forwarded\"", "reach: null");
+        let (_dir, path) = files(&format!("{WITHOUT_CREDENTIALS}{nothing}"), Some((SECRETS, 0o600)));
+        let e = super::load_agent(&path).expect_err("on with no reach loaded").to_string();
+        assert!(e.contains("no public address and no forward was declared"), "{e}");
+
+        // A file from before the opening existed is off.
+        let (_dir, path) = files(WITHOUT_CREDENTIALS, Some((SECRETS, 0o600)));
+        assert!(!super::load_agent(&path).unwrap().opening.enabled);
+    }
+
     #[test]
     fn a_timing_out_of_bounds_stops_the_load_by_name() {
         let (_dir, path) = files(&format!("{WITHOUT_CREDENTIALS}timings:\n  tunnelPing: 30s\n"), Some((SECRETS, 0o600)));
@@ -427,6 +456,12 @@ pub struct AgentConfig {
     /// default, which is what the code held before the section existed.
     #[serde(default)]
     pub timings: crate::timings::Timings,
+    /// **The provider opening** (`crate::opening`): one UDP port of this
+    /// host's public side per machine. Absent is off, as is every file
+    /// written before it existed; deploy-agent.yml writes every key from the
+    /// inventory's `onv_opening`.
+    #[serde(default)]
+    pub opening: crate::opening::OpeningConfig,
     /// Where the two credentials were read from. Not a key of any file: set by
     /// [`load_agent_with`], and said at start.
     #[serde(skip)]
@@ -646,6 +681,11 @@ pub fn load_agent_with(path: &str, secrets: &str) -> anyhow::Result<AgentConfig>
     }
 
     cfg.timings
+        .check()
+        .map_err(|bad| anyhow::anyhow!("{path} refused:\n  {}", bad.join("\n  ")))?;
+    // The opening, by the same rule: a key that does not pass stops the load,
+    // so `check-config` refuses it before deploy-agent.yml installs the file.
+    cfg.opening
         .check()
         .map_err(|bad| anyhow::anyhow!("{path} refused:\n  {}", bad.join("\n  ")))?;
     Ok(cfg)

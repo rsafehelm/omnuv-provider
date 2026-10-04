@@ -65,6 +65,14 @@ case "$1" in
         # the lease lock, and never the one it replaced. Before `join` its
         # service's ConditionPathExists skips each run.
         systemctl enable --now onv-lease-expire.timer >/dev/null 2>&1 || true
+        # **The provider opening's applier** (opening.rs): at boot, and again
+        # whenever the agent rewrites its ports. Started once now so the
+        # kernel holds what the configuration says from this install on:
+        # off, which is the default, removes the table. Before `join` its
+        # ConditionPathExists skips it.
+        systemctl enable onv-opening.service >/dev/null 2>&1 || true
+        systemctl enable --now onv-opening.path >/dev/null 2>&1 || true
+        systemctl start onv-opening.service >/dev/null 2>&1 || true
     fi
     ;;
 esac

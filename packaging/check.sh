@@ -77,7 +77,8 @@ if want package; then
 step "Maintainer scripts and the build script pass shellcheck"
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm packaging/deb/DEBIAN/postrm \
-    packaging/build-deb.sh packaging/check.sh src/guest/onv-certificate.sh
+    packaging/build-deb.sh packaging/check.sh src/guest/onv-certificate.sh \
+    tests/opening/nft_test.sh tests/opening/in_container.sh
 
 # The script a web machine runs to fetch its project's certificate rides in
 # its first-boot data, so this package never installs it: it is run instead,
@@ -114,6 +115,18 @@ OMNUV_LEASE_TIMER_LOG="$out/timer.log" OMNUV_AUDIT_LOG="$out/audit.log" \
 test "$rc" -eq 1
 grep -q 'refused' "$out/timer.log"
 grep -q '"actor":"host-timer"' "$out/audit.log"
+
+# The provider opening (opening.rs): its units in the package, enabled by its
+# postinst, its table removed by its prerm; then the packaged binary applies
+# and removes the rules in a disposable container, against the egress policy
+# omnuv's play installs (tests/opening/).
+step "The package holds the opening's applier, and its rules do what they say in a container"
+grep -q ' ./lib/systemd/system/onv-opening.service$' <<< "$listing"
+grep -q ' ./lib/systemd/system/onv-opening.path$' <<< "$listing"
+grep -q '^ *systemctl enable --now onv-opening.path' <<< "$postinst"
+grep -q 'nft delete table inet onv_opening' <<< "$(dpkg-deb -I "$deb" prerm)"
+tests/opening/nft_test.sh "$out/root/usr/bin/onv-provider" > "$out/opening.log" 2>&1 || { cat "$out/opening.log"; exit 1; }
+grep -q '^opening: every case passed$' "$out/opening.log"
 
 step "The Workload Agent is built, static, and starts"
 kind="$(file "$out/workloadd/onv-workloadd")"

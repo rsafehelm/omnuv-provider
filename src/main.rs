@@ -33,6 +33,7 @@ mod timings;
 mod workload_config;
 mod scrub;
 mod installwatch;
+mod opening;
 #[cfg(test)]
 mod pvemock;
 
@@ -45,6 +46,7 @@ USAGE:
     onv-provider agent [--config /etc/onv/agent.yaml] [--secrets PATH]
     onv-provider check-config [--config /etc/onv/agent.yaml] [--secrets PATH]
     onv-provider run-lease-expire [--config /etc/onv/agent.yaml] [--secrets PATH] [--dry-run]
+    onv-provider apply-opening [--config /etc/onv/agent.yaml] [--state PATH] [--print]
     onv-provider print-config
     onv-provider discover --provider <id> [--config <path>]
 
@@ -61,6 +63,16 @@ CONFIGURATION:
     what it would stop. It exits 0 when nothing is wrong, 1 when something was
     not done, and 2 when the file was refused.
 
+    `apply-opening` is the provider opening's applier (onv-opening.service,
+    as root, woken when the agent's opening.json changes): it reads the
+    `opening` block of --config and the ports the agent gave, never the
+    credentials, and replaces nftables table inet onv_opening whole, or
+    removes it when the opening is off or anything cannot be trusted. It
+    exits 0 when the kernel holds what the files say, 1 when it fell back to
+    no table, and 2 when the configuration was refused. `--print` shows the
+    rules and changes nothing. The opening is off unless the inventory's
+    onv_opening turns it on; deploy-agent.yml writes it, never a hand edit.
+
 JOIN OPTIONS:
     --region <name>       marketplace region                 (default eu-west)
     --cpu <n>             vCPU to sell                       (default 8)
@@ -69,6 +81,14 @@ JOIN OPTIONS:
     --storage <id>        Proxmox storage for marketplace disks
     --gpu <pci>           GPU to sell, repeatable (e.g. 0000:21:00.0)
     --dry-run             print every command without running it
+
+    The provider opening, off unless --opening-reach is given: one UDP port of
+    this host's public side per buyer machine, so peers reach it directly.
+    --opening-reach <r>      public: the address is on this host;
+                             forwarded: your router forwards the ports here
+    --opening-address <ip>   the public address peers reach   (required)
+    --opening-ports <a-b>    the UDP range                    (default 31820-31970)
+    --opening-interface <i>  where forwarded packets arrive   (default vmbr0)
 
 `join` runs on your own machine and dials Omnuv outward. Omnuv never connects to
 you: no inbound rule, no port forward, no SSH access, no public address. The
@@ -133,8 +153,25 @@ async fn main() -> anyhow::Result<()> {
             .filter_map(|(i, _)| args.get(i + 1).cloned())
             .collect();
 
+        // The provider opening: on when a reach is named, off otherwise.
+        let opening = match arg("--opening-reach").as_deref() {
+            None => opening::OpeningConfig::default(),
+            Some(reach) => opening::OpeningConfig {
+                enabled: true,
+                reach: Some(match reach {
+                    "public" => opening::Reach::Public,
+                    "forwarded" => opening::Reach::Forwarded,
+                    other => anyhow::bail!("--opening-reach is {other:?}; it is public or forwarded"),
+                }),
+                public_address: arg("--opening-address"),
+                interface: arg("--opening-interface").unwrap_or_else(|| opening::DEFAULT_INTERFACE.into()),
+                ports: arg("--opening-ports").unwrap_or_else(|| opening::DEFAULT_PORTS.into()),
+            },
+        };
+
         audit::init(std::env::var("OMNUV_AUDIT_LOG").ok().as_deref());
         return join::run(join::JoinArgs {
+            opening,
             core: need("--core")?,
             token: need("--token")?.into(),
             region: arg("--region").unwrap_or_else(|| "eu-west".into()),
@@ -172,6 +209,15 @@ async fn main() -> anyhow::Result<()> {
 
     let path = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
     let secrets = arg("--secrets").unwrap_or_else(|| config::secrets_beside(&path));
+
+    // **The provider opening's applier** (`opening.rs`): run as root by
+    // onv-opening.service. A separate, minimal entry point: agent.yaml's
+    // `opening` block and the agent's opening.json, never the credentials,
+    // never Core, and one nft transaction.
+    if command == "apply-opening" {
+        let print = std::env::args().any(|a| a == "--print");
+        std::process::exit(opening::apply_main(&path, arg("--state").as_deref(), print));
+    }
 
     // What `deploy-agent.yml` runs on the files it is about to install, before
     // anything restarts. stdout is the result and nothing else — the hash the

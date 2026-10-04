@@ -10,6 +10,14 @@ case "$1" in
         systemctl disable onv-lease-expire.timer >/dev/null 2>&1 || true
         systemctl stop onv-provider.service || true
         systemctl disable onv-provider.service >/dev/null 2>&1 || true
+        # The provider opening goes with the agent that gave its ports: the
+        # applier stopped, and its table removed, so no port of this host
+        # stays translated to a machine nothing manages.
+        systemctl stop onv-opening.path onv-opening.service || true
+        systemctl disable onv-opening.path onv-opening.service >/dev/null 2>&1 || true
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet onv_opening 2>/dev/null || true
     fi
     ;;
 esac
