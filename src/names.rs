@@ -157,9 +157,20 @@ pub fn gpu_mapping(pci: &str) -> String {
 
 /// The short tag that keys a machine to its marketplace id.
 ///
-/// Proxmox tags cannot hold a hyphenated UUID cleanly, so a truncated form
-/// keys the association. Collisions are implausible at this scale and would
-/// only ever affect this agent's own machines.
+/// **A handle for a person and a filter, never an identity** (the
+/// assets-by-id audit of 3 October 2026). Twelve hex digits are 2^48, and two
+/// machines can carry one tag. What says which machine a guest is, is its
+/// stamp (`stamped`), the whole id in the first line of its description:
+/// `Client::the_guest` asks every carrier's stamp and refuses a twin, and the
+/// survey reports every guest sharing a key under that key, saying
+/// `adopt-unknown.yml` refuses it (it decides only a tag one guest carries).
+///
+/// **Why it stays short.** No Proxmox limit was measured to force it: a tag
+/// is `[a-z0-9_][a-z0-9_+.-]*` as far as the audit read, which a whole uuid
+/// fits. It stays because Core's `unknown_guests`, `adopt-unknown.yml` and
+/// every guest already built key on this form, so a whole-id tag is a rename
+/// to converge on both sides (both tags carried, then the short one dropped),
+/// queued in omnuv's TODO rather than done here.
 pub fn short_tag(id: &str) -> String {
     format!("{PREFIX}-{}", id.replace('-', "").chars().take(12).collect::<String>())
 }

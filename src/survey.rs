@@ -16,10 +16,13 @@
 //! Three answers, on the checks channel the report already carries:
 //!
 //! ```text
-//! guest.unclaimed   fail      one per guest, subject = its key tag (the
+//! guest.unclaimed   fail      one per key, subject = its key tag (the
 //!                             hypervisor's handle, which Core's unknown_guests
-//!                             and adopt-unknown.yml key on); compared by the
-//!                             whole id its stamp names, never by the tag
+//!                             and adopt-unknown.yml key on), naming every
+//!                             unasked guest carrying it, and saying the
+//!                             adoption refuses a key more than one carries;
+//!                             compared by the whole id its stamp names,
+//!                             never by the tag
 //! guests.surveyed   pass      the listing worked; says how many were compared
 //! guests.surveyed   unknown   the listing failed — could not look, which is
 //!                             never the same as nothing there
@@ -76,10 +79,20 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
         )
         .collect();
 
+    // The key tag each guest carries (`names::short_tag`), when it carries one.
+    fn key_of(tags: &str) -> Option<String> {
+        tags.split(&[';', ','][..])
+            .map(str::trim)
+            .find(|t| t.starts_with("onv-") && t.len() == 16 && t[4..].bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_string)
+    }
+
     let mut out = Vec::new();
+    // One report per subject, in the order the guests were listed: Core keeps
+    // one row per subject, so two checks under one key left one guest unseen.
+    let mut reports: Vec<(String, Vec<String>)> = Vec::new();
     let (mut compared, mut older) = (0usize, 0usize);
     for g in guests {
-        let tokens: Vec<&str> = g.tags.split(&[';', ','][..]).map(str::trim).collect();
         let Some(claim) = claim_of(&g.tags) else {
             // An earlier generation's claim cannot be keyed against this
             // desired state. Counted and said, rather than compared wrongly.
@@ -93,24 +106,44 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
         // worker's stamp never matches an instance Core asked for.
         let asked_for = g.stamp.as_deref().is_some_and(|s| wanted.iter().any(|w| w == s));
         if !asked_for {
-            let key = tokens
-                .iter()
-                .find(|t| t.starts_with("onv-") && t.len() == 16 && t[4..].bytes().all(|b| b.is_ascii_hexdigit()))
-                .map(|t| t.to_string());
-            out.push(SelfCheck {
-                name: "guest.unclaimed".into(),
-                kind: CheckKind::Presence,
-                result: CheckResult::Fail,
-                detail: Some(format!(
-                    "VM {} on {} carries the {claim} claim, and Core's desired state names no such machine \
-                     (its stamp reads {:?})",
-                    g.vmid,
-                    g.node,
-                    g.stamp.as_deref().unwrap_or("")
-                )),
-                subject: Some(key.unwrap_or_else(|| format!("vmid-{}", g.vmid))),
-            });
+            let subject = key_of(&g.tags).unwrap_or_else(|| format!("vmid-{}", g.vmid));
+            let line = format!(
+                "VM {} on {} carries the {claim} claim, and Core's desired state names no such machine \
+                 (its stamp reads {:?})",
+                g.vmid,
+                g.node,
+                g.stamp.as_deref().unwrap_or("")
+            );
+            match reports.iter_mut().find(|(s, _)| *s == subject) {
+                Some((_, lines)) => lines.push(line),
+                None => reports.push((subject, vec![line])),
+            }
         }
+    }
+    for (subject, lines) in reports {
+        // **A shared key is refused, never adopted.** The key is twelve hex
+        // digits of the id (`names::short_tag` says why it stays short), so
+        // two machines can carry one. `adopt-unknown.yml` decides a guest by
+        // this key and refuses one that more than one guest carries, asked
+        // for or not; the report says so rather than invite it.
+        let carriers: Vec<u32> =
+            guests.iter().filter(|g| key_of(&g.tags).as_deref() == Some(subject.as_str())).map(|g| g.vmid).collect();
+        let mut detail = lines.join("; ");
+        if carriers.len() > 1 {
+            detail.push_str(&format!(
+                "; {} guests carry the key {subject} (VM {}), so adopt-unknown.yml refuses it: \
+                 each is decided by its whole id, by a person",
+                carriers.len(),
+                carriers.iter().map(u32::to_string).collect::<Vec<_>>().join(", VM ")
+            ));
+        }
+        out.push(SelfCheck {
+            name: "guest.unclaimed".into(),
+            kind: CheckKind::Presence,
+            result: CheckResult::Fail,
+            detail: Some(detail),
+            subject: Some(subject),
+        });
     }
     out.push(SelfCheck {
         name: "guests.surveyed".into(),
@@ -318,14 +351,43 @@ mod tests {
             ClaimedGuest { stamp: None, ..made_for(102, crate::names::TAG_INSTANCE, ASKED) },
         ];
         let found = checks(Ok(&guests), &desired(&[ASKED]));
-        let reported: Vec<u32> = found
-            .iter()
-            .filter(|c| c.name == "guest.unclaimed")
-            .map(|c| if c.detail.as_deref().unwrap().contains("VM 101") { 101 } else if c.detail.as_deref().unwrap().contains("VM 102") { 102 } else { 0 })
-            .collect();
-        assert_eq!(reported, [101, 102], "{found:?}");
-        assert!(found.iter().find(|c| c.detail.as_deref().unwrap_or("").contains("VM 101")).unwrap()
-            .detail.as_deref().unwrap().contains(TWIN), "the twin's report does not name the id it carries");
+        // All three carry one key, so the two not asked for are one report.
+        let unclaimed: Vec<_> = found.iter().filter(|c| c.name == "guest.unclaimed").collect();
+        assert_eq!(unclaimed.len(), 1, "{found:?}");
+        let detail = unclaimed[0].detail.as_deref().unwrap();
+        assert!(detail.contains("VM 101 on") && detail.contains("VM 102 on"), "{detail:?}");
+        assert!(!detail.contains("VM 100 on"), "the machine Core asked for was reported: {detail:?}");
+        assert!(detail.contains(TWIN), "the twin's report does not name the id it carries");
+    }
+
+    /// **One key, one report, naming every guest that carries it** (the
+    /// assets-by-id audit of 3 October 2026). The subject is the twelve-hex
+    /// key tag, and Core keeps one row per subject: two unclaimed guests
+    /// sharing it, reported as two checks, became one row naming whichever
+    /// came last, so one machine of the two hid. And a shared key is not a
+    /// handle `adopt-unknown.yml` may decide by: it refuses a tag more than
+    /// one guest carries, and the report says so rather than invite it.
+    #[test]
+    fn guests_sharing_a_key_are_one_report_that_names_them_all_and_refuses_adoption() {
+        const TWIN: &str = "0a0b0c0d-0e0f-4fff-8fff-ffffffffffff";
+        assert_eq!(crate::names::short_tag(TWIN), crate::names::short_tag(GONE), "the fixture must share the tag");
+        let guests = [
+            made_for(101, crate::names::TAG_INSTANCE, GONE),
+            made_for(102, crate::names::TAG_INSTANCE, TWIN),
+            made_for(103, crate::names::TAG_INSTANCE, ASKED),
+        ];
+        let found = checks(Ok(&guests), &desired(&[ASKED]));
+        let unclaimed: Vec<_> = found.iter().filter(|c| c.name == "guest.unclaimed").collect();
+        assert_eq!(unclaimed.len(), 1, "one key reported more than once, so Core keeps one of them: {found:?}");
+        let detail = unclaimed[0].detail.as_deref().unwrap();
+        assert_eq!(unclaimed[0].subject.as_deref(), Some(crate::names::short_tag(GONE).as_str()));
+        for needle in ["VM 101", "VM 102", GONE, TWIN, "refuses"] {
+            assert!(detail.contains(needle), "{needle:?} missing from {detail:?}");
+        }
+        // A key only one guest carries reads as it always did.
+        let lone = checks(Ok(&guests[..1]), &desired(&[ASKED]));
+        let lone = lone.iter().find(|c| c.name == "guest.unclaimed").unwrap().detail.as_deref().unwrap();
+        assert!(!lone.contains("refuses"), "{lone:?}");
     }
 
     /// **Could not look is not nothing there.** A failed listing yields one
