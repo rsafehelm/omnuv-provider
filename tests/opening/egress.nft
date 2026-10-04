@@ -6,10 +6,18 @@
 #!/usr/sbin/nft -f
 # Omnuv buyer egress policy for onvnat0. Managed by bootstrap.
 #
-# Buyer VMs on this bridge get the internet and nothing else. Proxmox SDN
-# already masquerades their traffic out the host's uplink; this decides what
-# may be masqueraded at all, and what the host itself will answer. Loaded by
-# onv-egress.service into its own table, so it never touches Proxmox's rules.
+# Buyer VMs on this bridge get the internet and nothing else. This table is the
+# whole of it: what may leave, what the host answers, and the address
+# translation that lets it leave. Loaded by onv-egress.service into its own
+# table, so it never touches Proxmox's rules.
+#
+# **Replace, never append, in one transaction.** The first two lines make the
+# table exist and then delete it, and `nft -f` applies the whole file
+# atomically, so loading it any number of times leaves exactly one copy of
+# every rule below and no moment with none of them.
+table inet onv_egress
+delete table inet onv_egress
+
 table inet onv_egress {
     set private {
         type ipv4_addr
@@ -44,5 +52,36 @@ table inet onv_egress {
         iifname "onvnat0" ip daddr 10.201.0.1 tcp dport 53 accept
         iifname "onvnat0" ip daddr 10.201.0.1 icmp type echo-request accept
         iifname "onvnat0" drop
+    }
+
+    # **The address translation, here and not in Proxmox SDN (4 October
+    # 2026).** The subnet's `snat` flag made Proxmox write
+    # `post-up iptables -t nat -A POSTROUTING …` into the bridge's stanza, and
+    # ifupdown2 re-runs every `post-up` on every reload while running a
+    # `post-down` only for an interface it removes (`ifreload_down_changed=0`
+    # on Proxmox). Each SDN apply appended another copy: 183 on Pluto and 43
+    # on Titan that day. The flag is off now and the rule lives here, where a
+    # reload cannot reach it and a reload of this file cannot duplicate it.
+    #
+    # Masquerade, not SNAT to a fixed address: Proxmox fixed the uplink's
+    # address when it wrote the file, so a host whose address changed sent
+    # buyer traffic out under its old one until the next apply. Everything
+    # private is dropped in `forward` above, so what is left to translate is
+    # internet-bound and leaves by the default route.
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        meta nfproto ipv4 iifname "onvnat0" oifname != "onvnat0" masquerade
+    }
+
+    # Proxmox's `-t raw -I PREROUTING -i fwbr+ -j CT --zone 1`, which came with
+    # the same flag, kept as it was: traffic arriving from a firewall bridge is
+    # tracked in zone 1, so a packet bridged through a `fwbr` and then routed
+    # is not mistaken for one connection seen twice. It matches every
+    # firewall bridge on the host, the named list's included, and they have
+    # had it since the egress bridge first existed; dropping it would change
+    # their traffic, not only ours. IPv4 only, as the iptables rule was.
+    chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        meta nfproto ipv4 iifname "fwbr*" ct zone set 1
     }
 }
