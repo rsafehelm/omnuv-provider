@@ -165,14 +165,52 @@ pub fn gpu_mapping(pci: &str) -> String {
 /// survey reports every guest sharing a key under that key, saying
 /// `adopt-unknown.yml` refuses it (it decides only a tag one guest carries).
 ///
-/// **Why it stays short.** No Proxmox limit was measured to force it: a tag
-/// is `[a-z0-9_][a-z0-9_+.-]*` as far as the audit read, which a whole uuid
-/// fits. It stays because Core's `unknown_guests`, `adopt-unknown.yml` and
-/// every guest already built key on this form, so a whole-id tag is a rename
-/// to converge on both sides (both tags carried, then the short one dropped),
-/// queued in omnuv's TODO rather than done here.
+/// **The generation before the whole-id key** (`key_tag`, 4 October 2026).
+/// Every guest built before then carries this and only this, so it is still
+/// written beside the whole one and still matched (`carries_key`): a rename
+/// converges both names, and the short one is dropped only once no guest
+/// carries it alone.
 pub fn short_tag(id: &str) -> String {
     format!("{PREFIX}-{}", id.replace('-', "").chars().take(12).collect::<String>())
+}
+
+/// **The key tag that is the id** (the assets-by-id audit's rename, omnuv's
+/// migration 0235): `onv-` and the whole uuid. A Proxmox tag is
+/// `[a-z0-9_][a-z0-9_+.-]*` (`pve-tag` in its JSON schema, as read; not
+/// measured on a host), which a lowercase uuid fits. `None` for an id that is
+/// not a uuid: such a tag could read as another (`onv-test`, an environment).
+pub fn key_tag(id: &str) -> Option<String> {
+    is_uuid(id).then(|| format!("{PREFIX}-{id}"))
+}
+
+/// Whether one tag token is this id's key, in either generation.
+pub fn is_key_of(token: &str, id: &str) -> bool {
+    token == short_tag(id) || key_tag(id).is_some_and(|k| token == k)
+}
+
+/// Whether a guest's tags carry this id's key, in either generation.
+pub fn carries_key(tags: &str, id: &str) -> bool {
+    tags.split(';').any(|t| is_key_of(t.trim(), id))
+}
+
+/// The key a guest's tags carry, as the survey names it: the whole one when
+/// it has one, else the twelve-digit one; `None` with neither.
+pub fn key_in(tags: &str) -> Option<String> {
+    let tokens: Vec<&str> = tags.split(&[';', ','][..]).map(str::trim).collect();
+    let whole = tokens.iter().find(|t| t.strip_prefix("onv-").is_some_and(is_uuid));
+    let short = tokens
+        .iter()
+        .find(|t| t.strip_prefix("onv-").is_some_and(|r| r.len() == 12 && r.bytes().all(|b| b.is_ascii_hexdigit())));
+    whole.or(short).map(|t| t.to_string())
+}
+
+/// A lowercase uuid, as Core writes one.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_digit() || ('a'..='f').contains(&c),
+        })
 }
 
 /// Every tag a machine this agent creates carries, in one place.
@@ -181,7 +219,9 @@ pub fn short_tag(id: &str) -> String {
 ///
 /// ```text
 /// onv-instance   what this is, and that the marketplace owns it. The claim
-/// onv-<12 hex>   which marketplace resource it is. The key
+/// onv-<12 hex>   which marketplace resource it is: the key, the generation
+///                before, still written while guests carry it alone
+/// onv-<uuid>     which marketplace resource it is: the key, by the whole id
 /// onv-<env>      which deployment built it: prod, test, dev. Not a claim
 /// ```
 ///
@@ -198,6 +238,10 @@ pub fn short_tag(id: &str) -> String {
 /// and the key are what anything looks for.
 pub fn tags(claim: &str, id: &str, environment: Option<&str>) -> String {
     let mut out = format!("{claim};{}", short_tag(id));
+    if let Some(key) = key_tag(id) {
+        out.push(';');
+        out.push_str(&key);
+    }
     if let Some(env) = environment.map(str::trim).filter(|e| !e.is_empty()) {
         out.push_str(&format!(";{PREFIX}-{env}"));
     }
@@ -567,11 +611,33 @@ mod tag_grammar {
     #[test]
     fn a_machine_carries_its_claim_its_key_and_its_environment() {
         let t = tags(TAG_INSTANCE, "3f2a1b4c-5d6e-7f80-9112-233445566778", Some("test"));
-        assert_eq!(t, "onv-instance;onv-3f2a1b4c5d6e;onv-test");
+        assert_eq!(t, "onv-instance;onv-3f2a1b4c5d6e;onv-3f2a1b4c-5d6e-7f80-9112-233445566778;onv-test");
         // Whole tokens, never a prefix: this is what a sweep matches on.
         let parts: Vec<_> = t.split(';').collect();
         assert!(parts.contains(&TAG_INSTANCE));
-        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.len(), 4);
+    }
+
+    /// **Both generations of the key, and nothing near them** (omnuv's 0235).
+    /// A guest built before the whole key carries the short one alone and is
+    /// still this id's; a twin's short key is matched (its stamp refuses it,
+    /// `the_guest`), a twin's whole key is not; an environment tag never is.
+    #[test]
+    fn a_key_is_matched_in_either_generation_and_named_by_the_whole_one() {
+        const ID: &str = "3f2a1b4c-5d6e-7f80-9112-233445566778";
+        const TWIN: &str = "3f2a1b4c-5d6e-4000-8000-000000000001";
+        assert_eq!(key_tag(ID).as_deref(), Some("onv-3f2a1b4c-5d6e-7f80-9112-233445566778"));
+        assert_eq!(key_tag("test"), None, "an id that is not a uuid would read as an environment");
+        assert_eq!(key_tag("3F2A1B4C-5D6E-7F80-9112-233445566778"), None, "Core writes lowercase");
+        assert!(carries_key("onv-instance;onv-3f2a1b4c5d6e", ID), "a guest of the generation before");
+        assert!(carries_key(&tags(TAG_INSTANCE, ID, Some("prod")), ID));
+        assert!(carries_key("onv-instance;onv-3f2a1b4c-5d6e-7f80-9112-233445566778", ID), "the whole key alone");
+        assert!(!carries_key(&format!("onv-instance;{}", key_tag(TWIN).unwrap()), ID), "a twin's whole key");
+        assert!(!carries_key("onv-instance;onv-test", ID));
+        assert_eq!(key_in(&tags(TAG_INSTANCE, ID, Some("test"))), key_tag(ID), "the whole key names it");
+        assert_eq!(key_in("onv-instance;onv-3f2a1b4c5d6e;onv-test").as_deref(), Some("onv-3f2a1b4c5d6e"));
+        assert_eq!(key_in("onv-instance;onv-test"), None);
+        assert_eq!(key_in("onv-instance;onv-3f2a1b4c5d6"), None, "eleven digits are not a key");
     }
 
     #[test]

@@ -391,7 +391,7 @@ fn accounted_pci(vm: &VmEntry, config: &serde_json::Map<String, serde_json::Valu
     let claims = desired.instances.iter().map(|s| (crate::names::TAG_INSTANCE, "instance", &s.id, &s.gpu_local_ids))
         .chain(desired.inference_workers.iter().map(|s| (crate::names::TAG_WORKER, "inference worker", &s.id, &s.gpu_local_ids)));
     for (kind, label, id, devices) in claims {
-        if tags.contains(kind) && tags.contains(crate::names::short_tag(id).as_str())
+        if tags.contains(kind) && tags.iter().any(|t| crate::names::is_key_of(t, id))
             && description == Some(format!("Omnuv {label} {id}").as_str()) {
             matched += 1;
             for device in devices {
@@ -540,6 +540,29 @@ impl Client {
         form: &[(impl AsRef<str>, String)],
     ) -> anyhow::Result<T> {
         self.send_form(reqwest::Method::PUT, path, form).await
+    }
+
+    /// **The whole-id key, onto a guest built before it** (omnuv's 0235: a
+    /// rename converges both names). `vm`'s tags as listed; the caller has
+    /// proved by its stamp that this guest is `id` (`the_guest`). Every tag it
+    /// carries is kept, the key added beside them; a guest already carrying
+    /// it, or an id that is not a uuid, is left as it is. A tag is metadata:
+    /// nothing restarts, so a buyer's machine is not touched. Says whether it
+    /// wrote.
+    pub(crate) async fn ensure_key_tag(&self, node: &str, vmid: u32, tags: Option<&str>, id: &str) -> anyhow::Result<bool> {
+        let Some(key) = crate::names::key_tag(id) else { return Ok(false) };
+        let mut tokens: Vec<&str> =
+            tags.unwrap_or_default().split(&[';', ','][..]).map(str::trim).filter(|t| !t.is_empty()).collect();
+        if tokens.contains(&key.as_str()) {
+            return Ok(false);
+        }
+        tokens.push(&key);
+        self.put_form::<Option<serde_json::Value>>(
+            &format!("/nodes/{node}/qemu/{vmid}/config"),
+            &[("tags", tokens.join(";"))],
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Sets a user's password inside a running guest from its crypt(3) hash,
@@ -1818,6 +1841,33 @@ mod home_node_tests {
             blind.client().the_guest("onv-instance", id).await.is_err(),
             "a node that could not be read was taken as holding nothing"
         );
+    }
+
+    /// **A guest built before the whole key gets it, keeping every tag it
+    /// has** (omnuv's 0235: a rename converges both names). One already
+    /// carrying it, and an id that is not a uuid, are not written to.
+    #[tokio::test]
+    async fn a_guest_built_before_the_whole_key_is_given_it_and_keeps_the_rest() {
+        let id = "0a0b0c0d-0e0f-4000-8000-000000000001";
+        let short = crate::names::short_tag(id);
+        let mock = crate::pvemock::Mock::start(|_, _, _| (200, serde_json::Value::Null)).await;
+        let c = mock.client();
+        let before = format!("onv-instance;{short};onv-prod");
+        assert!(c.ensure_key_tag("pve-a", 812, Some(&before), id).await.expect("written"));
+        let body = mock.body_of("PUT", "/nodes/pve-a/qemu/812/config").expect("a tag write");
+        let tags: String = body
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("tags="))
+            .map(|v| v.replace("%3B", ";").replace("%3b", ";"))
+            .expect("the tags field");
+        assert_eq!(tags, format!("onv-instance;{short};onv-prod;onv-{id}"), "a tag was lost or the key not added");
+
+        let quiet = crate::pvemock::Mock::start(|_, _, _| (200, serde_json::Value::Null)).await;
+        let since = crate::names::tags("onv-instance", id, Some("prod"));
+        assert!(!quiet.client().ensure_key_tag("pve-a", 812, Some(&since), id).await.unwrap());
+        assert!(!quiet.client().ensure_key_tag("pve-a", 813, Some("onv-worker;onv-worker_abc"), "worker_abc").await.unwrap());
+        assert!(!quiet.called("PUT", "/nodes/pve-a/qemu/812/config") && !quiet.called("PUT", "/nodes/pve-a/qemu/813/config"),
+            "a guest already keyed, or keyed by no uuid, was written to");
     }
 
     /// **A live action finds a machine by its whole id, never the first

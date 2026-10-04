@@ -171,9 +171,10 @@ impl Client {
             #[serde(default)]
             tags: Option<String>,
         }
-        let id_tag = crate::names::short_tag(id);
+        // The key in either generation: a guest built before the whole key
+        // carries the twelve-digit one alone (omnuv's 0235).
         let tagged = |tags: Option<&str>| {
-            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))
+            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && crate::names::carries_key(t, id))
         };
         let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
         let found: Vec<Claimed> = vms
@@ -277,9 +278,8 @@ impl Client {
         } else {
             crate::instance::BUYER_POOL
         };
-        let id_tag = crate::names::short_tag(id);
         let claimed = |tags: Option<&str>| {
-            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))
+            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && crate::names::carries_key(t, id))
         };
         let stamp = crate::names::stamped(kind, id);
         let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;

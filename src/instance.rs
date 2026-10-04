@@ -120,6 +120,7 @@ pub(crate) fn resolve_dev(mac: &str) -> String {
 }
 
 
+#[cfg(test)]
 pub(crate) fn short_tag(id: &str) -> String {
     crate::names::short_tag(id)
 }
@@ -934,6 +935,19 @@ impl Client {
                 // exactly as for the segment above.
                 if spec.intent != Lifecycle::Absent {
                     self.ensure_egress(node, vm.vmid).await?;
+                }
+
+                // And its whole-id key, beside the twelve-digit one a machine
+                // built before it carries alone (omnuv's 0235), so the short
+                // one can go once none carries it alone. Not a reason to fail
+                // the pass: the short key still finds it, and the next pass
+                // tries again. A tag is metadata; nothing restarts.
+                if spec.intent != Lifecycle::Absent {
+                    match self.ensure_key_tag(node, vm.vmid, vm.tags.as_deref(), &spec.id).await {
+                        Ok(true) => audit::record("instance.key_tag", "core", &spec.id, "whole-id key added", Some(&vm.vmid.to_string())),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("instance {}: its whole-id key was not added: {e:#}", spec.id),
+                    }
                 }
 
                 // Converge toward the requested lifecycle rather than merely
@@ -1862,7 +1876,7 @@ impl Client {
                 }
             };
             let tags = vm.tags.clone().unwrap_or_default();
-            let ours = tags.split(';').any(|t| t == entry.claim) && tags.split(';').any(|t| t == short_tag(&entry.id));
+            let ours = tags.split(';').any(|t| t == entry.claim) && crate::names::carries_key(&tags, &entry.id);
             // **The create claimed it, so it is a machine and not a leftover**
             // (RC4). See the note above.
             if ours {
@@ -2586,6 +2600,13 @@ mod tests {
         let seen = e.downcast_ref::<SeenThenFailed>().unwrap_or_else(|| panic!("reported as a plain failure: {e:#}"));
         assert_eq!(seen.state, InstanceState::Running, "a running machine was reported as something else");
         assert_eq!((seen.local_id.as_str(), seen.node.as_str()), ("700", "n1"));
+        // A machine built before the whole key carries the short one alone:
+        // the pass gives it the whole one beside it (omnuv's 0235).
+        let whole = crate::names::key_tag(&sp.id).expect("Core's ids are uuids");
+        assert!(
+            mock.body_of("PUT", "/nodes/n1/qemu/700/config").is_some_and(|b| b.contains(&whole) && b.contains(&short_tag(&sp.id))),
+            "the pass did not converge the whole-id key beside the short one"
+        );
         std::fs::remove_dir_all(&root).unwrap();
 
         let blind = Mock::start(|_, _, _| (503, serde_json::Value::Null)).await;

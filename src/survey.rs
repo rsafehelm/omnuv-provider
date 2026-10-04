@@ -79,12 +79,11 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
         )
         .collect();
 
-    // The key tag each guest carries (`names::short_tag`), when it carries one.
+    // The key tag each guest carries, when it carries one: the whole one
+    // (`names::key_tag`) over the twelve-digit one (omnuv's 0235), so a guest
+    // built since is named by its id and Core keys its decision on it.
     fn key_of(tags: &str) -> Option<String> {
-        tags.split(&[';', ','][..])
-            .map(str::trim)
-            .find(|t| t.starts_with("onv-") && t.len() == 16 && t[4..].bytes().all(|b| b.is_ascii_hexdigit()))
-            .map(str::to_string)
+        crate::names::key_in(tags)
     }
 
     let mut out = Vec::new();
@@ -121,13 +120,18 @@ pub fn checks(guests: Result<&[ClaimedGuest], String>, desired: &DesiredState) -
         }
     }
     for (subject, lines) in reports {
-        // **A shared key is refused, never adopted.** The key is twelve hex
-        // digits of the id (`names::short_tag` says why it stays short), so
-        // two machines can carry one. `adopt-unknown.yml` decides a guest by
-        // this key and refuses one that more than one guest carries, asked
-        // for or not; the report says so rather than invite it.
-        let carriers: Vec<u32> =
-            guests.iter().filter(|g| key_of(&g.tags).as_deref() == Some(subject.as_str())).map(|g| g.vmid).collect();
+        // **A shared key is refused, never adopted.** A twelve-digit key is
+        // part of the id, so two machines can carry one: a guest of the
+        // generation before carries it alone, and one built since carries it
+        // beside its whole key. `adopt-unknown.yml` decides a guest by this
+        // key and refuses one that more than one guest carries, asked for or
+        // not, so every carrier of the token counts, whatever the guest is
+        // named by; the report says so rather than invite it.
+        let carriers: Vec<u32> = guests
+            .iter()
+            .filter(|g| g.tags.split(&[';', ','][..]).any(|t| t.trim() == subject))
+            .map(|g| g.vmid)
+            .collect();
         let mut detail = lines.join("; ");
         if carriers.len() > 1 {
             detail.push_str(&format!(
@@ -268,6 +272,13 @@ mod tests {
         ClaimedGuest { stamp: Some(crate::names::stamped(claim, id)), ..guest(vmid, &crate::names::tags(claim, id, Some("test"))) }
     }
 
+    /// A guest built before the whole key (omnuv's 0235): the claim, the
+    /// twelve-digit key alone, the environment, and its stamp.
+    fn made_before(vmid: u32, claim: &str, id: &str) -> ClaimedGuest {
+        let tags = format!("{claim};{};onv-test", crate::names::short_tag(id));
+        ClaimedGuest { stamp: Some(crate::names::stamped(claim, id)), ..guest(vmid, &tags) }
+    }
+
     /// **Both directions** (gap 4). A pass where every drive refresh worked
     /// says so and names no machine; one where a refresh failed says which.
     /// A pass that refreshed nothing says nothing, rather than a pass with
@@ -316,7 +327,7 @@ mod tests {
         let unclaimed: Vec<_> = found.iter().filter(|c| c.name == "guest.unclaimed").collect();
         assert_eq!(unclaimed.len(), 1, "{found:?}");
         assert_eq!(unclaimed[0].result, CheckResult::Fail);
-        assert_eq!(unclaimed[0].subject.as_deref(), Some(crate::names::short_tag(GONE).as_str()));
+        assert_eq!(unclaimed[0].subject, crate::names::key_tag(GONE), "a guest built since is named by its whole key");
         assert!(unclaimed[0].detail.as_deref().unwrap().contains("VM 101"));
         let surveyed = found.iter().find(|c| c.name == "guests.surveyed").expect("a summary");
         assert_eq!(surveyed.result, CheckResult::Pass);
@@ -346,9 +357,9 @@ mod tests {
         const TWIN: &str = "3f2a1b4c-5d6e-4fff-8fff-ffffffffffff";
         assert_eq!(crate::names::short_tag(TWIN), crate::names::short_tag(ASKED), "the fixture must share the tag");
         let guests = [
-            made_for(100, crate::names::TAG_INSTANCE, ASKED),
-            made_for(101, crate::names::TAG_INSTANCE, TWIN),
-            ClaimedGuest { stamp: None, ..made_for(102, crate::names::TAG_INSTANCE, ASKED) },
+            made_before(100, crate::names::TAG_INSTANCE, ASKED),
+            made_before(101, crate::names::TAG_INSTANCE, TWIN),
+            ClaimedGuest { stamp: None, ..made_before(102, crate::names::TAG_INSTANCE, ASKED) },
         ];
         let found = checks(Ok(&guests), &desired(&[ASKED]));
         // All three carry one key, so the two not asked for are one report.
@@ -372,9 +383,9 @@ mod tests {
         const TWIN: &str = "0a0b0c0d-0e0f-4fff-8fff-ffffffffffff";
         assert_eq!(crate::names::short_tag(TWIN), crate::names::short_tag(GONE), "the fixture must share the tag");
         let guests = [
-            made_for(101, crate::names::TAG_INSTANCE, GONE),
-            made_for(102, crate::names::TAG_INSTANCE, TWIN),
-            made_for(103, crate::names::TAG_INSTANCE, ASKED),
+            made_before(101, crate::names::TAG_INSTANCE, GONE),
+            made_before(102, crate::names::TAG_INSTANCE, TWIN),
+            made_before(103, crate::names::TAG_INSTANCE, ASKED),
         ];
         let found = checks(Ok(&guests), &desired(&[ASKED]));
         let unclaimed: Vec<_> = found.iter().filter(|c| c.name == "guest.unclaimed").collect();
@@ -388,6 +399,35 @@ mod tests {
         let lone = checks(Ok(&guests[..1]), &desired(&[ASKED]));
         let lone = lone.iter().find(|c| c.name == "guest.unclaimed").unwrap().detail.as_deref().unwrap();
         assert!(!lone.contains("refuses"), "{lone:?}");
+    }
+
+    /// **A guest built since is named by its whole key** (omnuv's 0235): two
+    /// twins sharing twelve digits are two reports, each by its own id, and
+    /// neither is refused. A guest of the generation before sharing those
+    /// twelve digits with one built since is named by them, and two guests
+    /// carry them, so its report says adopt-unknown refuses that key.
+    #[test]
+    fn a_guest_built_since_is_its_own_report_by_its_whole_key() {
+        const TWIN: &str = "0a0b0c0d-0e0f-4fff-8fff-ffffffffffff";
+        let both = [made_for(101, crate::names::TAG_INSTANCE, GONE), made_for(102, crate::names::TAG_INSTANCE, TWIN)];
+        let found = checks(Ok(&both), &desired(&[ASKED]));
+        let mut subjects: Vec<_> =
+            found.iter().filter(|c| c.name == "guest.unclaimed").map(|c| c.subject.clone()).collect();
+        subjects.sort();
+        let mut want = vec![crate::names::key_tag(GONE), crate::names::key_tag(TWIN)];
+        want.sort();
+        assert_eq!(subjects, want, "{found:?}");
+        assert!(!found.iter().any(|c| c.detail.as_deref().is_some_and(|d| d.contains("refuses"))), "{found:?}");
+
+        let mixed = [made_before(101, crate::names::TAG_INSTANCE, GONE), made_for(102, crate::names::TAG_INSTANCE, TWIN)];
+        let found = checks(Ok(&mixed), &desired(&[ASKED]));
+        let old = found
+            .iter()
+            .find(|c| c.subject.as_deref() == Some(crate::names::short_tag(GONE).as_str()))
+            .unwrap_or_else(|| panic!("the older guest is not named by its key: {found:?}"));
+        assert!(old.detail.as_deref().unwrap().contains("refuses"), "{old:?}");
+        let new = found.iter().find(|c| c.subject == crate::names::key_tag(TWIN)).expect("the newer by its whole key");
+        assert!(!new.detail.as_deref().unwrap().contains("refuses"), "{new:?}");
     }
 
     /// **Could not look is not nothing there.** A failed listing yields one

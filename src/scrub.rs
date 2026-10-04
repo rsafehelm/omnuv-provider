@@ -453,7 +453,7 @@ impl Client {
         }) {
             let config: serde_json::Value = self.get_json(&format!("/nodes/{}/qemu/{}/config", v.node, v.vmid)).await?;
             let Some(id) = scrub_of(&config) else { continue };
-            if wanted.contains(id.as_str()) || !v.tags.as_deref().is_some_and(|t| t.split(';').any(|x| x == crate::names::short_tag(&id))) {
+            if wanted.contains(id.as_str()) || !v.tags.as_deref().is_some_and(|t| crate::names::carries_key(t, &id)) {
                 continue;
             }
             eprintln!("scrub {id}: vm {} on {} is no longer wanted; removing it", v.vmid, v.node);

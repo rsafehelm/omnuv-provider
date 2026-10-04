@@ -481,6 +481,16 @@ impl Client {
                 running = false;
             }
 
+            // Its whole-id key beside the twelve-digit one (omnuv's 0235), as
+            // a machine's; a failure is said and tried again next pass.
+            if spec.intent != Lifecycle::Absent {
+                match self.ensure_key_tag(node, vm.vmid, vm.tags.as_deref(), &spec.id).await {
+                    Ok(true) => crate::audit::record("worker.key_tag", "core", &spec.id, "whole-id key added", Some(&vm.vmid.to_string())),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("worker {}: its whole-id key was not added: {e:#}", spec.id),
+                }
+            }
+
             // **Its first-boot configuration, brought up to date (PROVIDER-31).**
             // Only the power state was converged, so a catalogue change — the
             // model's `vllm_args`, its `extra_args` — never reached a worker
