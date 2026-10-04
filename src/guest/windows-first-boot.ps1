@@ -10,8 +10,8 @@
 # **It prints step names and nothing else.** cloudbase-init writes this
 # script's output to its own log at debug level, and its configuration in the
 # image has debug on, so a secret printed here would be on the disk. The
-# overlay's key is in the tunnel's join file only; the stream login is in its
-# own file only.
+# overlay's key is in the tunnel's join file only. The stream login is the
+# recipe's: it mints it and writes it, and this script never does.
 #
 # Exit codes 1001-1003 are cloudbase-init's reboot requests
 # (execcmd.get_plugin_return_value); this script exits 0 or 1 and nothing else.
@@ -37,8 +37,8 @@ $STEP = 'starting'
 $LABEL = ''
 $rc = 0
 try {
-    # Before anything is written under it: the status, the stream login and
-    # the steps are SYSTEM's and Administrators', never Users' (ProgramData's
+    # Before anything is written under it: the status, the recipe's stream
+    # login and the steps are SYSTEM's and Administrators', never Users' (ProgramData's
     # default lets Users read). A child with its own protected DACL, as the
     # tunnel's data directory has from the image, keeps it.
     New-Item -ItemType Directory -Force -Path $onv | Out-Null

@@ -10,8 +10,8 @@
 # **It prints step names and nothing else.** cloudbase-init writes this
 # script's output to its own log at debug level, and its configuration in the
 # image has debug on, so a secret printed here would be on the disk. The
-# overlay's key is in the tunnel's join file only; the stream login is in its
-# own file only.
+# overlay's key is in the tunnel's join file only. The stream login is the
+# recipe's: it mints it and writes it, and this script never does.
 #
 # Exit codes 1001-1003 are cloudbase-init's reboot requests
 # (execcmd.get_plugin_return_value); this script exits 0 or 1 and nothing else.
@@ -37,14 +37,14 @@ $STEP = 'starting'
 $LABEL = ''
 $rc = 0
 try {
-    # Before anything is written under it: the status, the stream login and
-    # the steps are SYSTEM's and Administrators', never Users' (ProgramData's
+    # Before anything is written under it: the status, the recipe's stream
+    # login and the steps are SYSTEM's and Administrators', never Users' (ProgramData's
     # default lets Users read). A child with its own protected DACL, as the
     # tunnel's data directory has from the image, keeps it.
     New-Item -ItemType Directory -Force -Path $onv | Out-Null
     Set-OnvPrivate $onv -directory
 
-    $STEP = '1/4'
+    $STEP = '1/3'
     $LABEL = 'Starting the machine'
     Write-OnvStatus ("step={0}`nlabel={1}`n" -f $STEP, $LABEL)
     Write-Output "omnuv: step $STEP"
@@ -72,7 +72,7 @@ try {
         }
     }
 
-    $STEP = '2/4'
+    $STEP = '2/3'
     $LABEL = 'Joining your private network'
     Write-OnvStatus ("step={0}`nlabel={1}`n" -f $STEP, $LABEL)
     Write-Output "omnuv: step $STEP"
@@ -105,7 +105,7 @@ try {
         }
     }
 
-    $STEP = '3/4'
+    $STEP = '3/3'
     $LABEL = 'Finishing setup'
     Write-OnvStatus ("step={0}`nlabel={1}`n" -f $STEP, $LABEL)
     Write-Output "omnuv: step $STEP"
@@ -114,56 +114,6 @@ try {
         [System.IO.File]::WriteAllBytes($file, [Convert]::FromBase64String('77u/V3JpdGUtT3V0cHV0ICdhIHJlY2lwZSBzdGVwJw=='))
         & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $file
         if ($LASTEXITCODE -ne 0) { throw "the recipe's step exited $LASTEXITCODE" }
-    }
-
-    $STEP = '4/4'
-    $LABEL = 'Preparing your stream'
-    Write-OnvStatus ("step={0}`nlabel={1}`n" -f $STEP, $LABEL)
-    Write-Output "omnuv: step $STEP"
-    & {
-        # The stream's login, the Windows twin of the Linux recipe's
-        # /etc/onv/recipe-stream-credential (omnuv db/recipes/steam-gaming.sh): both
-        # halves random, minted here rather than sent down, so no secret is in desired
-        # state or on the drive. Sunshine keeps only a salted hash; the plaintext is in
-        # one file, SYSTEM's and Administrators', read by the provider through the
-        # guest agent and left in place, because Core takes only the first delivery.
-        $credential = 'C:\ProgramData\onv\recipe-stream-credential'
-        if (Test-Path -LiteralPath $credential) {
-            Write-Output 'omnuv: the stream login exists already'
-            return
-        }
-        $sunshine = 'C:\Program Files\Sunshine\sunshine.exe'
-        if (-not (Test-Path -LiteralPath $sunshine)) { throw 'this image has no Sunshine' }
-        function New-OnvToken([int] $length) {
-            $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-            $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-            $byte = New-Object byte[] 1
-            $token = New-Object System.Text.StringBuilder
-            while ($token.Length -lt $length) {
-                $random.GetBytes($byte)
-                # 248 is 4 x 62: every symbol equally likely.
-                if ($byte[0] -lt 248) { [void] $token.Append($alphabet[$byte[0] % 62]) }
-            }
-            $token.ToString()
-        }
-        $user = 'onv-' + (New-OnvToken 8)
-        $password = New-OnvToken 20
-        if ($user.Length -ne 12 -or $password.Length -ne 20) { throw 'the stream login came out short' }
-        # In argv for the length of the call, as on Linux: --creds takes it no other
-        # way. Its output is discarded, never logged. 'Continue' around it: Windows
-        # PowerShell turns a redirected native stderr line into a terminating error
-        # under 'Stop'.
-        $ErrorActionPreference = 'Continue'
-        & $sunshine --creds $user $password > $null 2> $null
-        $code = $LASTEXITCODE
-        $ErrorActionPreference = 'Stop'
-        if ($code -ne 0) { throw "sunshine --creds exited $code" }
-        # Inherits the onv directory's DACL, set before the first step.
-        [System.IO.File]::WriteAllText($credential, ("user={0}`npassword={1}`n" -f $user, $password), $utf8)
-        # Sunshine reads its login when it starts.
-        if (Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue) {
-            Restart-Service -Name 'SunshineService' -Force
-        }
     }
 
     $STEP = 'finished'

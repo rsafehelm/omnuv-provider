@@ -55,8 +55,11 @@ pub(crate) fn guest_kind(image: &ImageSpec) -> anyhow::Result<GuestKind> {
 /// Where a Windows machine's install says how it went: the twin of Linux's
 /// `/etc/onv/recipe-status`, the same `step=`/`label=`/`rc=` lines.
 pub(crate) const STATUS: &str = r"C:\ProgramData\onv\recipe-status";
-/// Where it leaves the stream login it minted: Linux's
+/// Where the recipe leaves the stream login it minted: Linux's
 /// `/etc/onv/recipe-stream-credential`, the same `user=`/`password=` lines.
+/// **The recipe is its only writer** (omnuv's `steam-gaming-windows.ps1`, as
+/// `steam-gaming.sh` on Linux); the agent reads and reports it, and its
+/// first-boot script never touches it.
 pub(crate) const STREAM_CREDENTIAL: &str = r"C:\ProgramData\onv\recipe-stream-credential";
 /// The tunnel's join file (W3; omnuv-client `tunnel/machine.go`, plan §5a).
 pub(crate) const JOIN: &str = r"C:\ProgramData\onv\tunnel\machine-join.json";
@@ -71,7 +74,6 @@ pub(crate) const FIRST_BOOT_LOG: &str = r"C:\Program Files\Cloudbase Solutions\C
 const SCRIPT: &str = include_str!("guest/windows-first-boot.ps1");
 const STEP_MACHINE: &str = include_str!("guest/windows-step-machine.ps1");
 const STEP_JOIN: &str = include_str!("guest/windows-step-join.ps1");
-const STEP_STREAM: &str = include_str!("guest/windows-step-stream.ps1");
 const STEPS_MARK: &str = "# @STEPS@\n";
 
 /// **The machine's NetBIOS name**: `onv-` and the first eleven hex digits of
@@ -285,10 +287,12 @@ fn steps(spec: &InstanceSpec) -> anyhow::Result<Vec<(&'static str, String)>> {
                 ),
             ));
         }
-        // The stream's login, only for a machine with a recipe: Core keeps
-        // it on the recipe's deployment, and a machine without one has
-        // nowhere for it to go.
-        steps.push(("Preparing your stream", STEP_STREAM.to_string()));
+        // **No stream login here.** The recipe mints it and writes
+        // `STREAM_CREDENTIAL`, as steam-gaming.sh does on Linux: one writer.
+        // A second mint after it would hand Sunshine one login while Core,
+        // which takes only the first delivery, kept the other. A machine
+        // with no recipe has no stream to sign in to (W2: no console
+        // password either), so nothing mints one at all.
     }
     Ok(steps)
 }
@@ -577,19 +581,25 @@ mod tests {
         assert_eq!(meta["local-hostname"].as_str(), Some("onv-3f2a9c1b04d"));
     }
 
-    /// Steps: numbered out of one total, the stream last and only with a
-    /// recipe, the join only with an enrolment; containers refused.
+    /// Steps: numbered out of one total, never a stream login (the
+    /// recipe's alone), the recipe's own steps last, the join only with an
+    /// enrolment; containers refused.
     #[test]
     fn the_steps_follow_what_the_machine_was_given() {
         let spec = windows_spec();
         let labels: Vec<&str> = steps(&spec).unwrap().iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, ["Starting the machine", "Joining your private network", "Finishing setup", "Preparing your stream"]);
+        assert_eq!(labels, ["Starting the machine", "Joining your private network", "Finishing setup"]);
         let script = first_boot_script(&spec).unwrap();
-        assert!(script.contains("$STEP = '4/4'") && !script.contains("$STEP = '5/"), "{script}");
+        assert!(script.contains("$STEP = '3/3'") && !script.contains("$STEP = '4/"), "{script}");
+        // One writer of the stream login: the recipe. Nothing here mints it,
+        // writes its file or tells Sunshine a login.
+        for needle in ["--creds", "recipe-stream-credential", "sunshine.exe", "SunshineService"] {
+            assert!(!script.contains(needle), "the first-boot script holds {needle}");
+        }
         assert!(!script.contains(STEPS_MARK));
         // The steps are indented into the template, which a here-string's
         // closing `'@` at column 0 would not survive.
-        for step in [STEP_MACHINE, STEP_JOIN, STEP_STREAM] {
+        for step in [STEP_MACHINE, STEP_JOIN] {
             assert!(!step.contains("@'") && !step.contains("@\""), "a here-string in a step");
         }
 
@@ -750,7 +760,7 @@ mod tests {
         let status_q = format!("/nodes/n1/qemu/700/agent/file-read?file={}", crate::proxmox::urlencode(STATUS));
         let cred_q = format!("/nodes/n1/qemu/700/agent/file-read?file={}", crate::proxmox::urlencode(STREAM_CREDENTIAL));
         assert!(status_q.ends_with("C%3A%5CProgramData%5Conv%5Crecipe-status"), "{status_q}");
-        for (status, want) in [("step=finished\nlabel=Preparing your stream\nrc=0\n", "done"), ("step=3/4\nlabel=Finishing setup\nrc=1\n", "error")] {
+        for (status, want) in [("step=finished\nlabel=Finishing setup\nrc=0\n", "done"), ("step=3/3\nlabel=Finishing setup\nrc=1\n", "error")] {
             let (sq, cq) = (status_q.clone(), cred_q.clone());
             let mock = Mock::start(move |_, path, _| {
                 if path == sq {
