@@ -346,63 +346,6 @@ fn loading_detail(t: Option<&omnuv_protocol::WorkloadReport>) -> Option<String> 
 }
 
 impl Client {
-    /// The same machine, looked for across **every node of the cluster**.
-    ///
-    /// Finds a VM this agent created, by kind tag plus marketplace id tag —
-    /// both, so nothing the marketplace did not create is ever acted on.
-    ///
-    /// **A provider is not a node.** A lookup that asked one node was what the
-    /// whole agent used (the last caller, `maintain`, went in PROVIDER-32): a machine this agent built on `nuc3`
-    /// was invisible to a reconcile pointed at `nuc0`, so it looked like a
-    /// machine that had never been created — and converging would have built a
-    /// *second* copy while the first kept its card attached. That is the
-    /// duplicate the rename guard exists to prevent, reached by another door.
-    ///
-    /// `/cluster/resources` is the runtime's own answer to *where is this*, and
-    /// asking it is one request rather than one per node.
-    pub(crate) async fn find_tagged_vm_anywhere(
-        &self,
-        kind: &str,
-        id_tag: &str,
-    ) -> anyhow::Result<Option<(String, VmRef)>> {
-        #[derive(serde::Deserialize)]
-        struct ClusterVm {
-            node: String,
-            vmid: u32,
-            #[serde(default)]
-            tags: Option<String>,
-        }
-        let tagged = |tags: Option<&str>| {
-            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && t.split(';').any(|x| x == id_tag))
-        };
-        let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
-        if let Some(v) = vms.into_iter().find(|v| tagged(v.tags.as_deref())) {
-            return Ok(Some((v.node, VmRef { vmid: v.vmid, tags: v.tags })));
-        }
-
-        // **A miss is confirmed before anyone acts on it (PROVIDER-5).** That
-        // aggregate is cached, and a miss is the dangerous answer: on create it
-        // means "clone another", on delete it means "gone — free the card".
-        // Whether its tags can lag a moment behind a clone depends on how
-        // fresh Proxmox keeps them, which nobody here has measured; so the
-        // absence is asked of every online node's live listing, the same way
-        // `reap_unused_segments` asks. A node that cannot be read means the
-        // absence cannot be concluded, never that nothing is there. An offline
-        // node's guests are still in the aggregate, and nothing is created on
-        // an offline node, so its freshness is not the question.
-        let nodes: Vec<serde_json::Value> = self.get_json("/nodes").await?;
-        for n in nodes.iter().filter(|n| n["status"].as_str() == Some("online")) {
-            let Some(node) = n["node"].as_str() else { continue };
-            let live: Vec<VmRef> = self.get_json(&format!("/nodes/{node}/qemu")).await.map_err(|e| {
-                anyhow::anyhow!("{node} could not be listed, so this machine's absence cannot be concluded: {e}")
-            })?;
-            if let Some(v) = live.into_iter().find(|v| tagged(v.tags.as_deref())) {
-                eprintln!("  the cluster listing missed VM {} on {node}; found live", v.vmid);
-                return Ok(Some((node.to_string(), v)));
-            }
-        }
-        Ok(None)
-    }
 
     /// Machines this agent built under the project's old name.
     ///
@@ -482,7 +425,7 @@ impl Client {
         // buyer machine competing for one GPU is the exact case *one physical
         // GPU, at most one active allocation* exists to forbid.
         if let Some((found, vm)) =
-            self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await?
+            self.the_guest(TAG, &spec.id).await?
         {
             let node = found.as_str();
             // Live status from the node, not the cached cluster aggregate —
@@ -1106,13 +1049,6 @@ fn worker_state(running: bool, has_address: bool, serving: bool) -> WorkerState 
     }
 }
 
-/// Tags cannot hold a full UUID with dashes cleanly, so a short prefix keys the
-/// association. Collisions are implausible at POC scale and would only ever
-/// affect this agent's own VMs.
-fn short_tag(worker_id: &str) -> String {
-    crate::names::short_tag(worker_id)
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1230,7 +1166,7 @@ mod tests {
 
     #[test]
     fn short_tag_is_stable_and_tag_safe() {
-        let t = short_tag("b48aedfb-205d-42fd-a6d3-3deafaeae938");
+        let t = crate::names::short_tag("b48aedfb-205d-42fd-a6d3-3deafaeae938");
         assert_eq!(t, "onv-b48aedfb205d");
         assert!(!t.contains('-') || t.starts_with("onv-"));
         assert!(t.len() <= 20);
@@ -1678,7 +1614,7 @@ mod a_worker_sent_built_is_looked_for {
     async fn a_worker_sent_built_that_is_there_is_reported_not_lost() {
         let (_root, dir) = snippets();
         let tags: &'static str = Box::leak(format!("{};{}", super::TAG, crate::names::short_tag(&spec().id)).into_boxed_str());
-        let mock = a_cluster(vec![(412, tags, crate::join::GATEWAY_POOL, String::new())]).await;
+        let mock = a_cluster(vec![(412, tags, crate::join::GATEWAY_POOL, crate::names::description(super::TAG, &spec().id))]).await;
         let status = ensure(&mock, &dir, Some(true), true).await.expect("a status");
         assert!(!lost(&status), "a worker that is there was said lost: {status:?}");
         assert_eq!(status.local_id.as_deref(), Some("412"));
@@ -1838,6 +1774,9 @@ mod a_worker_takes_its_new_configuration {
                 ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
                     {"node": "n1", "vmid": 801, "status": "running", "tags": format!("{TAG};{key}")}])),
                 ("GET", "/nodes/n1/qemu/801/status/current") => (200, serde_json::json!({"status": "running"})),
+                ("GET", "/nodes/n1/qemu/801/config") => {
+                    (200, serde_json::json!({"description": crate::names::description(TAG, "worker_abc")}))
+                }
                 ("PUT", "/nodes/n1/qemu/801/cloudinit") => (200, serde_json::Value::Null),
                 ("POST", "/nodes/n1/qemu/801/status/reboot") => (200, serde_json::json!("UPID:n1:reboot")),
                 _ => (500, serde_json::Value::Null),
@@ -1890,6 +1829,9 @@ mod a_worker_takes_its_new_configuration {
                     ("GET", "/cluster/resources?type=vm") => (200, serde_json::json!([
                         {"node": "n1", "vmid": 801, "status": listed, "tags": format!("{TAG};{key}")}])),
                     ("GET", "/nodes/n1/qemu/801/status/current") => (503, serde_json::Value::Null),
+                    ("GET", "/nodes/n1/qemu/801/config") => {
+                        (200, serde_json::json!({"description": crate::names::description(TAG, "worker_abc")}))
+                    }
                     _ => crate::pvemock::gate_clear(method, path).unwrap_or((200, serde_json::Value::Null)),
                 }
             })

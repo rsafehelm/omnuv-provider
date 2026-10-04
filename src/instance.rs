@@ -234,10 +234,31 @@ exit 1"#;
 /// answered its console, reported RUNNING, and had no networking and no
 /// enrolment — which is the first entry in `fixed.md`, met again from the
 /// other direction.
-fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment) -> String {
-    let hostname = o.hostname.clone().unwrap_or_default();
-    let host_arg =
-        if hostname.is_empty() { String::new() } else { format!(" --hostname {hostname}") };
+/// **What the machine's overlay peer is called: never the buyer's name** (the
+/// assets-by-id audit of 3 October 2026). Core's name when it sends one;
+/// otherwise `onv-m-<instance id>`, the whole id, in the form the overlay's
+/// own names take. Left unset, NetBird named the peer after the guest's
+/// hostname, which is the buyer's name: a machine made again under a deleted
+/// one's name enrolled as a namesake peer, and anything finding peers by name
+/// found the wrong one.
+fn peer_name(o: &omnuv_protocol::OverlayEnrolment, instance_id: &str) -> String {
+    o.hostname.clone().filter(|h| !h.trim().is_empty()).unwrap_or_else(|| format!("onv-m-{instance_id}"))
+}
+
+/// The guest's hostname. The buyer's name is a display name inside the guest
+/// (its prompt, `/etc/hosts`), and stays so where it identifies nothing: no
+/// overlay, or a peer Core named. When Core enrols the machine and names no
+/// peer, the guest takes the peer's id-based name, so the two agree and the
+/// buyer's name is nowhere an identity is read from.
+fn guest_hostname(spec: &InstanceSpec) -> String {
+    match &spec.overlay {
+        Some(o) if o.hostname.as_deref().is_none_or(|h| h.trim().is_empty()) => peer_name(o, &spec.id),
+        _ => spec.name.clone(),
+    }
+}
+
+fn overlay_runcmd(o: &omnuv_protocol::OverlayEnrolment, instance_id: &str) -> String {
+    let host_arg = format!(" --hostname {}", peer_name(o, instance_id));
     format!(
         "  - [ sh, -c, \"netbird up --management-url {url} --setup-key {key}{host_arg} \
          >/var/log/onv-overlay.log 2>&1 || true\" ]\n",
@@ -576,8 +597,8 @@ runcmd:
   - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
 {recipe_join}{overlay}{network_final}{recipe_final}"#,
         apt = apt,
-        name = spec.name,
-        overlay = spec.overlay.as_ref().map(overlay_runcmd).unwrap_or_default(),
+        name = guest_hostname(spec),
+        overlay = spec.overlay.as_ref().map(|o| overlay_runcmd(o, &spec.id)).unwrap_or_default(),
         recipe_files = spec.recipe.as_ref().map(recipe_files).unwrap_or_default(),
         recipe_boot = early.first().map(|l| status_line(1, total, l, true)).unwrap_or_default(),
         recipe_join = early.get(1).map(|l| status_line(2, total, l, false)).unwrap_or_default(),
@@ -835,7 +856,7 @@ impl Client {
         // Not even looked at: nothing is known about this machine, so nothing
         // is claimed about it (PROVIDER-26). See `NotLookedAt`.
         if let Some((node, vm)) = self
-            .find_tagged_vm_anywhere(TAG, &short_tag(&spec.id))
+            .the_guest(TAG, &spec.id)
             .await
             .map_err(|e| anyhow::Error::from(NotLookedAt(format!("{e:#}"))))?
         {
@@ -1689,7 +1710,7 @@ impl Client {
             // every machine after it down. A lookup that fails is said and
             // skipped — never read as "absent", which would be the same as
             // creating on a guess — and the pass goes on.
-            let found = match self.find_tagged_vm_anywhere(TAG, &short_tag(&spec.id)).await {
+            let found = match self.the_guest(TAG, &spec.id).await {
                 Ok(Some(found)) => found,
                 Ok(None) => continue,
                 Err(e) => {
@@ -2514,6 +2535,7 @@ mod tests {
         sp.intent = Lifecycle::Running;
         sp.reboot_token = Some("t-fails".into());
         let key = short_tag(&sp.id);
+        let stamp = crate::names::description(TAG, &sp.id);
         let mock = Mock::start(move |method, path, _| {
             if let Some(ok) = task_ok(path) {
                 return ok;
@@ -2524,6 +2546,7 @@ mod tests {
                 ])),
                 ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 9000})),
                 ("POST", "/nodes/n1/qemu/700/status/reboot") => (500, serde_json::json!(null)),
+                ("GET", p) if p.ends_with("/qemu/700/config") => (200, serde_json::json!({"description": stamp.clone()})),
                 ("GET", _) => (200, serde_json::json!({})),
                 _ => (200, serde_json::Value::Null),
             }
@@ -2589,6 +2612,7 @@ mod tests {
             sp.intent = Lifecycle::Stopped;
             sp.attempt = attempt;
             let key = short_tag(&sp.id);
+            let stamp = crate::names::description(TAG, &sp.id);
             let mock = Mock::start(move |method, path, _| {
                 if let Some(ok) = task_ok(path) {
                     return ok;
@@ -2598,13 +2622,14 @@ mod tests {
                         {"node": "n1", "vmid": 700, "status": "stopped", "tags": format!("{TAG};{key}")}
                     ])),
                     ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "stopped"})),
-                    ("GET", "/nodes/n1/qemu/700/config") => (200, serde_json::json!({"hostpci0": "mapping=onv-gpu-a,pcie=1"})),
+                    ("GET", "/nodes/n1/qemu/700/config") => (200, serde_json::json!({"description": stamp.clone(), "hostpci0": "mapping=onv-gpu-a,pcie=1"})),
                     ("GET", "/nodes/n1/qemu") => (200, match card_held_by {
                         Some(other) => serde_json::json!([{"vmid": 700, "status": "stopped"}, {"vmid": other, "status": "running"}]),
                         None => serde_json::json!([{"vmid": 700, "status": "stopped"}]),
                     }),
                     ("GET", "/nodes/n1/qemu/800/config") => (200, serde_json::json!({"hostpci0": "mapping=onv-gpu-a,pcie=1"})),
                     ("GET", "/nodes/n1/tasks?source=active") => (200, serde_json::json!([])),
+                    ("GET", p) if p.ends_with("/qemu/700/config") => (200, serde_json::json!({"description": stamp.clone()})),
                     ("GET", _) => (200, serde_json::json!({})),
                     _ => (200, serde_json::Value::Null),
                 }
@@ -2647,6 +2672,7 @@ mod tests {
         sp.intent = Lifecycle::Running;
         sp.reboot_token = Some("t-1".into());
         let key = short_tag(&sp.id);
+        let stamp = crate::names::description(TAG, &sp.id);
         let uptime = Arc::new(AtomicU64::new(86_400));
         let fail_task = Arc::new(AtomicBool::new(false));
         let (up, fail) = (uptime.clone(), fail_task.clone());
@@ -2665,6 +2691,7 @@ mod tests {
                     (200, serde_json::json!({"status": "running", "uptime": up.load(Ordering::SeqCst)}))
                 }
                 ("POST", "/nodes/n1/qemu/700/status/reboot") => (200, serde_json::json!("UPID:n1:0001:reboot")),
+                ("GET", p) if p.ends_with("/qemu/700/config") => (200, serde_json::json!({"description": stamp.clone()})),
                 ("GET", _) => (200, serde_json::json!({})),
                 _ => (200, serde_json::Value::Null),
             }
@@ -2865,6 +2892,7 @@ mod tests {
         let mut second = first.clone();
         second.id = "22222222-2222-4222-8222-222222222222".into();
         let (a, b) = (short_tag(&first.id), short_tag(&second.id));
+        let (sa, sb) = (crate::names::description(TAG, &first.id), crate::names::description(TAG, &second.id));
         let mock = Mock::start(move |method, path, _| {
             if let Some(r) = task_ok(path) {
                 return r;
@@ -2878,6 +2906,8 @@ mod tests {
                 ("GET", "/nodes/n1/qemu/701/status/current") | ("GET", "/nodes/n2/qemu/702/status/current") => {
                     (200, serde_json::json!({"status": "stopped"}))
                 }
+                ("GET", "/nodes/n1/qemu/701/config") => (200, serde_json::json!({"description": sa.clone()})),
+                ("GET", "/nodes/n2/qemu/702/config") => (200, serde_json::json!({"description": sb.clone()})),
                 ("POST", "/nodes/n1/qemu/701/status/start") => (500, serde_json::Value::Null),
                 ("POST", "/nodes/n2/qemu/702/status/start") => (200, serde_json::json!("UPID:n2:start")),
                 _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
@@ -3716,6 +3746,7 @@ mod tests {
         sp.network = None;
         sp.intent = Lifecycle::Running;
         let key = short_tag(&sp.id);
+        let stamp = crate::names::description(TAG, &sp.id);
         let tags = format!("{TAG};{key}");
         let mock = Mock::start(move |method, path, _| {
             if let Some(ok) = task_ok(path) {
@@ -3728,6 +3759,7 @@ mod tests {
                 ("GET", "/nodes/n1/qemu/700/status/current") => (200, serde_json::json!({"status": "running", "uptime": 9000})),
                 // The drive refresh, and nothing else, fails.
                 ("PUT", "/nodes/n1/qemu/700/cloudinit") => (500, serde_json::json!(null)),
+                ("GET", p) if p.ends_with("/qemu/700/config") => (200, serde_json::json!({"description": stamp.clone()})),
                 ("GET", _) => (200, serde_json::json!({})),
                 _ => (200, serde_json::Value::Null),
             }
@@ -4199,9 +4231,38 @@ mod tests {
             management_url: "https://example.invalid".into(),
             hostname: None,
         };
-        let frag = overlay_runcmd(&o);
+        let frag = overlay_runcmd(&o, "abcdef12-0000-0000-0000-000000000000");
         assert!(frag.ends_with('\n'), "overlay fragment does not end a line");
         assert!(!frag.starts_with('\n'), "overlay fragment starts a line it did not open");
+    }
+
+    /// **The peer is never named after the buyer's machine name** (the
+    /// assets-by-id audit, 3 October 2026). With no name from Core, the peer
+    /// and the guest both take `onv-m-<instance id>`; with one, the peer takes
+    /// Core's and the guest keeps the buyer's name for display; with no
+    /// overlay, nothing is enrolled and the guest keeps the buyer's name.
+    #[test]
+    fn a_peer_is_named_by_id_never_by_the_buyers_name() {
+        let mut sp = spec_with_network();
+        let id = sp.id.clone();
+        sp.overlay = Some(omnuv_protocol::OverlayEnrolment {
+            setup_key: "k".into(),
+            management_url: "https://example.invalid".into(),
+            hostname: None,
+        });
+        let ci = cloud_init(&sp, None, 101);
+        assert!(ci.contains(&format!("--hostname onv-m-{id}")), "the peer took no id-based name: {ci}");
+        assert!(ci.contains(&format!("hostname: onv-m-{id}\n")), "the guest's hostname was not the peer's");
+        assert!(!ci.contains("hostname: gpu-1\n") && !ci.contains("--hostname gpu-1"), "the buyer's name identified something");
+
+        sp.overlay.as_mut().unwrap().hostname = Some("gpu-1-abcdef12".into());
+        let ci = cloud_init(&sp, None, 101);
+        assert!(ci.contains("--hostname gpu-1-abcdef12"), "Core's peer name was not used");
+        assert!(ci.contains("hostname: gpu-1\n"), "the guest lost its display name though Core named the peer");
+
+        sp.overlay = None;
+        let ci = cloud_init(&sp, None, 101);
+        assert!(!ci.contains("--hostname") && ci.contains("hostname: gpu-1\n"), "{ci}");
     }
 
     fn spec_with_network() -> InstanceSpec {

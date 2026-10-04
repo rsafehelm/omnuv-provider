@@ -1765,6 +1765,7 @@ mod handshake_tests {
         spec["recipe"] = serde_json::json!({"id": "ollama-openwebui", "compose": "services: {}", "post_up": []});
         let id = spec["id"].as_str().unwrap().to_string();
         let key = crate::names::short_tag(&id);
+        let stamp = crate::names::description(crate::instance::TAG, &id);
         let view = serde_json::json!({
             "protocol_version": omnuv_protocol::PROTOCOL_VERSION,
             "version": 1,
@@ -1787,6 +1788,7 @@ mod handshake_tests {
                     (200, serde_json::json!({"content": said.lock().unwrap().clone()}))
                 }
                 ("GET", p) if p.contains("/agent/") => (500, serde_json::Value::Null),
+                ("GET", "/nodes/n1/qemu/700/config") => (200, serde_json::json!({"description": stamp.clone()})),
                 ("GET", _) => (200, serde_json::json!({})),
                 _ => (200, serde_json::Value::Null),
             }
@@ -2102,6 +2104,7 @@ mod handshake_tests {
         view["instances"][0]["lifecycle"] = serde_json::json!("running");
         let id = view["instances"][0]["id"].as_str().unwrap().to_string();
         let claim = format!("{};{}", crate::instance::TAG, crate::names::short_tag(&id));
+        let stamp = crate::names::description(crate::instance::TAG, &id);
         for (again, started) in [("stopped", false), ("running", true)] {
             let mut later = view.clone();
             later["version"] = serde_json::json!(6);
@@ -2119,7 +2122,7 @@ mod handshake_tests {
                 }
             })
             .await;
-            let claim = claim.clone();
+            let (claim, stamp) = (claim.clone(), stamp.clone());
             let pve = crate::pvemock::Mock::start(move |method, path, _| {
                 if let Some(r) = crate::pvemock::task_ok(path) {
                     return r;
@@ -2130,6 +2133,7 @@ mod handshake_tests {
                         {"node": "n1", "vmid": 900, "status": "stopped", "tags": claim}])),
                     ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([{"vmid": 900, "status": "stopped", "tags": claim}])),
                     ("GET", "/nodes/n1/qemu/900/status/current") => (200, serde_json::json!({"status": "stopped"})),
+                    ("GET", "/nodes/n1/qemu/900/config") => (200, serde_json::json!({"description": stamp.clone()})),
                     ("POST", "/nodes/n1/qemu/900/status/start") => (200, serde_json::json!("UPID:n1:start")),
                     _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
                 }

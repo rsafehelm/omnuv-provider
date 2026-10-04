@@ -1765,7 +1765,9 @@ mod home_node_tests {
     /// makes absence unknowable, which is an error, never `None`.
     #[tokio::test]
     async fn a_machine_the_cluster_listing_missed_is_found_live_or_not_concluded() {
-        let key = "onv-0a0b0c0d0e0f";
+        let id = "0a0b0c0d-0e0f-4000-8000-000000000001";
+        let key = crate::names::short_tag(id);
+        let stamp = crate::names::description("onv-instance", id);
         let mock = crate::pvemock::Mock::start(move |_, path, _| match path {
             "/cluster/resources?type=vm" => (200, serde_json::json!([])),
             "/nodes" => (200, serde_json::json!([
@@ -1777,10 +1779,11 @@ mod home_node_tests {
             "/nodes/pve-b/qemu" => (200, serde_json::json!([
                 {"vmid": 812, "status": "running", "tags": format!("onv-instance;{key}")}
             ])),
+            "/nodes/pve-b/qemu/812/config" => (200, serde_json::json!({"description": stamp})),
             _ => (404, serde_json::Value::Null),
         })
         .await;
-        let (node, vm) = mock.client().find_tagged_vm_anywhere("onv-instance", key).await
+        let (node, vm) = mock.client().the_guest("onv-instance", id).await
             .expect("the lookup")
             .expect("a machine the aggregate missed was taken as absent");
         assert_eq!((node.as_str(), vm.vmid), ("pve-b", 812));
@@ -1793,9 +1796,55 @@ mod home_node_tests {
         })
         .await;
         assert!(
-            blind.client().find_tagged_vm_anywhere("onv-instance", key).await.is_err(),
+            blind.client().the_guest("onv-instance", id).await.is_err(),
             "a node that could not be read was taken as holding nothing"
         );
+    }
+
+    /// **A live action finds a machine by its whole id, never the first
+    /// twelve-digit match** (the assets-by-id audit, 3 October 2026). Two
+    /// guests share the first twelve hex digits of two different ids: each
+    /// id finds only its own, by the stamp. Two guests carrying one claim are
+    /// refused, never one of them taken; and a lone guest stamped with another
+    /// id is not this machine.
+    #[tokio::test]
+    async fn a_machine_is_found_by_its_whole_id_and_a_twin_is_refused() {
+        let mine = "0a0b0c0d-0e0f-4000-8000-000000000001";
+        let other = "0a0b0c0d-0e0f-4999-8999-999999999999";
+        let key = crate::names::short_tag(mine);
+        assert_eq!(key, crate::names::short_tag(other), "the fixture needs a twelve-digit twin");
+        let listing = |vms: serde_json::Value| vms;
+        let config = |id: &str| serde_json::json!({"description": crate::names::description("onv-instance", id)});
+        // Two carriers: one is mine, one is the twin's.
+        let (k, c_mine, c_other) = (key.clone(), config(mine), config(other));
+        let two = crate::pvemock::Mock::start(move |_, path, _| match path {
+            "/cluster/resources?type=vm" => (200, listing(serde_json::json!([
+                {"node": "pve-a", "vmid": 101, "tags": format!("onv-instance;{k}")},
+                {"node": "pve-a", "vmid": 102, "tags": format!("onv-instance;{k}")},
+            ]))),
+            "/nodes/pve-a/qemu/101/config" => (200, c_other.clone()),
+            "/nodes/pve-a/qemu/102/config" => (200, c_mine.clone()),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let err = two.client().the_guest("onv-instance", mine).await.expect_err("two carriers, one taken");
+        assert!(format!("{err:#}").contains("2 guests carry"), "{err:#}");
+
+        // One carrier, stamped with the other id: not mine, and not "absent".
+        let (k, c_other) = (key.clone(), config(other));
+        let twin = crate::pvemock::Mock::start(move |_, path, _| match path {
+            "/cluster/resources?type=vm" => (200, serde_json::json!([
+                {"node": "pve-a", "vmid": 101, "tags": format!("onv-instance;{k}")},
+            ])),
+            "/nodes/pve-a/qemu/101/config" => (200, c_other.clone()),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+        let err = twin.client().the_guest("onv-instance", mine).await.expect_err("a twin taken for this machine");
+        assert!(format!("{err:#}").contains("not its whole id"), "{err:#}");
+        // And the twin's own id finds it.
+        let (node, vm) = twin.client().the_guest("onv-instance", other).await.unwrap().expect("its own id");
+        assert_eq!((node.as_str(), vm.vmid), ("pve-a", 101));
     }
 
     /// And the console, which asked the configured node alone: a machine on
@@ -1808,6 +1857,9 @@ mod home_node_tests {
                 {"node": "pve-b", "vmid": 701, "status": "running", "tags": format!("onv-instance;{key}")}
             ])),
             "/nodes/pve-b/qemu/701/status/current" => (200, serde_json::json!({"status": "stopped"})),
+            "/nodes/pve-b/qemu/701/config" => (200, serde_json::json!({
+                "description": crate::names::description("onv-instance", "7e7e7e7e-0000-4000-8000-000000000001")
+            })),
             _ => (404, serde_json::Value::Null),
         })
         .await;

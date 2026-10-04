@@ -160,7 +160,7 @@ impl Client {
     /// the first could never ask it.
     ///
     /// None in the cluster listing is confirmed against every online node's
-    /// live listing, as `find_tagged_vm_anywhere` does (PROVIDER-5): a miss is
+    /// live listing (PROVIDER-5): a miss is
     /// the dangerous answer, and a node that cannot be read means absence
     /// cannot be concluded.
     pub(crate) async fn claimed_guests(&self, kind: &str, id: &str) -> anyhow::Result<Vec<Claimed>> {
@@ -198,6 +198,52 @@ impl Client {
             );
         }
         Ok(live)
+    }
+
+    /// **The one guest that is this machine, by its whole id** (the assets-by-id
+    /// audit of 3 October 2026). Live actions and the console used to take the
+    /// first guest carrying the claim and twelve hex digits of the id, where a
+    /// delete refused a twin (licence (a)); now every reader asks the same
+    /// question a delete does. Every guest carrying the claim is listed
+    /// (`claimed_guests`, a miss confirmed on every node), and the answer is:
+    ///
+    /// ```text
+    /// none                          Ok(None): it is not here
+    /// one, stamped with this id     that guest
+    /// one, stamped with another     refused: a twelve-digit twin is not this machine
+    /// two or more                   refused, naming them: which is it is the operator's
+    /// ```
+    ///
+    /// A refusal is an error, never `None`: `None` means "build it" to a
+    /// create and "gone" to a delete, and neither is true of a twin.
+    pub(crate) async fn the_guest(&self, kind: &str, id: &str) -> anyhow::Result<Option<(String, VmRef)>> {
+        let found = self.claimed_guests(kind, id).await?;
+        let one = match found.as_slice() {
+            [] => return Ok(None),
+            [one] => one.clone(),
+            many => {
+                let named: Vec<String> = many.iter().map(|c| format!("vm {} on {}", c.vm.vmid, c.node)).collect();
+                anyhow::bail!(
+                    "{} guests carry the claim of {id} ({}); none is acted on, and the operator decides which, if any, is it",
+                    many.len(),
+                    named.join(", ")
+                );
+            }
+        };
+        let config: serde_json::Value = self
+            .get_json(&format!("/nodes/{}/qemu/{}/config", one.node, one.vm.vmid))
+            .await
+            .map_err(|e| anyhow::anyhow!("vm {} on {}: its stamp could not be read: {e}", one.vm.vmid, one.node))?;
+        let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
+        if first != Some(crate::names::stamped(kind, id).as_str()) {
+            anyhow::bail!(
+                "vm {} on {} carries the tag of {id} but not its whole id (its stamp reads {:?}); it is not that machine, and nothing is done to it",
+                one.vm.vmid,
+                one.node,
+                first.unwrap_or("")
+            );
+        }
+        Ok(Some((one.node, one.vm)))
     }
 
     /// **Every guest carrying this machine's clone stamp and not its claim**

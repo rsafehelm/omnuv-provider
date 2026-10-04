@@ -85,7 +85,7 @@ impl Client {
         // "the whole cluster" — every console asked `/nodes//qemu` and failed,
         // and on a cluster a machine on any other host had no console at all.
         let Some((node, vm)) = self
-            .find_tagged_vm_anywhere(crate::instance::TAG, &crate::instance::short_tag(instance_id))
+            .the_guest(crate::instance::TAG, instance_id)
             .await?
         else {
             anyhow::bail!("no such machine on this provider");
