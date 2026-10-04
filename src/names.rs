@@ -268,6 +268,14 @@ pub fn snippet_network(id: &str) -> String {
     format!("{PREFIX}-net-{id}.yaml")
 }
 
+/// A Windows machine's NoCloud **meta-data**: its instance-id (the machine's
+/// id) and its NetBIOS name (`guest_windows::meta_data`). Linux machines have
+/// none: Proxmox's own meta-data is theirs, and changing it would change their
+/// instance-id and rerun their first boot.
+pub fn snippet_meta(id: &str) -> String {
+    format!("{PREFIX}-meta-{id}.yaml")
+}
+
 /// The cloud-init snippet an inference worker reads at first boot.
 ///
 /// **Named for its kind, as of 13 September 2026.** It used to be
@@ -302,6 +310,7 @@ pub fn snippet_owner(filename: &str) -> Option<(SnippetKind, &str)> {
     for (prefix, kind) in [
         ("instance-", SnippetKind::Instance),
         ("net-", SnippetKind::Network),
+        ("meta-", SnippetKind::Meta),
         ("worker-", SnippetKind::Worker),
     ] {
         if let Some(id) = body.strip_prefix(prefix) {
@@ -322,6 +331,8 @@ pub fn snippet_owner(filename: &str) -> Option<(SnippetKind, &str)> {
 pub enum SnippetKind {
     Instance,
     Network,
+    /// A Windows machine's meta-data (`snippet_meta`).
+    Meta,
     Worker,
     /// A worker snippet written before the rename. Its origin is ours by
     /// grammar, but a file of uncertain origin is reported rather than removed.
@@ -451,6 +462,7 @@ mod tests {
         assert!(short_tag("2f8a1c0d-dead-beef").starts_with("onv-"));
         assert!(snippet_instance("x").starts_with("onv-"));
         assert!(snippet_network("x").starts_with("onv-"));
+        assert!(snippet_meta("x").starts_with("onv-"));
         assert!(snippet_worker("x").starts_with("onv-worker-"));
         assert_eq!(snippet_worker_legacy("x"), "onv-x.yaml");
         assert!(vnet("c4d90fd2-be3d").starts_with("onv"));
@@ -588,6 +600,7 @@ mod snippet_grammar_tests {
         );
         assert_eq!(snippet_owner(&snippet_instance(id)), Some((SnippetKind::Instance, id)));
         assert_eq!(snippet_owner(&snippet_network(id)), Some((SnippetKind::Network, id)));
+        assert_eq!(snippet_owner(&snippet_meta(id)), Some((SnippetKind::Meta, id)));
     }
 
     /// **A prefix is recognition, not authority.** Anything whose grammar we do
