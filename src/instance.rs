@@ -35,12 +35,20 @@ pub(crate) const LOST: &str = "this machine is no longer on its provider and was
 
 const NO_FORM: &[(String, String)] = &[];
 
-/// The isolated bridge a buyer machine attaches to: its own network's segment
-/// on this provider, one vnet per network in the marketplace zone (see `sdn`).
-/// The network's gateway creates it and is the only other thing on it, so a
-/// machine of another tenant is never on the same wire.
-pub(crate) fn marketplace_bridge(net: &NetworkAttachment) -> String {
-    crate::sdn::vnet_for(&net.network_id)
+/// The isolated bridge a new machine's second interface attaches to: its own
+/// network's segment on this provider, the one `ensure_vnet` found or made by
+/// the alias naming the whole network id. The network's gateway is the only
+/// other thing on it, so a machine of another tenant is never on the same wire.
+///
+/// **Never a name derived from the id** (the assets-by-id audit of 3 October
+/// 2026). This was `marketplace_bridge`, `onv` plus five hex digits of the
+/// network id, and the fallback when no segment had been found: the name
+/// another network sharing those digits may hold (`sdn::choose` passes over
+/// it for that reason). With no segment found, the build is refused.
+fn segment_for_build(segment_bridge: Option<&str>, net: &NetworkAttachment) -> anyhow::Result<String> {
+    segment_bridge.map(str::to_string).ok_or_else(|| {
+        anyhow::anyhow!("no segment was found for network {} on this provider, so the machine is not built", net.network_id)
+    })
 }
 
 /// The NAT bridge a buyer machine's internet interface attaches to. Also
@@ -844,12 +852,12 @@ impl Client {
         // Idempotent and cheap: `ensure_vnet` returns immediately when the vnet
         // is defined and applied, so every machine after the first on a given
         // provider pays one API read.
-        // The vnet this network actually has here, which is not always the
-        // name `marketplace_bridge` computes: see `ensure_vnet`.
+        // The vnet this network actually has here, found by the alias naming
+        // the whole network id: see `ensure_vnet`. A machine being removed
+        // needs none, and none is derived for it.
         let segment_bridge = match &spec.network {
             Some(net) if spec.intent != Lifecycle::Absent => Some(self.ensure_vnet(node, &net.network_id).await?),
-            Some(net) => Some(marketplace_bridge(net)),
-            None => None,
+            Some(_) | None => None,
         };
 
         // **Cluster-wide, or a machine on another node is built twice.** The
@@ -1444,7 +1452,7 @@ impl Client {
                 config.push((
                     "net1".to_string(),
                     format!("virtio={},bridge={}", marketplace_mac(&spec.id),
-                            segment_bridge.clone().unwrap_or_else(|| marketplace_bridge(net))),
+                            segment_for_build(segment_bridge.as_deref(), net)?),
                 ));
             }
             let answer = self.post_form::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config"), &config).await?;
@@ -2227,6 +2235,24 @@ pub(crate) fn maintenance_may_touch(lifecycle: Lifecycle, exists: bool, running:
 
 #[cfg(test)]
 mod tests {
+
+    /// **A new machine's segment is the one found by the whole network id,
+    /// never one derived from five hex digits of it** (the assets-by-id
+    /// audit of 3 October 2026). `onv` plus five digits is the name another
+    /// network sharing them may hold; only `ensure_vnet`'s answer, by the
+    /// alias, names this network's bridge. Without it the build refuses.
+    #[test]
+    fn a_machine_is_built_only_on_the_segment_its_whole_network_id_found() {
+        let net = NetworkAttachment {
+            network_id: "c4d90fd2-be3d-4225-a4a6-265138a76e49".into(),
+            dns_name: None,
+            mac: "02:09:a4:76:f8:ee".into(),
+        };
+        // ensure_vnet passed over the first name, held by another network.
+        assert_eq!(segment_for_build(Some("onv1a2b3"), &net).unwrap(), "onv1a2b3");
+        let none = segment_for_build(None, &net);
+        assert!(none.is_err(), "a segment derived from five hex digits was taken: {none:?}");
+    }
 
     /// **A create that fails after the clone undoes the clone.** Through the
     /// real client: the resize fails, so the machine this call just cloned
