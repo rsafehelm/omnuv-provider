@@ -105,8 +105,23 @@ pub fn config(fingerprint: Option<&str>) -> anyhow::Result<Arc<rustls::ClientCon
     ))
 }
 
+/// Below pveproxy's 5 s idle close, with room for the clocks of two
+/// processes and a request already being written.
+const PVEPROXY_IDLE_MARGIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The Proxmox API's client.
+///
+/// **An idle connection is dropped before pveproxy drops it.** pveproxy closes
+/// a kept-alive connection after 5 s idle (`$self->{timeout} = 5`,
+/// PVE::APIServer::AnyEvent, PVE 9.2) and reqwest keeps one for 90 s by
+/// default, so a request after a pause of 5 to 90 s went out on a connection
+/// the far side had closed: "connection closed before message completed".
+/// On Pluto on 5 October 2026 that was every mirror retry, because hashing the
+/// staged 9 GB image took longer than 5 s between two requests.
 pub fn client(tls: Arc<rustls::ClientConfig>) -> anyhow::Result<reqwest::Client> {
-    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+    let builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .pool_idle_timeout(PVEPROXY_IDLE_MARGIN);
     Ok(builder.use_preconfigured_tls(Arc::unwrap_or_clone(tls)).build()?)
 }
 
