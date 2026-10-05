@@ -118,7 +118,7 @@ pub fn template_requests(
     environment: Option<&str>,
 ) -> [Vec<(String, String)>; 3] {
     let kv = |k: &str, v: String| (k.to_string(), v);
-    let mut create = vec![
+    let create = vec![
         kv("vmid", vmid.to_string()),
         kv("name", format!("{}-{}", crate::names::PREFIX, id)),
         // Per clone, whatever the template says: the machine's own size.
@@ -141,11 +141,6 @@ pub fn template_requests(
         kv("pool", crate::names::POOL.into()),
         kv("description", description(id, sha256)),
     ];
-    // The deployment it belongs to, as every machine this agent makes says
-    // it (`names::tags`); never a claim, so a template stays a template.
-    if let Some(env) = environment.map(str::trim).filter(|e| !e.is_empty()) {
-        create.push(kv("tags", format!("{}-{env}", crate::names::PREFIX)));
-    }
     let disk = vec![kv(
         "scsi0",
         match shape {
@@ -172,6 +167,20 @@ pub fn template_requests(
             kv("vga", "std".into()),
         ],
     };
+    // The deployment it belongs to, as every machine this agent makes says
+    // it (`names::tags`); never a claim, so a template stays a template.
+    //
+    // **Set with the finish, never at create.** qemu-server 9.2.7 checks a
+    // create's tags against `/vms/<vmid>` with no pool (`assert_tag_permissions`
+    // in the create worker, `check_vm_perm(…, undef, ['VM.Config.Options'])`),
+    // and this token's rights reach a VM only through the `onv` pool it is not
+    // yet in. On Titan on 5 October 2026 every import was refused so, while
+    // Pluto's 9.1.16, which checks no tags at create, imported. Once created
+    // the VM is a pool member, and the finish's PUT is allowed.
+    let mut finish = finish;
+    if let Some(env) = environment.map(str::trim).filter(|e| !e.is_empty()) {
+        finish.push(kv("tags", format!("{}-{env}", crate::names::PREFIX)));
+    }
     [create, disk, finish]
 }
 
@@ -652,6 +661,12 @@ mod tests {
             calls.iter().filter(|c| c.method == m && c.path == "/nodes/n1/qemu/9005/config" && c.body.contains("import-from")).count()
         };
         assert_eq!((imports("POST"), imports("PUT")), (1, 0), "the disk was not imported as one task");
+        // **No tags at create**: qemu-server 9.2.7 checks them against a VM
+        // not yet in the pool that grants this token anything.
+        assert!(
+            calls.iter().filter(|c| c.method == "POST" && c.path == "/nodes/n1/qemu").all(|c| !c.body.contains("tags=")),
+            "the create carries tags"
+        );
         // Two tasks are waited on: the create's, and the import's.
         let waits = calls.iter().filter(|c| c.method == "GET" && c.path.starts_with("/nodes/n1/tasks/") && c.path.ends_with("/status")).count();
         assert_eq!(waits, 2, "the import's task was not waited on");
