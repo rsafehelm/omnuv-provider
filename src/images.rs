@@ -356,6 +356,48 @@ pub fn outstanding<'a>(
         .collect()
 }
 
+/// **Every template of ours says its environment, whenever it was made**
+/// (the operator, 5 October 2026). The mirror tags what it imports, but only
+/// since 6782fb8, and `build-template.yml` tagged nothing; a template whose
+/// digest never moves is never imported again, so six templates on Pluto and
+/// Titan stayed untagged. This adds `onv-<environment>` to each template that
+/// is this image's (`is_this_images_template`), keeping every tag it carries.
+/// A tag is metadata: nothing is rebuilt. Answers the vmids it tagged.
+pub async fn ensure_environment_tags(
+    px: &crate::proxmox::Client,
+    node: &str,
+    offered: &std::collections::BTreeMap<String, u32>,
+) -> Vec<u32> {
+    let Some(env) = px.environment.as_deref().map(str::trim).filter(|e| !e.is_empty()) else {
+        return Vec::new();
+    };
+    let want = format!("{}-{env}", crate::names::PREFIX);
+    let mut tagged = Vec::new();
+    for (id, vmid) in offered {
+        let Ok(cfg) = px.get_json::<serde_json::Value>(&format!("/nodes/{node}/qemu/{vmid}/config")).await else {
+            continue;
+        };
+        if !is_this_images_template(&cfg, id) {
+            continue;
+        }
+        let tags = cfg.get("tags").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let mut tokens: Vec<&str> =
+            tags.split(&[';', ','][..]).map(str::trim).filter(|t| !t.is_empty()).collect();
+        if tokens.contains(&want.as_str()) {
+            continue;
+        }
+        tokens.push(&want);
+        match px
+            .put_form::<Option<serde_json::Value>>(&format!("/nodes/{node}/qemu/{vmid}/config"), &[("tags", tokens.join(";"))])
+            .await
+        {
+            Ok(_) => tagged.push(*vmid),
+            Err(e) => eprintln!("image {id}: template {vmid} could not be tagged {want}: {e:#}"),
+        }
+    }
+    tagged
+}
+
 /// What this provider actually holds, read from the templates themselves.
 ///
 /// **Observed, never inferred from having fetched.** The invariant is written
@@ -627,6 +669,55 @@ mod tests {
             assert!(result.is_ok() && deleted, "this image's own {why} template was not replaced: {result:?}");
         }
     }
+    /// **A held template gains its environment tag and keeps the rest**; one
+    /// already tagged, an operator's template, our unfinished import and a
+    /// client with no environment are all left alone.
+    #[tokio::test]
+    async fn held_templates_are_tagged_with_their_environment() {
+        use crate::pvemock::Mock;
+        let ours = |vmid: u32, id: &str, tags: &str| {
+            serde_json::json!({"name": format!("onv-{id}"), "template": 1,
+                               "description": super::description(id, "ab12"), "tags": tags, "vmid": vmid})
+        };
+        let configs = std::sync::Arc::new(std::collections::BTreeMap::from([
+            ("/nodes/n1/qemu/9000/config".to_string(), ours(9000, "ubuntu-2604", "")),
+            ("/nodes/n1/qemu/9001/config".to_string(), ours(9001, "ubuntu-2604-nvidia", "keep;onv-test")),
+            ("/nodes/n1/qemu/9002/config".to_string(), ours(9002, "ubuntu-2604-gaming", "keep")),
+            ("/nodes/n1/qemu/9003/config".to_string(),
+             serde_json::json!({"name": "golden", "template": 1, "description": "my golden image"})),
+            ("/nodes/n1/qemu/9004/config".to_string(),
+             serde_json::json!({"name": "onv-ubuntu-2604-ollama", "template": 0,
+                                "description": super::description("ubuntu-2604-ollama", "ab12")})),
+        ]));
+        let offered = std::collections::BTreeMap::from([
+            ("ubuntu-2604".to_string(), 9000),
+            ("ubuntu-2604-nvidia".to_string(), 9001),
+            ("ubuntu-2604-gaming".to_string(), 9002),
+            ("golden".to_string(), 9003),
+            ("ubuntu-2604-ollama".to_string(), 9004),
+        ]);
+        let routes = configs.clone();
+        let mock = Mock::start(move |method, path, _| match (method, routes.get(path)) {
+            ("GET", Some(cfg)) => (200, cfg.clone()),
+            ("PUT", Some(_)) => (200, serde_json::Value::Null),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await;
+
+        let px = mock.client().with_environment(Some("test".into()));
+        let tagged = super::ensure_environment_tags(&px, "n1", &offered).await;
+        assert_eq!(tagged, vec![9000, 9002]);
+        let puts: Vec<(String, String)> = mock.calls.lock().unwrap().iter()
+            .filter(|c| c.method == "PUT").map(|c| (c.path.clone(), c.body.clone())).collect();
+        assert_eq!(puts, vec![
+            ("/nodes/n1/qemu/9000/config".to_string(), "tags=onv-test".to_string()),
+            ("/nodes/n1/qemu/9002/config".to_string(), "tags=keep%3Bonv-test".to_string()),
+        ]);
+
+        let none = super::ensure_environment_tags(&mock.client(), "n1", &offered).await;
+        assert!(none.is_empty(), "a client with no environment tagged {none:?}");
+    }
+
     /// Every call an import makes against a hypervisor with nothing at the
     /// vmid, for a client of the given Windows ids and environment: the
     /// merged form values, and whether the template flag was set.

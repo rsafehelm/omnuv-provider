@@ -2535,6 +2535,9 @@ async fn mirror_images(
 ) -> anyhow::Result<()> {
     let offered = cfg.proxmox.image_map();
     let held = crate::images::held(driver, node, &offered).await;
+    for vmid in crate::images::ensure_environment_tags(driver, node, &offered).await {
+        eprintln!("image mirror: template {vmid} tagged with its environment");
+    }
     let wanted = crate::images::outstanding(catalogue, &offered, &held);
 
     let dir = std::path::Path::new(&cfg.proxmox.snippet_dir)
