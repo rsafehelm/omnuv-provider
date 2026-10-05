@@ -24,6 +24,7 @@
     "citype": "nocloud",
     "boot": "order=scsi0",
     "vga": "std",
+    "localtime": "0",
     "serial0": "socket",
     "agent": "enabled=1"
   },

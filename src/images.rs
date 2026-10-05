@@ -99,7 +99,16 @@ impl TemplateShape {
         let ostype = cfg.get("ostype").and_then(serde_json::Value::as_str).unwrap_or_default();
         match self {
             TemplateShape::Linux => !ostype.starts_with("win"),
-            TemplateShape::Windows => ostype == "win11",
+            // **And its clock in UTC** (run fa56103c, 5 October 2026):
+            // Proxmox puts a Windows guest's RTC on the host's local time
+            // unless `localtime` says otherwise, the image's zone is UTC, so
+            // on Pluto (WEST) a clone booted an hour ahead and Sunshine minted
+            // its certificate then: "The certificate is not yet valid" to the
+            // client. A template without it is imported again.
+            TemplateShape::Windows => {
+                ostype == "win11"
+                    && cfg.get("localtime").map(|v| v.as_u64() == Some(0) || v.as_str() == Some("0")) == Some(true)
+            }
         }
     }
 }
@@ -165,6 +174,7 @@ pub fn template_requests(
             kv("boot", "order=scsi0".into()),
             kv("serial0", "socket".into()),
             kv("vga", "std".into()),
+            kv("localtime", "0".into()),
         ],
     };
     // The deployment it belongs to, as every machine this agent makes says
@@ -844,11 +854,17 @@ mod tests {
     #[tokio::test]
     async fn a_template_is_held_only_in_its_shape() {
         use crate::pvemock::Mock;
-        let held_with = |ostype: &'static str, windows: &'static [&'static str]| async move {
+        let held_clock = |ostype: &'static str, windows: &'static [&'static str], localtime: serde_json::Value| async move {
             let mock = Mock::start(move |method, path, _| match (method, path) {
-                ("GET", "/nodes/n1/qemu/9005/config") => (200, serde_json::json!({
-                    "template": 1, "ostype": ostype, "name": "onv-windows-11-gaming",
-                    "description": super::description("windows-11-gaming", A)})),
+                ("GET", "/nodes/n1/qemu/9005/config") => {
+                    let mut cfg = serde_json::json!({
+                        "template": 1, "ostype": ostype, "name": "onv-windows-11-gaming",
+                        "description": super::description("windows-11-gaming", A)});
+                    if !localtime.is_null() {
+                        cfg["localtime"] = localtime.clone();
+                    }
+                    (200, cfg)
+                }
                 _ => (404, serde_json::Value::Null),
             })
             .await;
@@ -856,7 +872,14 @@ mod tests {
             let offered = std::collections::BTreeMap::from([("windows-11-gaming".to_string(), 9005u32)]);
             super::held(&px, "n1", &offered).await
         };
+        let held_with = |ostype: &'static str, windows: &'static [&'static str]| held_clock(ostype, windows, serde_json::json!(0));
         assert_eq!(held_with("win11", &["windows-11-gaming"]).await.len(), 1, "the right shape was not held");
+        // Its clock in UTC (run fa56103c): Proxmox's default for a Windows
+        // guest, unset, is the host's local time, and so is an explicit 1.
+        for clock in [serde_json::Value::Null, serde_json::json!(1)] {
+            assert!(held_clock("win11", &["windows-11-gaming"], clock.clone()).await.is_empty(),
+                    "a Windows template with localtime {clock} was held");
+        }
         assert!(held_with("l26", &["windows-11-gaming"]).await.is_empty(), "a Linux-shaped Windows template was held");
         assert!(held_with("win11", &[]).await.is_empty(), "a Windows-shaped template held for a Linux id");
         assert_eq!(held_with("l26", &[]).await.len(), 1, "a Linux template stopped being held");
