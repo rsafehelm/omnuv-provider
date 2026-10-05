@@ -4113,7 +4113,7 @@ mod tests {
         use base64::Engine as _;
         script
             .lines()
-            .filter_map(|l| l.strip_prefix("echo ")?.strip_suffix(" | base64 -d | bash"))
+            .filter_map(|l| l.strip_prefix("echo ")?.split_once(" | base64 -d > ").map(|(b, _)| b))
             .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
             .map(|b| String::from_utf8_lossy(&b).to_string())
             .collect()
