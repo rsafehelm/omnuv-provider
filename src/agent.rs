@@ -514,13 +514,23 @@ impl Core {
 async fn startup_checks(
     cfg: &AgentConfig,
     driver: &Arc<crate::proxmox::Client>,
-    core: &Core,
 ) -> Vec<String> {
-    let mut out: Vec<String> = runtime_checks(cfg, driver).await.iter().map(check_line).collect();
-    // Core, over TLS. Not the overlay — by design nothing here may depend on
-    // it, and this check exists partly to keep that honest.
-    out.insert(1, core_check(core, &cfg.core.url, &cfg.timings.hash()).await);
-    out
+    runtime_checks(cfg, driver).await.iter().map(check_line).collect()
+}
+
+/// **The handshake, then whether Core accepts this agent**, in that order.
+///
+/// Core, over TLS, and not the overlay: by design nothing here may depend on
+/// it, and this check exists partly to keep that honest. It used to run
+/// before the handshake, with the other start-up checks, so its heartbeat
+/// carried no session; once a provider's agents hold sessions Core refuses
+/// such a call with 426 (its capability floor, lifecycle phase 7), and every
+/// start on Pluto and Titan printed "SELFCHECK FAILED ... answered 426 Upgrade
+/// Required to an authenticated heartbeat" while the agent ran fine (found
+/// 5 October 2026). After the handshake the heartbeat is the agent's own.
+async fn handshake_then_core_check(core: &Core, driver: &impl ComputeDriver, url: &str, config_hash: &str) -> anyhow::Result<(u64, String)> {
+    let heartbeat_secs = handshake(core, driver).await?;
+    Ok((heartbeat_secs, core_check(core, url, config_hash).await))
 }
 
 /// What every heartbeat says (`omnuv_protocol::Heartbeat`): which tunables this
@@ -677,11 +687,12 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // re-run and reported on every pass (see `runtime_checks`), so a
     // misconfiguration is visible where it happened and stops being said
     // once it is fixed.
-    for line in startup_checks(&cfg, &driver, &core).await {
+    for line in startup_checks(&cfg, &driver).await {
         println!("{line}");
     }
 
-    let heartbeat_secs = handshake(&core, &driver).await?;
+    let (heartbeat_secs, accepted) = handshake_then_core_check(&core, &driver, &cfg.core.url, &cfg.timings.hash()).await?;
+    println!("{accepted}");
 
     // Woken by Core over the tunnel; the poll below is the safety net for when
     // no tunnel is up, so a push is never a correctness dependency.
@@ -1440,6 +1451,48 @@ mod handshake_tests {
         let said: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(said["capabilities"].as_array().unwrap().contains(&serde_json::json!("report-interval")), "{body}");
         assert_eq!(core.report.period(std::time::Duration::from_secs(300)), std::time::Duration::from_secs(45));
+    }
+
+    /// **The start-up check asks Core after the handshake**, so its heartbeat
+    /// carries the session: a Core that refuses a call without one (426, a
+    /// provider whose agents hold sessions) accepts this agent, and the check
+    /// says so (5 October 2026).
+    #[tokio::test]
+    async fn the_core_check_follows_the_handshake() {
+        use tokio::io::AsyncWriteExt;
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Core as production answers with sessions on: a heartbeat without
+        // the session header is 426.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let request = String::from_utf8_lossy(&read_request(&mut socket).await).to_string();
+                    let head = request.split("\r\n\r\n").next().unwrap_or_default().to_lowercase();
+                    let (status, body) = if head.starts_with("post /provider/v1/handshake") {
+                        ("200 OK", r#"{"provider_id":"p","protocol_version":6,"heartbeat_interval_secs":30,"session":"s-1"}"#)
+                    } else if head.contains(&format!("{}:", crate::session::HEADER.to_lowercase())) {
+                        ("200 OK", "{}")
+                    } else {
+                        ("426 Upgrade Required", "\"this call carries no session\"")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        // Before the handshake, the check is refused, as every start was.
+        assert!(core_check(&core, &base, "0123456789ab").await.contains("426"));
+        let (_, said) = handshake_then_core_check(&core, &HeartbeatDriver, &base, "0123456789ab").await.expect("the handshake");
+        assert!(said.contains("accepts this agent"), "{said}");
     }
 
     /// **A held provider is waited for, and the session rides every call**
