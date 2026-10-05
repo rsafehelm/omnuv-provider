@@ -528,6 +528,12 @@ pub(crate) fn progress_from(status: &str) -> Option<omnuv_protocol::RecipeProgre
     })
 }
 
+/// **A step is a file bash runs, never bash's standard input** (5 October
+/// 2026). Piped in, a step's first command that reads standard input reads the
+/// rest of the step instead: Ollama's `docker compose exec -T` did, and every
+/// line after it, the HTTPS front among them, never ran, while bash, at the end
+/// of its input, exited 0 and the console said done. Standard input is
+/// `/dev/null`, as it is for a step nobody types into.
 pub(crate) fn install_script(steps: &[(&'static str, String)], status: &str, first: usize, total: usize) -> String {
     let body: String = steps
         .iter()
@@ -536,7 +542,8 @@ pub(crate) fn install_script(steps: &[(&'static str, String)], status: &str, fir
             format!(
                 "STEP={}/{}\nLABEL='{label}'\n\
                  printf 'step=%s\\nlabel=%s\\n' \"$STEP\" \"$LABEL\" > {status}\n\
-                 echo \"omnuv: recipe step $STEP\"\necho {} | base64 -d | bash\n",
+                 echo \"omnuv: recipe step $STEP\"\necho {} | base64 -d > {status}.step\n\
+                 bash {status}.step </dev/null\n",
                 first + i,
                 total,
                 b64(script)
@@ -4186,6 +4193,23 @@ mod tests {
         let ran = std::process::Command::new("/bin/bash").arg("-c").arg(&script).status().unwrap();
         assert_eq!(ran.code(), Some(7));
         assert_eq!(read(&status), "step=2/2\nlabel=Finishing setup\nrc=7\n", "the trap names the step that stopped");
+    }
+
+    /// **A step that reads standard input does not eat the rest of itself**
+    /// (5 October 2026: Ollama's recipe stopped silently at its first
+    /// `docker compose exec`). Run, not read, under bash, the step's own lines
+    /// after the reader must run.
+    #[test]
+    fn a_step_reading_standard_input_runs_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("onv/recipe-status");
+        let after = dir.path().join("after");
+        let steps: Vec<(&'static str, String)> =
+            vec![("Finishing setup", format!("cat >/dev/null\necho ran > {}", after.display()))];
+        let script = install_script(&steps, &status.to_string_lossy(), 1, 1);
+        let ran = std::process::Command::new("/bin/bash").arg("-c").arg(&script).status().unwrap();
+        assert!(ran.success(), "{script}");
+        assert_eq!(std::fs::read_to_string(&after).ok().as_deref(), Some("ran\n"), "the line after the reader never ran");
     }
 
     /// **The machine's own steps come first** (the operator's option 1, 3
