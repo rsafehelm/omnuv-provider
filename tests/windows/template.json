@@ -25,6 +25,7 @@
     "boot": "order=scsi0",
     "vga": "std",
     "localtime": "0",
+    "audio0": "device=ich9-intel-hda,driver=none",
     "serial0": "socket",
     "agent": "enabled=1"
   },

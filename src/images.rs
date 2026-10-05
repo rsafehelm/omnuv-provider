@@ -108,6 +108,9 @@ impl TemplateShape {
             TemplateShape::Windows => {
                 ostype == "win11"
                     && cfg.get("localtime").map(|v| v.as_u64() == Some(0) || v.as_str() == Some("0")) == Some(true)
+                    // And its sound card: a template without one streams
+                    // silence, so it is imported again.
+                    && cfg.get("audio0").and_then(serde_json::Value::as_str).is_some_and(|a| a.contains("device=ich9-intel-hda"))
             }
         }
     }
@@ -175,6 +178,12 @@ pub fn template_requests(
             kv("serial0", "socket".into()),
             kv("vga", "std".into()),
             kv("localtime", "0".into()),
+            // **A sound card**, so Sunshine has something to capture (5 Oct
+            // 2026: "Couldn't get default audio endpoint [0x80070490] ...
+            // The stream will not have audio"). Intel HD Audio, which Windows
+            // drives with its own driver; no host backend (`none`), since the
+            // sound leaves through the stream, never through the host.
+            kv("audio0", "device=ich9-intel-hda,driver=none".into()),
         ],
     };
     // The deployment it belongs to, as every machine this agent makes says
@@ -854,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn a_template_is_held_only_in_its_shape() {
         use crate::pvemock::Mock;
-        let held_clock = |ostype: &'static str, windows: &'static [&'static str], localtime: serde_json::Value| async move {
+        let held_shape = |ostype: &'static str, windows: &'static [&'static str], localtime: serde_json::Value, audio: bool| async move {
             let mock = Mock::start(move |method, path, _| match (method, path) {
                 ("GET", "/nodes/n1/qemu/9005/config") => {
                     let mut cfg = serde_json::json!({
@@ -862,6 +871,9 @@ mod tests {
                         "description": super::description("windows-11-gaming", A)});
                     if !localtime.is_null() {
                         cfg["localtime"] = localtime.clone();
+                    }
+                    if audio {
+                        cfg["audio0"] = serde_json::json!("device=ich9-intel-hda,driver=none");
                     }
                     (200, cfg)
                 }
@@ -872,7 +884,11 @@ mod tests {
             let offered = std::collections::BTreeMap::from([("windows-11-gaming".to_string(), 9005u32)]);
             super::held(&px, "n1", &offered).await
         };
+        let held_clock = |ostype: &'static str, windows: &'static [&'static str], localtime: serde_json::Value| held_shape(ostype, windows, localtime, true);
         let held_with = |ostype: &'static str, windows: &'static [&'static str]| held_clock(ostype, windows, serde_json::json!(0));
+        // Its sound card (5 Oct 2026): without one the stream is silent.
+        assert!(held_shape("win11", &["windows-11-gaming"], serde_json::json!(0), false).await.is_empty(),
+                "a Windows template with no sound card was held");
         assert_eq!(held_with("win11", &["windows-11-gaming"]).await.len(), 1, "the right shape was not held");
         // Its clock in UTC (run fa56103c): Proxmox's default for a Windows
         // guest, unset, is the host's local time, and so is an explicit 1.
