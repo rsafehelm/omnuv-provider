@@ -105,6 +105,25 @@ pub(crate) fn refusal_text(
     said
 }
 
+/// A request that never got an answer, with every cause reqwest knows.
+///
+/// reqwest's own text is only its outermost layer, "error sending request for
+/// url (…)", which reads the same for a timeout, a refused connection and a
+/// TLS failure. On Pluto on 5 October 2026 that was all an import's failure
+/// said, and every retry after it failed on a request that never reached
+/// Proxmox, for a reason nothing recorded. The URL carries no credential (the
+/// token is a header), so the whole chain is safe to log.
+fn transport(e: &reqwest::Error) -> String {
+    let mut said = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(c) = cause {
+        said.push_str(": ");
+        said.push_str(&c.to_string());
+        cause = c.source();
+    }
+    said
+}
+
 /// The reason phrase of a response, when it was not the canonical one.
 fn reason_of(res: &reqwest::Response) -> Option<String> {
     res.extensions()
@@ -664,7 +683,7 @@ impl Client {
             .form(&pairs)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{path}: {}", transport(&e)))?;
         let status = res.status();
         if !status.is_success() {
             let reason = reason_of(&res);
@@ -742,8 +761,14 @@ impl Client {
     }
 
     pub(crate) async fn wait_task(&self, node: &str, upid: &str) -> anyhow::Result<()> {
+        self.wait_task_within(node, upid, 600).await
+    }
+
+    /// `wait_task` for a task that may outlast ten minutes: `polls` looks, about
+    /// a second apart.
+    pub(crate) async fn wait_task_within(&self, node: &str, upid: &str, polls: u32) -> anyhow::Result<()> {
         let encoded = urlencode(upid);
-        for _ in 0..600 {
+        for _ in 0..polls {
             let v: serde_json::Value =
                 self.get(&format!("/nodes/{node}/tasks/{encoded}/status")).await?;
             if v.get("status").and_then(|s| s.as_str()) == Some("stopped") {
@@ -755,7 +780,7 @@ impl Client {
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        anyhow::bail!("proxmox task {upid} did not finish in 10 minutes")
+        anyhow::bail!("proxmox task {upid} did not finish in {polls} looks (about {} minutes)", polls / 60)
     }
 
     /// **What must be true before a machine is started.** The start is the
@@ -902,7 +927,7 @@ impl Client {
             .header("Authorization", self.auth.expose())
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("GET {path}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("GET {path}: {}", transport(&e)))?;
 
         let status = res.status();
         if !status.is_success() {

@@ -394,6 +394,11 @@ pub async fn held(
     out
 }
 
+/// How long an import may take: about an hour of one-second looks. Not timed;
+/// Pluto's Windows import (9.0 GB onto 64 G) was in its config by 01:02 after
+/// starting at 00:59:55 on 5 October 2026, so the hour is wide on purpose.
+const IMPORT_POLLS: u32 = 3600;
+
 /// Turns a verified artefact on disk into a template at `vmid`.
 ///
 /// The shape matches what the build plays produce, because a buyer's machine
@@ -427,21 +432,24 @@ pub async fn import(
     // create names did not exist, so Titan's template was destroyed and
     // nothing replaced it. Proxmox reports that as "Permission check failed",
     // which is not a sentence anyone connects to a missing pool.
-    anyhow::ensure!(
-        px.get_json::<serde_json::Value>(&format!("/pools/{}", crate::names::POOL))
-            .await
-            .is_ok(),
-        "pool '{}' does not exist on {node}; not destroying the existing template \
-         for an import that would fail",
-        crate::names::POOL
-    );
-    anyhow::ensure!(
-        px.get_json::<serde_json::Value>(&format!("/nodes/{node}/storage/{storage}/status"))
-            .await
-            .is_ok(),
-        "storage '{storage}' does not answer on {node}; not destroying the existing \
-         template for an import that would fail"
-    );
+    //
+    // **What Proxmox said is kept.** These two checks once read any failure as
+    // "does not exist": on Pluto on 5 October 2026 the pool was there and the
+    // token could read it, and every retry still said it was missing, for a
+    // reason the message threw away.
+    if let Err(e) = px.get_json::<serde_json::Value>(&format!("/pools/{}", crate::names::POOL)).await {
+        anyhow::bail!(
+            "pool '{}' could not be read on {node} ({e:#}); not destroying the existing template \
+             for an import that would fail",
+            crate::names::POOL
+        );
+    }
+    if let Err(e) = px.get_json::<serde_json::Value>(&format!("/nodes/{node}/storage/{storage}/status")).await {
+        anyhow::bail!(
+            "storage '{storage}' does not answer on {node} ({e:#}); not destroying the existing \
+             template for an import that would fail"
+        );
+    }
 
     // Retire whatever is there. Only ever a template: `held` refuses to look
     // at anything else, and this refuses to remove anything else.
@@ -502,7 +510,15 @@ pub async fn import(
     // The import itself, and the only step that moves gigabytes. Proxmox reads
     // the volume, converts it onto `storage`, and owns every part of that — we
     // do not write an image importer, we ask the one that exists.
-    let _: serde_json::Value = px.put_form(&format!("/nodes/{node}/qemu/{vmid}/config"), &disk).await?;
+    //
+    // **Asked as a task (POST), never PUT.** PUT converts inside the request,
+    // and every request this client makes gives up after 20 s (`tls::client`).
+    // On Pluto on 5 October 2026 windows-11-gaming's 9.0 GB qcow2, onto a 64 G
+    // volume, outlasted it: Proxmox finished the import, and the steps after it
+    // never ran. Proxmox's own description of PUT says to use POST for storage
+    // allocation (PVE 9.2, `update_vm`).
+    let upid: String = px.post_form(&format!("/nodes/{node}/qemu/{vmid}/config"), &disk).await?;
+    px.wait_task_within(node, &upid, IMPORT_POLLS).await?;
 
     let _: serde_json::Value = px.put_form(&format!("/nodes/{node}/qemu/{vmid}/config"), &finish).await?;
 
@@ -630,8 +646,18 @@ mod tests {
         super::import(&px, "n1", "local-zfs", "onv-snippets", id, 9005, A).await.expect("the import");
         let calls = mock.calls.lock().unwrap().clone();
         let mut merged = std::collections::BTreeMap::new();
+        // **The disk is imported as a task**: POSTed and waited on, never PUT,
+        // which converts inside a request the client abandons after 20 s.
+        let imports = |m: &str| {
+            calls.iter().filter(|c| c.method == m && c.path == "/nodes/n1/qemu/9005/config" && c.body.contains("import-from")).count()
+        };
+        assert_eq!((imports("POST"), imports("PUT")), (1, 0), "the disk was not imported as one task");
+        // Two tasks are waited on: the create's, and the import's.
+        let waits = calls.iter().filter(|c| c.method == "GET" && c.path.starts_with("/nodes/n1/tasks/") && c.path.ends_with("/status")).count();
+        assert_eq!(waits, 2, "the import's task was not waited on");
         for c in calls.iter().filter(|c| {
-            (c.method == "POST" && c.path == "/nodes/n1/qemu") || (c.method == "PUT" && c.path == "/nodes/n1/qemu/9005/config")
+            (c.method == "POST" && c.path == "/nodes/n1/qemu")
+                || (matches!(c.method.as_str(), "POST" | "PUT") && c.path == "/nodes/n1/qemu/9005/config")
         }) {
             let pairs: Vec<(String, String)> =
                 reqwest::Url::parse(&format!("http://x/?{}", c.body)).unwrap().query_pairs().into_owned().collect();
