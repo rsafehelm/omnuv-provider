@@ -678,41 +678,32 @@ async fn handshake_then_core_check(
 /// 11), and the Workload Agent's digest its workers verify
 /// (`workloadd_sha256`), which Core holds against the binary it serves.
 fn heartbeat_body(config_hash: &str, settings: Option<&omnuv_protocol::AgentSettings>) -> serde_json::Value {
-    let exe = std::fs::read_link("/proc/self/exe").ok();
     serde_json::to_value(omnuv_protocol::Heartbeat {
         config_hash: Some(config_hash.to_string()),
         settings_hash: crate::settings::hash(settings),
-        components: components(config_hash, exe.as_deref()),
+        components: components(config_hash),
         workloadd_sha256: crate::worker::workloadd_sha256(),
     })
     .expect("a heartbeat serialises")
 }
 
-/// The binary every unit of this package runs (`packaging/deb`).
-const INSTALLED_BINARY: &str = "/usr/bin/onv-provider";
-
 /// **The units on this host, and what each runs** (`Heartbeat::components`).
 ///
-/// The agent always, with its build and the hash of the tunables it runs.
-/// The opening applier and the lease timer are oneshots of the same binary
-/// file, `/usr/bin/onv-provider`, run afresh each time; so they run this
-/// build exactly when this process is that file and it has not been
-/// replaced under it (`exe`, `/proc/self/exe`, ends ` (deleted)` once a
-/// package upgrade replaced it). Otherwise what they run is not known here,
-/// and they are left out, which Core reads as "not reported", never as "not
-/// running".
-fn components(config_hash: &str, exe: Option<&std::path::Path>) -> Vec<omnuv_protocol::Component> {
-    let unit = |name: &str, config_hash: Option<&str>| omnuv_protocol::Component {
-        name: name.to_string(),
+/// The agent alone, with its build and the hash of the tunables it runs:
+/// this process is the only binary it has evidence about. The opening
+/// applier and the lease timer run their own files (`/usr/bin/onv-opening`,
+/// `/usr/bin/onv-lease-expire`, since A3), which can be upgraded, replaced
+/// or missing apart from this one, so this process cannot say what they
+/// run; they are left out, which Core reads as "not reported", never as
+/// "not running". Reporting them needs evidence from their own files (a
+/// version stamp each writes, or a build digest recorded in the package),
+/// never this process's version or path.
+fn components(config_hash: &str) -> Vec<omnuv_protocol::Component> {
+    vec![omnuv_protocol::Component {
+        name: "onv-provider".to_string(),
         version: AGENT_VERSION.to_string(),
-        config_hash: config_hash.map(str::to_string),
-    };
-    let mut out = vec![unit("onv-provider", Some(config_hash))];
-    if exe == Some(std::path::Path::new(INSTALLED_BINARY)) {
-        out.push(unit("onv-opening", None));
-        out.push(unit("onv-lease-expire", None));
-    }
-    out
+        config_hash: Some(config_hash.to_string()),
+    }]
 }
 
 /// **What this agent can say about its own footing, on every report
@@ -2950,6 +2941,170 @@ mod handshake_tests {
         }
     }
 
+    /// **The refusals no retry can mend are typed on the report a pass
+    /// sends** (v0.28.0, contract change 3), not only in the hand-built
+    /// statuses the goldens read: a machine whose image this provider does
+    /// not offer reports `image_not_offered`, and one no node can hold (its
+    /// cards sold on a node this provider does not have) `unplaceable`, both
+    /// not retryable. The control: the same view on the shipped image and
+    /// with no card is cloned, so the harness reaches the build at all.
+    #[tokio::test]
+    async fn a_pass_types_the_refusals_no_retry_can_mend() {
+        let view = |image: &str, gpu_node: Option<&str>| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+            v["version"] = serde_json::json!(5);
+            v["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+            v["instances"][0]["image"]["id"] = serde_json::json!(image);
+            v["instances"][0]["gpu_node"] = serde_json::json!(gpu_node);
+            v
+        };
+        let (_, calls) = a_pass_serving(vec![view(crate::config::DEFAULT_IMAGE, None)], an_empty_node).await;
+        assert!(!clones(&calls).is_empty(), "the control asked for no clone, so this test could not see a refusal: {calls:?}");
+
+        for (image, gpu_node, want, waiting) in [
+            ("debian-13", None, "image_not_offered", "a provider that offers this image"),
+            (crate::config::DEFAULT_IMAGE, Some("n9"), "unplaceable", "a provider with free capacity"),
+        ] {
+            let (sent, calls) = a_pass_serving(vec![view(image, gpu_node)], an_empty_node).await;
+            assert!(clones(&calls).is_empty(), "{want}: a refused machine was cloned: {calls:?}");
+            let report = the_report(&sent);
+            let m = &report["instances"][0];
+            assert_eq!(
+                (m["state"].as_str(), m["retryable"].as_bool(), m["outcome"].as_str(), m["waiting_on"].as_str()),
+                (Some("ERROR"), Some(false), Some(want), Some(waiting)),
+                "{report}"
+            );
+            assert!(m.get("residue").is_none_or(|r| r == &serde_json::json!([])), "{want}: a refusal carried a residue: {report}");
+        }
+    }
+
+    /// The report of each of `passes` passes over a worker Core sends Absent,
+    /// on a host where it is vm 200 on n1 holding one volume. `residue`: the
+    /// volume outlives the worker's destroy, as a storage that refuses to
+    /// free it does.
+    async fn a_worker_torn_down(passes: usize, residue: bool) -> Vec<serde_json::Value> {
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        const DISK: &str = "vmdata:vm-200-disk-0";
+        let mut view = a_worker_view(42, Some(true));
+        view["inference_workers"][0]["lifecycle"] = serde_json::json!("deleted");
+        let w = view["inference_workers"][0]["id"].as_str().unwrap().to_string();
+        let body = view.to_string();
+        let (base, mut rx) = session_stub(move |line, _| {
+            if line.starts_with("GET /provider/v1/desired-state") {
+                ("200 OK", body.clone())
+            } else {
+                ("204 No Content", String::new())
+            }
+        })
+        .await;
+        #[derive(Default)]
+        struct Host {
+            present: bool,
+            volumes: Vec<String>,
+        }
+        let host = Arc::new(Mutex::new(Host { present: true, volumes: vec![DISK.into()] }));
+        let claim = crate::names::tags(crate::names::TAG_WORKER, &w, Some("test"));
+        let stamp = crate::names::description(crate::names::TAG_WORKER, &w);
+        let h = host.clone();
+        let pve = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(r) = crate::pvemock::task_ok(path) {
+                return r;
+            }
+            let mut h = h.lock().unwrap();
+            match (method, path) {
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", p) if p.starts_with("/cluster/resources") => (
+                    200,
+                    if h.present {
+                        serde_json::json!([{"node": "n1", "vmid": 200, "status": "stopped", "tags": claim, "type": "qemu"}])
+                    } else {
+                        serde_json::json!([])
+                    },
+                ),
+                ("GET", "/nodes/n1/qemu") => (
+                    200,
+                    if h.present { serde_json::json!([{"vmid": 200, "status": "stopped", "tags": claim}]) } else { serde_json::json!([]) },
+                ),
+                ("GET", "/nodes/n1/qemu/200/status/current") if h.present => (200, serde_json::json!({"status": "stopped"})),
+                ("GET", "/nodes/n1/qemu/200/config") if h.present => {
+                    (200, serde_json::json!({"description": stamp, "scsi0": format!("{DISK},size=20G")}))
+                }
+                ("DELETE", p) if p.starts_with("/nodes/n1/qemu/200") => {
+                    h.present = false;
+                    if !residue {
+                        h.volumes.clear();
+                    }
+                    (200, serde_json::json!("UPID:n1:destroy"))
+                }
+                // A storage that will not free the volume: asked, and kept.
+                ("DELETE", p) if p.starts_with("/nodes/n1/storage/vmdata/content") => (200, serde_json::json!("UPID:n1:free")),
+                ("GET", "/cluster/ha/resources") => (200, serde_json::json!([])),
+                ("GET", "/nodes/n1/storage/vmdata/content") => {
+                    (200, serde_json::json!(h.volumes.iter().map(|v| serde_json::json!({"volid": v})).collect::<Vec<_>>()))
+                }
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+            }
+        })
+        .await;
+        let snippets = tempfile::tempdir().unwrap();
+        let snippet_dir = snippets.path().join("snippets");
+        std::fs::create_dir_all(&snippet_dir).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippet_dir.display()
+        ))
+        .expect("config");
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        let driver = pve.client();
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        let mut reports = Vec::new();
+        for _ in 0..passes {
+            let _ = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+            let mut sent = Vec::new();
+            while let Ok(r) = rx.try_recv() {
+                sent.push(r);
+            }
+            let report = the_report(&sent);
+            reports.push(report["workers"].as_array().and_then(|a| a.iter().find(|x| x["id"] == w.as_str())).cloned().unwrap_or_default());
+        }
+        assert!(!host.lock().unwrap().present, "the premise: the Absent worker was never destroyed");
+        reports
+    }
+
+    /// **A worker torn down is typed on the report a pass sends** (v0.28.0,
+    /// contract change 3): the destroy's own pass `not_proven_gone`, and the
+    /// pass that finds nothing left `deleted`, beside the words. With a
+    /// volume its storage would not free, `deleted_with_residue` and the
+    /// volume itself in `residue` on the wire.
+    #[tokio::test]
+    async fn a_worker_torn_down_is_typed_on_the_report() {
+        let reports = a_worker_torn_down(3, false).await;
+        assert_eq!(reports[0]["outcome"], serde_json::json!("not_proven_gone"), "the destroy's own pass: {reports:?}");
+        for (n, w) in reports.iter().enumerate().skip(1) {
+            assert_eq!(
+                (w["state"].as_str(), w["message"].as_str(), w["outcome"].as_str()),
+                (Some("OFFLINE"), Some("deleted"), Some("deleted")),
+                "pass {}: proven gone, and not typed so: {w}",
+                n + 1
+            );
+            assert!(w.get("residue").is_none_or(|r| r == &serde_json::json!([])), "a proof with nothing left carried a residue: {w}");
+        }
+
+        let reports = a_worker_torn_down(3, true).await;
+        let last = reports.last().unwrap();
+        assert_eq!(last["outcome"], serde_json::json!("deleted_with_residue"), "{reports:?}");
+        assert_eq!(last["residue"], serde_json::json!(["vmdata:vm-200-disk-0"]), "the residue was not on the wire: {last}");
+        assert_eq!(last["message"], serde_json::json!("deleted; residue vmdata:vm-200-disk-0"), "{last}");
+    }
+
     /// **A refusal's code decides before its status** (protocol v0.28.0,
     /// contract change 4), and without one every answer means what it always
     /// did. The cases that changed: `admission_*` and `held` wait, on any
@@ -3207,22 +3362,25 @@ mod handshake_tests {
         }
     }
 
-    /// **The units a heartbeat names**: the agent always, and the opening
-    /// applier and the lease timer only when this process is the installed
-    /// binary they run, not replaced under it.
+    /// **The units a heartbeat names**: the agent alone. The opening
+    /// applier and the lease timer run binaries of their own (A3), so this
+    /// process vouches for neither: not when it is the installed
+    /// `/usr/bin/onv-provider`, and not when their files are missing or a
+    /// different build. The heartbeat body is read as Core reads it.
     #[test]
     fn the_components_are_the_ones_this_process_can_vouch_for() {
-        let names = |exe: Option<&str>| -> Vec<String> {
-            components("0123456789ab", exe.map(std::path::Path::new)).into_iter().map(|c| c.name).collect()
-        };
-        assert_eq!(names(Some(INSTALLED_BINARY)), ["onv-provider", "onv-opening", "onv-lease-expire"]);
-        assert_eq!(names(Some("/usr/bin/onv-provider (deleted)")), ["onv-provider"], "a replaced binary vouched for its successor");
-        assert_eq!(names(Some("/home/dev/target/debug/onv-provider")), ["onv-provider"]);
-        assert_eq!(names(None), ["onv-provider"]);
-        let all = components("0123456789ab", Some(std::path::Path::new(INSTALLED_BINARY)));
-        assert!(all.iter().all(|c| c.version == AGENT_VERSION));
-        assert_eq!(all[0].config_hash.as_deref(), Some("0123456789ab"));
-        assert!(all[1..].iter().all(|c| c.config_hash.is_none()));
+        let body = heartbeat_body("0123456789ab", None);
+        let components = body["components"].as_array().expect("components on the wire");
+        assert_eq!(components.len(), 1, "a unit vouched for from another file: {components:?}");
+        assert_eq!(components[0]["name"], "onv-provider");
+        assert_eq!(components[0]["version"], AGENT_VERSION);
+        assert_eq!(components[0]["config_hash"], "0123456789ab");
+        for other in ["onv-opening", "onv-lease-expire"] {
+            assert!(
+                !components.iter().any(|c| c["name"] == other),
+                "{other} runs its own binary; this process cannot say what it runs"
+            );
+        }
     }
 
     /// **A destination this agent does not know is acted on not at all**
@@ -4113,10 +4271,8 @@ async fn reconcile_workers(
             // recycled VMID. Measured on Pluto, 19 September 2026.
             //
             // `Unplaceable` carries the same fact as a type, which a rename
-            // cannot break. The image refusal is still a phrase and is still
-            // the hazard; it is left as one deliberately rather than changed
-            // blind, because it lives in a different function and deserves its
-            // own change.
+            // cannot break, and so since v0.28.0 does the image refusal
+            // (`ImageNotOffered`).
             let unplaceable = e.downcast_ref::<crate::instance::Unplaceable>();
             let no_image = e.downcast_ref::<crate::instance::ImageNotOffered>().is_some();
             let retryable = !(no_image || unplaceable.is_some());

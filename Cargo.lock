@@ -833,7 +833,7 @@ dependencies = [
  "anyhow",
  "hyper",
  "libc",
- "omnuv-protocol",
+ "omnuv-protocol 0.5.0",
  "onv-agent-lib",
  "onv-core-link",
  "onv-driver-proxmox",
