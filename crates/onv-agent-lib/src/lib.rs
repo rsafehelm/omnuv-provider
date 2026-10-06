@@ -8,7 +8,10 @@
 
 pub mod audit;
 pub mod dur;
+pub mod lease_token;
 pub mod names;
 pub mod poison;
+pub mod run_lease;
+pub mod secrets;
 pub mod timings;
 pub mod workload_config;

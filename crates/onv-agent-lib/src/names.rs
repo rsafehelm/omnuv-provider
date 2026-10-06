@@ -50,7 +50,7 @@ pub const EGRESS_UNIT: &str = "onv-egress";
 /// host's rules or Proxmox's.
 pub const EGRESS_TABLE: &str = "onv_egress";
 /// The provider opening's table (`opening.rs`): one DNAT per opened machine,
-/// replaced whole by `onv-provider apply-opening`, which this unit runs.
+/// replaced whole by `onv-opening`, which this unit runs.
 pub const OPENING_TABLE: &str = "onv_opening";
 pub const OPENING_UNIT: &str = "onv-opening";
 

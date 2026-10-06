@@ -1,0 +1,41 @@
+[package]
+name = "onv-lease-expire"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "The Omnuv host timer: stops a machine past its run lease while the agent is not running."
+publish = false
+
+# **The host timer, a binary of its own** (omnuv's modular design, A3). It
+# holds one credential, its own Proxmox token, given by its unit's
+# LoadCredential=, and refuses to start without it; it links no Core client.
+# A crate of its own, not a target of the agent's package: a new target or
+# dependency there moves onv-workloadd's digest, which reboots every
+# inference worker (measured on wp/A3).
+[lib]
+doctest = false
+
+[[bin]]
+name = "onv-lease-expire"
+path = "src/main.rs"
+
+# The versions the agent already locks; this crate adds none to the build.
+[dependencies]
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+onv-agent-lib = { path = "../onv-agent-lib" }
+onv-core-link = { path = "../onv-core-link" }
+onv-driver-proxmox = { path = "../onv-driver-proxmox" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

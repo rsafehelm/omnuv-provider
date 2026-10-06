@@ -30,7 +30,6 @@ mod session;
 use onv_core_link::restore;
 mod lease;
 mod heldview;
-mod hosttimer;
 use onv_core_link::report;
 mod teardown;
 use onv_agent_lib::dur;
@@ -51,8 +50,6 @@ USAGE:
     onv-provider leave [--dry-run] [--without-core] [--config PATH]
     onv-provider agent [--config /etc/onv/agent.yaml] [--secrets PATH]
     onv-provider check-config [--config /etc/onv/agent.yaml] [--secrets PATH]
-    onv-provider run-lease-expire [--config /etc/onv/agent.yaml] [--secrets PATH] [--dry-run]
-    onv-provider apply-opening [--config /etc/onv/agent.yaml] [--state PATH] [--print]
     onv-provider print-config
     onv-provider discover --provider <id> [--config <path>]
 
@@ -63,21 +60,10 @@ CONFIGURATION:
     configuration, credentials redacted, on stderr; it exits 2 on a file that
     does not pass, naming the key. `print-config` prints the default timings.
 
-    `run-lease-expire` is the host timer (onv-lease-expire.timer, every
-    minute): when the agent's lease task is not running, it stops each machine
-    in run-lease.json past its run lease, and only stops. `--dry-run` says
-    what it would stop. It exits 0 when nothing is wrong, 1 when something was
-    not done, and 2 when the file was refused.
-
-    `apply-opening` is the provider opening's applier (onv-opening.service,
-    as root, woken when the agent's opening.json changes): it reads the
-    `opening` block of --config and the ports the agent gave, never the
-    credentials, and replaces nftables table inet onv_opening whole, or
-    removes it when the opening is off or anything cannot be trusted. It
-    exits 0 when the kernel holds what the files say, 1 when it fell back to
-    no table, and 2 when the configuration was refused. `--print` shows the
-    rules and changes nothing. The opening is off unless the inventory's
-    onv_opening turns it on; deploy-agent.yml writes it, never a hand edit.
+    The host timer and the opening's applier are binaries of their own since
+    omnuv's modular design, A3: `onv-lease-expire` (its own Proxmox token,
+    no Core credential) and `onv-opening` (no credential at all). Each says
+    its usage with --help.
 
 JOIN OPTIONS:
     --region <name>       marketplace region                 (default eu-west)
@@ -115,6 +101,12 @@ Prints a normalized InventoryReport as JSON on stdout. Pipe it into core:
 
 Credentials come from the environment, named by the provider's tokenEnv entry.
 ";
+
+/// The commands that left this binary, and where each went.
+const MOVED: [(&str, &str); 2] = [
+    ("run-lease-expire", "/usr/bin/onv-lease-expire (onv-lease-expire.service)"),
+    ("apply-opening", "/usr/bin/onv-opening (onv-opening.service)"),
+];
 
 /// The configuration in force, as the journal shows it at start: the hash every
 /// heartbeat carries, then every value with the credentials redacted, and a
@@ -216,13 +208,20 @@ async fn main() -> anyhow::Result<()> {
     let path = arg("--config").unwrap_or_else(|| "/etc/onv/agent.yaml".into());
     let secrets = arg("--secrets").unwrap_or_else(|| config::secrets_beside(&path));
 
-    // **The provider opening's applier** (`opening.rs`): run as root by
-    // onv-opening.service. A separate, minimal entry point: agent.yaml's
-    // `opening` block and the agent's opening.json, never the credentials,
-    // never Core, and one nft transaction.
-    if command == "apply-opening" {
-        let print = std::env::args().any(|a| a == "--print");
-        std::process::exit(opening::apply_main(&path, arg("--state").as_deref(), print));
+    // **Moved to binaries of their own** (omnuv's modular design, A3), each
+    // with only the credential it needs. Said, rather than read as an unknown
+    // command, so a hand run from an old runbook learns where they went.
+    if let Some(moved) = MOVED.iter().find(|(old, _)| *old == command) {
+        // A play that still calls one is older than this package: omnuv's
+        // deploy-agent.yml before A3, which neither mints the host timer's
+        // token nor proves it. Exit 2 fails that play loudly rather than let
+        // it end green over a timer that cannot start (243/CREDENTIALS).
+        eprintln!(
+            "onv-provider {}: moved to {}; nothing done. A play calling this is older than this \
+             package: deploy it with omnuv's deploy-agent.yml from A3 on",
+            moved.0, moved.1
+        );
+        std::process::exit(2);
     }
 
     // What `deploy-agent.yml` runs on the files it is about to install, before
@@ -240,14 +239,6 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         }
-    }
-
-    // **The host timer** (lifecycle phase 12): a separate, minimal entry
-    // point, run by onv-lease-expire.timer. No Core, no tunnel, no reconcile:
-    // the lease file, its lock, and a stop.
-    if command == "run-lease-expire" {
-        let dry_run = std::env::args().any(|a| a == "--dry-run");
-        std::process::exit(hosttimer::main(&path, &secrets, dry_run).await);
     }
 
     if command == "agent" {

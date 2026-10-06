@@ -38,7 +38,7 @@
 //!
 //! An agent that is dead stops nothing, so the file this task writes
 //! (`run-lease.json`, each leased machine's wall-clock deadline) is read by
-//! the **host timer** (`hosttimer.rs`, `onv-lease-expire.timer`), which stops
+//! the **host timer** (`onv-lease-expire`, its own crate), which stops
 //! them when this task is not running. The two never act at once: this task
 //! holds `run-lease.lock` for as long as it runs, and the timer acts only
 //! when it can take that lock itself (the kernel frees it the moment this
@@ -50,6 +50,8 @@
 //! exactly when Core cannot renew or release anything.
 
 use crate::proxmox::Client;
+// The file and its lock, shared with the host timer (A3).
+pub use onv_agent_lib::run_lease::{file, lock_file, open_lock, read_body, WRITE_EVERY};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -196,32 +198,6 @@ pub fn file_body(book: &Shared) -> serde_json::Value {
     })
 }
 
-/// One lease as the file holds it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct Written {
-    pub id: String,
-    pub until_unix: u64,
-}
-
-/// **The file read strictly**, by the agent at start and by the host timer:
-/// empty (nothing written, or only whitespace) is no lease; otherwise it is
-/// `{"leases": [{"id", "until_unix"}, …]}` with every id non-empty, or it is
-/// refused whole and nothing in it is acted on.
-pub fn read_body(body: &str) -> Result<Vec<Written>, String> {
-    #[derive(serde::Deserialize)]
-    struct File {
-        leases: Vec<Written>,
-    }
-    if body.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let f: File = serde_json::from_str(body).map_err(|e| format!("not a run-lease file: {e}"))?;
-    if let Some(n) = f.leases.iter().position(|l| l.id.trim().is_empty()) {
-        return Err(format!("lease {n} names no machine"));
-    }
-    Ok(f.leases)
-}
-
 /// Why the file's leases were not resumed ([`resumed`]): what the boot-time
 /// maintain path (omnuv's modular design, A6) is gated on. Read before the
 /// lease task writes the file again, since that write keeps only what was
@@ -274,56 +250,15 @@ pub fn resumed(book: &Shared, file: &std::path::Path) -> Result<usize, Unread> {
     Ok(n)
 }
 
-/// What one stop of a leased machine did, guest by guest, for whoever logs it.
-#[derive(Default)]
-pub(crate) struct Stops<'a> {
-    /// `vm <vmid> on <node>`, stopped by this call.
-    pub stopped: Vec<String>,
-    /// Guests carrying the claim that were left, and why: another stamp.
-    pub refused: Vec<String>,
-    /// Told `vm <vmid> on <node>` just before its stop is sent, so a run
-    /// that dies mid-stop has said what it was doing, and a machine already
-    /// stopped says nothing at all.
-    pub announce: Option<&'a (dyn Fn(&str) + Sync)>,
-}
+/// What one stop of a leased machine did: the driver crate's since A3,
+/// shared with the host timer.
+pub(crate) use onv_driver_proxmox::leased::Stops;
 
 impl Client {
-    /// **A leased machine stopped**: every guest carrying its claim tag and
-    /// its whole stamp, stopped when its node says it is not. A guest with
-    /// the tag and another stamp is left alone and said. What was done is in
-    /// `out` even when a later guest fails; an error ends the call there, and
-    /// the caller tries the whole machine again on its next pass.
-    ///
-    /// The power state is the node's live one (`status/current`), never the
-    /// cluster listing's, which lags. Stop only: nothing here destroys.
+    /// **A leased machine stopped**: `onv_driver_proxmox::leased::stop_leased`,
+    /// the rule the host timer stops by too, over this client.
     pub(crate) async fn stop_leased(&self, id: &str, out: &mut Stops<'_>) -> anyhow::Result<()> {
-        let tag = crate::names::TAG_INSTANCE;
-        for g in self.claimed_guests(tag, id).await? {
-            let config: serde_json::Value =
-                self.get_json(&format!("/nodes/{}/qemu/{}/config", g.node, g.vm.vmid)).await?;
-            let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next());
-            if first != Some(crate::names::stamped(tag, id).as_str()) {
-                out.refused.push(format!(
-                    "vm {} on {} carries {id}'s tag but not its stamp (its first line reads {:?}); not stopped",
-                    g.vm.vmid,
-                    g.node,
-                    first.unwrap_or("")
-                ));
-                continue;
-            }
-            if self.live_status(&g.node, g.vm.vmid).await? == "stopped" {
-                continue;
-            }
-            if let Some(say) = out.announce {
-                say(&format!("vm {} on {}", g.vm.vmid, g.node));
-            }
-            let upid: String = self
-                .post_form(&format!("/nodes/{}/qemu/{}/status/stop", g.node, g.vm.vmid), &[] as &[(String, String)])
-                .await?;
-            self.wait_task(&g.node, &upid).await?;
-            out.stopped.push(format!("vm {} on {}", g.vm.vmid, g.node));
-        }
-        Ok(())
+        onv_driver_proxmox::leased::stop_leased(self, id, out).await
     }
 }
 
@@ -353,34 +288,12 @@ pub async fn check(book: &Shared, driver: &Client, file: &std::path::Path) {
     }
 }
 
-/// How often the lease task looks, and so writes the file. The host timer's
-/// staleness bound is derived from it (`hosttimer::STALE_AFTER`).
-pub const WRITE_EVERY: Duration = Duration::from_secs(30);
-
-/// The lock that says the lease task is running, beside the file.
-pub fn lock_file(file: &std::path::Path) -> std::path::PathBuf {
-    file.with_extension("lock")
-}
-
-/// Opens the lock file, creating it when it is not there, never truncating
-/// anything. **Read-only when it exists**: `flock` needs no write access, so a
-/// lock file another user made (a person running the timer by hand as root)
-/// still locks, rather than leaving the agent's task to run without it.
-pub fn open_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    match std::fs::File::open(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path)
-        }
-        opened => opened,
-    }
-}
-
 /// **The lease lock, held for as long as the task runs.** Waited for while
 /// the host timer holds it (it is stopping machines; this task goes on after
 /// it), and owned by the task, so a panic here frees it as surely as the
 /// process ending does. `None` when it cannot be opened or locked: the task
 /// runs anyway, and the timer's second test, a file written within
-/// `hosttimer::STALE_AFTER`, is what keeps it from acting meanwhile.
+/// `onv_lease_expire::STALE_AFTER`, is what keeps it from acting meanwhile.
 pub(crate) async fn take_lock(file: &std::path::Path) -> Option<std::fs::File> {
     let path = lock_file(file);
     let f = match open_lock(&path) {
@@ -448,11 +361,6 @@ pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf, on_unr
         }
     });
     found
-}
-
-/// Where the file goes: beside the restore head.
-pub fn file(snippet_dir: &str) -> std::path::PathBuf {
-    std::path::Path::new(snippet_dir).parent().unwrap_or(std::path::Path::new("/var/lib/onv")).join("run-lease.json")
 }
 
 #[cfg(test)]

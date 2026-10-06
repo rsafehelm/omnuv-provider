@@ -18,6 +18,15 @@ path = "src/main.rs"
 # is its own crate, crates/onv-workloadd (omnuv's modular design, A2): as a
 # binary of this package its digest moved with this package's dependencies.
 
+# **The provider opening's applier, a binary of its own** (omnuv's modular
+# design, A3): it links onv-hostnet and none of the agent, and holds no
+# credential, Core's or Proxmox's. The host timer is the other one, in its
+# own crate (crates/onv-lease-expire), so it links none of the agent's
+# dependencies (no Core client) and its credential is its own.
+[[bin]]
+name = "onv-opening"
+path = "src/bin/onv-opening.rs"
+
 [dependencies]
 omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
 serde = { version = "1", features = ["derive"] }
@@ -69,6 +78,7 @@ members = [
     "crates/onv-generators",
     "crates/onv-hostnet",
     "crates/onv-images",
+    "crates/onv-lease-expire",
     "crates/onv-scrub",
     "crates/onv-tunnel",
     "crates/onv-workloadd",

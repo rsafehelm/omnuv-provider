@@ -5,6 +5,7 @@ onv-driver-proxmox
 onv-generators
 onv-hostnet
 onv-images
+onv-lease-expire
 onv-scrub
 onv-tunnel
 onv-workloadd

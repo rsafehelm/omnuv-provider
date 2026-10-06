@@ -817,6 +817,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "onv-lease-expire"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "hyper",
+ "libc",
+ "omnuv-protocol",
+ "onv-agent-lib",
+ "onv-core-link",
+ "onv-driver-proxmox",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "onv-scrub"
 version = "0.5.0"
 dependencies = [

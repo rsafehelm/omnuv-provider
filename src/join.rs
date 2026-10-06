@@ -353,17 +353,7 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     } else {
         sh("pveum user token remove onv@pve agent >/dev/null 2>&1; \
             pveum user token add onv@pve agent --privsep 1 --output-format json")
-            .and_then(|out| {
-                let v: serde_json::Value = serde_json::from_str(&out)?;
-                // **An empty secret is a failure, not a value.** It was written
-                // into agent.yaml as "", and the agent then failed every call
-                // to the hypervisor with an authentication error far from here.
-                v["value"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .ok_or_else(|| anyhow::anyhow!("pveum created a token and printed no secret: {out}"))
-            })?
+            .and_then(|out| token_secret(&out))?
     };
 
     // Pools, and roles granted only on those pools. The agent can write files
@@ -475,6 +465,25 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
     println!("\nGranting the agent its pools, storage, cards and zones, and reads at /:");
     step("grants", &grants_script(&storage), a.dry_run)?;
 
+    // **The host timer's own token** (omnuv's modular design, A3): it stops a
+    // buyer's machine past its run lease while the agent is down, so it holds
+    // VM.Audit and VM.PowerMgmt on the buyers' pool and nothing else, never the
+    // agent's token, and never Core's. Its unit loads it with LoadCredential=
+    // from a file only root can read. The same token deploy-agent.yml mints.
+    println!("\nCreating the host timer's token, which can stop a buyer's machine and do nothing else:");
+    step(&format!("role {LEASE_ROLE}"), &lease_role_script(), a.dry_run)?;
+    let lease_secret = if a.dry_run {
+        "<created at run time>".to_string()
+    } else {
+        sh(&format!(
+            "pveum user token remove onv@pve {name} >/dev/null 2>&1; \
+             pveum user token add onv@pve {name} --privsep 1 --output-format json",
+            name = onv_agent_lib::lease_token::TOKEN_NAME
+        ))
+        .and_then(|out| token_secret(&out))?
+    };
+    step(&format!("grant {LEASE_ROLE} on {BUYER_POOL}"), &lease_grant_script(), a.dry_run)?;
+
     let fingerprint = sh("openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256 | cut -d= -f2")
         .unwrap_or_default();
 
@@ -511,6 +520,13 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         let secrets_path = format!("/etc/onv/{}", crate::config::SECRETS_FILE);
         crate::names::write_private(&secrets_path, secrets.as_bytes(), 0o600)?;
         sh(&format!("chown onv:onv {secrets_path}"))?;
+        // Root's alone: systemd reads it for onv-lease-expire.service and hands
+        // that run a copy; the agent, running as onv, cannot read it.
+        crate::names::write_private(
+            onv_agent_lib::lease_token::CREDENTIAL_SOURCE,
+            lease_secrets_file(&lease_secret).as_bytes(),
+            0o600,
+        )?;
         sh("install -d -o onv -g onv /var/lib/onv/snippets /var/log/onv")?;
         // **And the audit log inside it.** `main` opened it before this ran,
         // as root, so it was root:root 0644 and the agent (`User=onv`) could
@@ -613,6 +629,54 @@ timings:
         secrets = crate::config::SECRETS_FILE,
         gpus = if gpus.is_empty() { "      []" } else { gpus },
     ))
+}
+
+/// What a `pveum user token add --output-format json` printed: its secret.
+/// **An empty secret is a failure, not a value.** It was written into
+/// agent.yaml as "", and the agent then failed every call to the hypervisor
+/// with an authentication error far from here.
+fn token_secret(out: &str) -> anyhow::Result<String> {
+    let v: serde_json::Value = serde_json::from_str(out)?;
+    v["value"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("pveum created a token and printed no secret"))
+}
+
+/// The host timer's role: `lease_token::PRIVILEGES`, the reads before a
+/// stop and the stop.
+const LEASE_ROLE: &str = onv_agent_lib::lease_token::ROLE;
+
+fn lease_role_script() -> String {
+    let privs = onv_agent_lib::lease_token::PRIVILEGES.join(",");
+    format!(
+        "pveum role list --output-format json | grep -q '\"{LEASE_ROLE}\"' \
+         && pveum role modify {LEASE_ROLE} -privs {privs} \
+         || pveum role add {LEASE_ROLE} -privs {privs}"
+    )
+}
+
+/// The host timer's one grant: its role on the buyers' pool, to its token
+/// alone. A privilege-separated token holds the intersection of its own
+/// grants and its user's, so this is all it holds.
+fn lease_grant_script() -> String {
+    format!(
+        "pveum acl modify /pool/{BUYER_POOL} -token 'onv@pve!{}' -role {LEASE_ROLE}",
+        onv_agent_lib::lease_token::TOKEN_NAME
+    )
+}
+
+/// `lease-secrets.yaml`, the host timer's credential: its token's id beside
+/// its secret, each a JSON string, which is a YAML one.
+fn lease_secrets_file(secret: &str) -> String {
+    format!(
+        "# Written by `onv-provider join`: the host timer's Proxmox token, mode 0600, root's.\n\
+         # onv-lease-expire.service loads it with LoadCredential=; nothing else reads it.\n\
+         proxmoxTokenId: {}\nproxmoxTokenSecret: {}\n",
+        serde_json::Value::from(format!("onv@pve!{}", onv_agent_lib::lease_token::TOKEN_NAME)),
+        serde_json::Value::from(secret)
+    )
 }
 
 /// `agent-secrets.yaml` as `join` writes it. Each value is written as a JSON
@@ -720,10 +784,11 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
         ("stop service", "systemctl disable --now onv-provider 2>/dev/null || true"),
         ("remove unit", "rm -f /etc/systemd/system/onv-provider.service; systemctl daemon-reload"),
         ("remove token", "pveum user token remove onv@pve agent 2>/dev/null || true"),
+        ("remove the host timer's token", "pveum user token remove onv@pve lease 2>/dev/null || true"),
         ("remove acl", "pveum acl delete / -token 'onv@pve!agent' -role OnvAgent 2>/dev/null || true; pveum acl delete / -user onv@pve -role OnvAgent 2>/dev/null || true"),
         ("remove user", "pveum user delete onv@pve 2>/dev/null || true"),
         ("remove role", "pveum role delete OnvAgent 2>/dev/null || true"),
-        ("remove config", "rm -f /etc/onv/agent.yaml /etc/onv/agent-secrets.yaml"),
+        ("remove config", "rm -f /etc/onv/agent.yaml /etc/onv/agent-secrets.yaml /etc/onv/lease-secrets.yaml"),
         ("remove storage", "pvesm remove onv-snippets 2>/dev/null || true"),
         ("remove pools", "pveum pool delete onv-buyers 2>/dev/null || true; pveum pool delete onv 2>/dev/null || true"),
         // **Two older generations, and they are not optional.** `join` created
@@ -754,7 +819,7 @@ pub async fn leave(dry_run: bool, without_core: bool, config: &str) -> anyhow::R
     // every vnet and subnet in them (the old `onat0` bridge included).
     step(
         "remove pool and SDN roles",
-        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus OnvConsolePassword OnvAgentRead OnvStorage OnvMapping OnvNetUse; do pveum role delete $r 2>/dev/null || true; done",
+        "for r in OnvSdn OnvWorkloadFiles OnvConsole OnvRecipeStatus OnvConsolePassword OnvAgentRead OnvStorage OnvMapping OnvNetUse OnvLease; do pveum role delete $r 2>/dev/null || true; done",
         dry_run,
     )?;
     let vnets = if dry_run {
@@ -1045,5 +1110,36 @@ mod tests {
         let (out, _, r) = run(&other, &nat, &raw);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(r.lines().filter(|l| *l == ct).count(), 1, "{r}");
+    }
+
+    /// **The host timer's credential, as `join` writes it, is the one the
+    /// timer reads** (A3): its own token's id and secret, quoted so no
+    /// character ends them, and no Core credential.
+    #[test]
+    fn the_host_timers_credential_reads_back_as_its_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = lease_secrets_file("pve-\"LEASE\"-SEKRET");
+        std::fs::write(dir.path().join(onv_agent_lib::lease_token::CREDENTIAL), &body).unwrap();
+        let token = onv_agent_lib::lease_token::read_token(Some(dir.path())).expect("join's file is refused by the timer");
+        assert_eq!(token.id, "onv@pve!lease");
+        assert_eq!(token.secret.expose(), "pve-\"LEASE\"-SEKRET");
+        assert!(!body.contains("coreToken"), "{body}");
+    }
+
+    /// **The host timer's token can stop a buyer's machine and nothing else**:
+    /// its role holds the reads before a stop and the stop, and its one grant
+    /// is on the buyers' pool, to its own token, never to the user or the
+    /// agent's token.
+    #[test]
+    fn the_host_timers_token_holds_a_stop_on_the_buyers_pool_alone() {
+        let role = lease_role_script();
+        assert!(role.contains("-privs VM.Audit,VM.PowerMgmt"), "{role}");
+        assert_eq!(role.matches("-privs ").count(), 2, "{role}");
+        let grant = lease_grant_script();
+        assert_eq!(grant, "pveum acl modify /pool/onv-buyers -token 'onv@pve!lease' -role OnvLease");
+        // Privilege separation: what the user holds there covers the role.
+        for p in onv_agent_lib::lease_token::PRIVILEGES {
+            assert!(ROLE_PRIVS.split(',').any(|q| q == p), "onv@pve lacks {p}, so the token would too");
+        }
     }
 }

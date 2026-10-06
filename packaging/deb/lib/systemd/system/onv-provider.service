@@ -51,6 +51,9 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ReadWritePaths=/var/lib/onv /var/log/onv
+# The host timer's token is root's, mode 0600, and its unit's alone
+# (onv-lease-expire.service, LoadCredential=); out of this one's view too.
+InaccessiblePaths=-/etc/onv/lease-secrets.yaml
 # **The audit log directory is not declared here**, and that is deliberate.
 # `LogsDirectory=` makes systemd create and then *re-chown* the path at every
 # start, to the service's own User and Group — so it fought the bootstrap,

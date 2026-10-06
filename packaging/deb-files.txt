@@ -8,6 +8,8 @@
 -rw-r--r-- ./usr/share/doc/onv-provider/README.md
 -rw-r--r-- ./usr/share/doc/onv-provider/copyright
 -rw-r--r-- ./usr/share/onv-provider/manifest.json
+-rwxr-xr-x ./usr/bin/onv-lease-expire
+-rwxr-xr-x ./usr/bin/onv-opening
 -rwxr-xr-x ./usr/bin/onv-provider
 drwxr-xr-x ./
 drwxr-xr-x ./etc/

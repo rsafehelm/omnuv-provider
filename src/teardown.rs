@@ -164,41 +164,13 @@ impl Client {
     /// the dangerous answer, and a node that cannot be read means absence
     /// cannot be concluded.
     pub(crate) async fn claimed_guests(&self, kind: &str, id: &str) -> anyhow::Result<Vec<Claimed>> {
-        #[derive(serde::Deserialize)]
-        struct ClusterVm {
-            node: String,
-            vmid: u32,
-            #[serde(default)]
-            tags: Option<String>,
-        }
-        // The key in either generation: a guest built before the whole key
-        // carries the twelve-digit one alone (omnuv's 0235).
-        let tagged = |tags: Option<&str>| {
-            tags.is_some_and(|t| t.split(';').any(|x| x == kind) && crate::names::carries_key(t, id))
-        };
-        let vms: Vec<ClusterVm> = self.get_json("/cluster/resources?type=vm").await?;
-        let found: Vec<Claimed> = vms
+        // The rule is the driver crate's since A3, shared with the host
+        // timer's own client; this is the agent's shape of its answer.
+        Ok(onv_driver_proxmox::leased::claimed_guests(self, kind, id)
+            .await?
             .into_iter()
-            .filter(|v| tagged(v.tags.as_deref()))
-            .map(|v| Claimed { node: v.node, vm: VmRef { vmid: v.vmid, tags: v.tags } })
-            .collect();
-        if !found.is_empty() {
-            return Ok(found);
-        }
-        let nodes: Vec<serde_json::Value> = self.get_json("/nodes").await?;
-        let mut live = Vec::new();
-        for n in nodes.iter().filter(|n| n["status"].as_str() == Some("online")) {
-            let Some(node) = n["node"].as_str() else { continue };
-            let vms: Vec<VmRef> = self.get_json(&format!("/nodes/{node}/qemu")).await.map_err(|e| {
-                anyhow::anyhow!("{node} could not be listed, so this machine's absence cannot be concluded: {e}")
-            })?;
-            live.extend(
-                vms.into_iter()
-                    .filter(|v| tagged(v.tags.as_deref()))
-                    .map(|vm| Claimed { node: node.to_string(), vm }),
-            );
-        }
-        Ok(live)
+            .map(|g| Claimed { node: g.node, vm: VmRef { vmid: g.vmid, tags: g.tags } })
+            .collect())
     }
 
     /// **The one guest that is this machine, by its whole id** (the assets-by-id
@@ -345,11 +317,7 @@ impl Client {
     /// listing's `status`, which lags a start by up to pvestatd's interval.
     /// A paused guest reads `running`, and is stopped like one.
     pub(crate) async fn live_status(&self, node: &str, vmid: u32) -> anyhow::Result<String> {
-        let now: serde_json::Value = self.get_json(&format!("/nodes/{node}/qemu/{vmid}/status/current")).await?;
-        now.get("status")
-            .and_then(|s| s.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("vm {vmid} on {node}: its node gave no power state, so it is not destroyed"))
+        onv_driver_proxmox::leased::live_status(self, node, vmid).await
     }
 
     /// **The destroy licence (a) allowed**: stopped first if its node says it

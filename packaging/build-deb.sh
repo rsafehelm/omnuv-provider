@@ -91,7 +91,7 @@ WORKLOADD_SHA256="$(sha256sum "$OUT/workloadd/onv-workloadd" | cut -d' ' -f1)"
 docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
     -e OMNUV_BUILD="$VERSION" -e OMNUV_WORKLOADD_SHA256="$WORKLOADD_SHA256" \
     -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
-    -w /w rust:1.98 cargo build --release --locked --quiet
+    -w /w rust:1.98 cargo build --release --locked --quiet -p omnuv-provider -p onv-lease-expire
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
@@ -99,7 +99,12 @@ cp -r "$ROOT/packaging/deb/DEBIAN" "$STAGE/"
 cp -r "$ROOT/packaging/deb/lib" "$STAGE/"
 # The journal's cap and the logs' rotation (A4); DEBIAN/conffiles names them.
 cp -r "$ROOT/packaging/deb/etc" "$STAGE/"
-install -m 0755 "$ROOT/target/release/onv-provider" "$STAGE/usr/bin/onv-provider"
+# Three host binaries (omnuv's modular design, A3): the agent and the
+# opening's applier, which holds no credential, from the agent's package; the
+# host timer, with its own token, from its own crate (crates/onv-lease-expire).
+for b in onv-provider onv-lease-expire onv-opening; do
+    install -m 0755 "$ROOT/target/release/$b" "$STAGE/usr/bin/$b"
+done
 install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/onv-provider/README.md"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/onv-provider/copyright"
 
