@@ -14,11 +14,13 @@
 #     package a deploy ships.
 #
 # Sections, in order:
-#     crate      the workspace's members as recorded; build, test and clippy
-#                of every member (warnings refused), then the review's defect
-#                classes: semgrep's tests of its own rules, then src and crates
-#     package    shellcheck; the .deb built as a release is built; what it
-#                holds; the Workload Agent static, and starting
+#     crate      the workspace's members as recorded; onv-workloadd's closure
+#                as recorded, with the files it includes by #[path]; build, test and clippy of every member (warnings
+#                refused), then the review's defect classes: semgrep's tests of
+#                its own rules, then src and crates
+#     package    shellcheck; the manifest check's own cases; the .deb built as
+#                a release is built; what it holds, its manifest held to the
+#                built onv-workloadd; the Workload Agent static, and starting
 #
 # Stops at the first failure and names the step. Needs cargo and docker. In
 # omnuv, `deployment/onv check` runs this as its `agent` stage.
@@ -60,6 +62,18 @@ if want crate; then
 step "The workspace's members are the ones recorded"
 packaging/baselines.sh members
 
+# onv-workloadd's own crate (omnuv's modular design, A2): what it is compiled
+# from, as recorded, and never one of the agent's members, so a split of the
+# agent cannot move the digest every inference worker's snippet carries.
+# Its closure includes, by sha256, the files it compiles by #[path], which
+# cargo tree cannot see; the reader of those attributes is tested first.
+step "The #[path] reader lists a right tree and refuses each wrong one"
+tests/packaging/workloadd_includes_test.py > "$out/includes-test.log" 2>&1 || { cat "$out/includes-test.log"; exit 1; }
+test "$(tail -1 "$out/includes-test.log")" = "includes: every case passed"
+
+step "onv-workloadd is built from its own closure, as recorded"
+packaging/baselines.sh closure
+
 step "Build"
 cargo build --locked --workspace --all-targets
 
@@ -86,7 +100,8 @@ if want package; then
 step "Maintainer scripts and the build script pass shellcheck"
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm packaging/deb/DEBIAN/postrm \
-    packaging/build-deb.sh packaging/check.sh packaging/baselines.sh crates/onv-generators/guest/onv-certificate.sh \
+    packaging/build-deb.sh packaging/check.sh packaging/baselines.sh packaging/manifest.sh \
+    tests/packaging/manifest_test.sh crates/onv-generators/guest/onv-certificate.sh \
     tests/opening/nft_test.sh tests/opening/in_container.sh
 
 # The script a web machine runs to fetch its project's certificate rides in
@@ -104,6 +119,12 @@ docker run --rm --network none -v "$PWD:/a:ro" -w /a "$PWSH_IMAGE" \
     pwsh -NoLogo -NoProfile -NonInteractive -File /a/tests/windows/harness.ps1 > "$out/windows.log" 2>&1 \
     || { cat "$out/windows.log"; exit 1; }
 test "$(tail -1 "$out/windows.log")" = "all checks passed"
+
+# The manifest's check, against packages that are right and each way of
+# being wrong, before it is trusted with the real one.
+step "The manifest check passes a right package and refuses each wrong one"
+tests/packaging/manifest_test.sh > "$out/manifest-test.log" 2>&1 || { cat "$out/manifest-test.log"; exit 1; }
+test "$(tail -1 "$out/manifest-test.log")" = "manifest: every case passed"
 
 step "Build the package as a release is built"
 ONV_PACKAGE_OUT="$out" ./packaging/build-deb.sh
@@ -126,6 +147,11 @@ packaging/baselines.sh deb "$deb"
 # The digest the agent compiles into every inference worker's snippet: a new
 # one reboots every running worker once (PROVIDER-31), so it moves only when
 # re-recorded on purpose (A1b, where a pure move changed it unnoticed).
+# The manifest (A2): in the package and beside it, naming the onv-workloadd
+# this build made, which the agent it packages carries too.
+step "The package's manifest names the built onv-workloadd's digest"
+packaging/manifest.sh "$deb" "$out/workloadd/onv-workloadd" "$out/onv-provider_current.manifest.json"
+
 step "onv-workloadd's digest is the one recorded"
 packaging/baselines.sh workloadd "$out/workloadd/onv-workloadd"
 

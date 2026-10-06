@@ -53,7 +53,11 @@ STAGE="$OUT/.deb"
 
 echo "onv-provider $VERSION ($ARCH)"
 
-# **The Workload Agent, built by the same command.** Nothing built it before,
+# **The Workload Agent, built by the same command, and alone.** Its own crate
+# (crates/onv-workloadd, omnuv's modular design A2), so only its closure is
+# compiled and its bytes move only with that closure, never with the agent's.
+#
+# Nothing built it before,
 # so `platform.yml` found no binary, skipped the copy, and every worker booted
 # without telemetry from 12 September on. Static, on musl: it runs inside guest
 # images whose glibc may be older than this toolchain's, where a dynamic build
@@ -63,7 +67,7 @@ docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry 
     -e CARGO_TARGET_DIR=/w/target/musl -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
     -w /w rust:1.98-alpine sh -ec "
         apk add --quiet --no-cache musl-dev >/dev/null
-        cargo build --release --locked --quiet --bin onv-workloadd
+        cargo build --release --locked --quiet -p onv-workloadd
     "
 mkdir -p "$OUT/workloadd"
 install -m 0755 "$ROOT/target/musl/release/onv-workloadd" "$OUT/workloadd/onv-workloadd"
@@ -96,6 +100,18 @@ cp -r "$ROOT/packaging/deb/lib" "$STAGE/"
 install -m 0755 "$ROOT/target/release/onv-provider" "$STAGE/usr/bin/onv-provider"
 install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/onv-provider/README.md"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/onv-provider/copyright"
+
+# **The manifest: which onv-workloadd this package was built with** (omnuv's
+# modular design, A2). The agent compiles the digest into every inference
+# worker's snippet, and a worker installs a served binary only if it is that one;
+# until now the digest lived only inside the agent's binary, so nothing could
+# ask a package or a host which onv-workloadd it expects. Shipped in the
+# package and written beside it, for the play that serves onv-workloadd and
+# has no dpkg-deb to ask. check.sh holds it to the built binary's sha256.
+MANIFEST="{\"package\":\"onv-provider\",\"version\":\"$VERSION\",\"workloadd_sha256\":\"$WORKLOADD_SHA256\"}"
+mkdir -p "$STAGE/usr/share/onv-provider"
+printf '%s\n' "$MANIFEST" > "$STAGE/usr/share/onv-provider/manifest.json"
+chmod 0644 "$STAGE/usr/share/onv-provider/manifest.json"
 
 size=$(du -sk "$STAGE" | cut -f1)
 cat > "$STAGE/DEBIAN/control" <<CTL
@@ -137,6 +153,7 @@ cp "$OUT/onv-provider_${VERSION}_${ARCH}.deb" "$OUT/onv-provider_current_${ARCH}
 # version hard-coded in the play would be the same two-definitions mistake in a
 # new place.
 printf '%s\n' "$VERSION" > "$OUT/onv-provider_current.version"
+printf '%s\n' "$MANIFEST" > "$OUT/onv-provider_current.manifest.json"
 
 echo "  $(basename "$OUT")/onv-provider_${VERSION}_${ARCH}.deb"
 echo "  $(basename "$OUT")/workloadd/onv-workloadd"

@@ -1,0 +1,42 @@
+[package]
+name = "onv-workloadd"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "The Omnuv Workload Agent: runs inside a marketplace-owned machine and reports what only the inside can see."
+publish = false
+
+# **Its own crate, so its bytes are its own** (omnuv's modular design, A2).
+# As a binary of the agent's package it was compiled under that package's
+# identity and dependency set, so a split of the agent into crates moved its
+# sha256 without touching a line of it (A1b: b807079f to fdeb27d8). That
+# digest is compiled into every inference worker's snippet (worker.rs), and a
+# changed snippet reboots the worker. Now its closure is this file, the two
+# files it includes from onv-agent-lib by path, and the locked versions below;
+# packaging/workloadd-closure.txt records the closure, with those two files'
+# sha256, and packaging/check.sh holds it, so it never grows a workspace
+# member. A split of the agent that leaves those two files alone cannot move
+# the digest; one that edits or moves them fails the closure check.
+#
+# Its version is its own: the agent's moving does not move it, and moving this
+# one moves the digest.
+[[bin]]
+name = "onv-workloadd"
+path = "src/main.rs"
+
+# The versions the agent already locks, with the features the agent asks of
+# them; this crate adds none to the build.
+[dependencies]
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+anyhow = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

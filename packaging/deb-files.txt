@@ -5,6 +5,7 @@
 -rw-r--r-- ./lib/systemd/system/onv-provider.service
 -rw-r--r-- ./usr/share/doc/onv-provider/README.md
 -rw-r--r-- ./usr/share/doc/onv-provider/copyright
+-rw-r--r-- ./usr/share/onv-provider/manifest.json
 -rwxr-xr-x ./usr/bin/onv-provider
 drwxr-xr-x ./
 drwxr-xr-x ./lib/
@@ -15,6 +16,7 @@ drwxr-xr-x ./usr/bin/
 drwxr-xr-x ./usr/share/
 drwxr-xr-x ./usr/share/doc/
 drwxr-xr-x ./usr/share/doc/onv-provider/
+drwxr-xr-x ./usr/share/onv-provider/
 control ./
 control ./control
 control ./postinst

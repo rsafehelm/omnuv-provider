@@ -43,13 +43,16 @@ use std::time::{Duration, Instant};
 
 // **What this machine is told, and how a time is written**: shared with the
 // Provider Agent, which writes `/etc/onv/workload.yaml` into this machine's
-// first boot. The crate has no library, so the two programs include the same
-// files; each uses its own half, which is why dead code is allowed here.
+// first boot. The two programs include the same files; each uses its own
+// half, which is why dead code is allowed here. By path, never by depending on
+// onv-agent-lib: that would put the agent's library in this binary's closure,
+// and every change to it would move this binary's digest, which every
+// inference worker's snippet carries (omnuv's modular design, A2).
 #[allow(dead_code)]
-#[path = "../../crates/onv-agent-lib/src/dur.rs"]
+#[path = "../../onv-agent-lib/src/dur.rs"]
 mod dur;
 #[allow(dead_code)]
-#[path = "../../crates/onv-agent-lib/src/workload_config.rs"]
+#[path = "../../onv-agent-lib/src/workload_config.rs"]
 mod workload_config;
 
 use workload_config::WorkloadConfig;
