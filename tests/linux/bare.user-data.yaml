@@ -1,0 +1,33 @@
+#cloud-config
+hostname: gpu-1
+manage_etc_hosts: true
+users:
+  # `default` keeps the image's own user (ubuntu), which most tooling assumes.
+  - default
+  - name: omnuv
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      []
+# Applies to the default user.
+ssh_authorized_keys:
+  []
+# The marketplace network is configured in bootcmd, which cloud-init runs in
+# the init stage on EVERY boot — before the config stage where apt runs, and
+# unlike runcmd, which runs only once. A slow first-boot apt used to leave the
+# private network unconfigured forever; here it comes up regardless.
+bootcmd:
+  # --no-block: in the init stage a start job for a unit ordered after
+  # basic.target cannot complete until this very stage finishes; waiting on
+  # it is a deadlock that looks like a boot stuck at cloud-init-network.
+  - [ sh, -c, "systemctl enable --now --no-block qemu-guest-agent 2>/dev/null || true" ]
+
+# The guest agent is baked into every template (build-template.yml), so apt
+# runs only for an image that lacks it. It was `packages: [qemu-guest-agent]`,
+# which makes cloud-init run `apt-get update` first even when the package is
+# already there: 8.0 s of every first boot, measured on an Ollama install on
+# production on 4 October 2026, for a no-op install. Networking already ran
+# in bootcmd, so an apt here, on an older image, delays nothing else.
+runcmd:
+  - [ sh, -c, "command -v qemu-ga >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent; }; systemctl enable --now qemu-guest-agent || true" ]

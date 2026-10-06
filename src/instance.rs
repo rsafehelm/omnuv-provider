@@ -5304,3 +5304,7 @@ mod a_provider_is_not_a_node {
         assert!(message.contains("nuc0:") && message.contains("nuc1:"));
     }
 }
+
+#[cfg(test)]
+#[path = "first_boot_goldens.rs"]
+mod first_boot_goldens;

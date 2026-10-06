@@ -1,0 +1,11 @@
+version: 2
+ethernets:
+  onv0:
+    match:
+      macaddress: "02:3C:EE:ED:56:5B"
+    dhcp4: true
+  onv1:
+    match:
+      macaddress: "02:09:a4:76:f8:ee"
+    dhcp4: false
+    addresses: [10.216.0.104/16]
