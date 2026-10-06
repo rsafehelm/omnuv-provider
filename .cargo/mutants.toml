@@ -1,0 +1,9 @@
+# cargo-mutants, for the agent's workspace.
+#
+# A mutant in a crate is tested by the whole workspace's tests, not only the
+# crate's own (omnuv's modular design, work package A1b). Some of a crate's
+# code is pinned only by the agent's tests: the image store's template shape
+# by images' tests against the Proxmox stand-in, which stays in the agent's
+# crate. Measured on wp/A1b: `cargo mutants -p onv-images` with the crate's
+# tests alone missed 18 mutants, among them every one in TemplateShape::holds.
+test_workspace = true

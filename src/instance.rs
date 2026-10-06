@@ -3300,48 +3300,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The rename guard has to recognise **every** generation, and getting it
-    /// wrong either blocks a healthy host forever or lets the duplicate-machine
-    /// accident through. Two now: `omnu-` and `omnuv-`.
-    ///
-    /// The prefixes nest — `omnuv-` starts with `omnu-`, and `onv-` starts with
-    /// neither — which is why this matches exact names rather than testing a
-    /// prefix. A prefix test called every current machine legacy the first time
-    /// and would do it again.
-    #[test]
-    fn a_tag_from_any_older_generation_is_recognised() {
-        use super::is_legacy_marketplace_tag;
-        // First generation.
-        assert!(is_legacy_marketplace_tag("omnu-42472e172c55;omnu-instance"));
-        assert!(is_legacy_marketplace_tag("gw-bfd571c2;omnu-gateway"));
-        assert!(is_legacy_marketplace_tag("omnu-worker"));
-        // Second, legacy as of the rename to `onv`.
-        assert!(is_legacy_marketplace_tag("omnuv-42472e172c55;omnuv-instance"));
-        assert!(is_legacy_marketplace_tag("omnuv-gateway"));
-        assert!(is_legacy_marketplace_tag("omnuv-worker"));
-    }
-
-    /// The current name is not legacy, or the agent would refuse to reconcile
-    /// a host it had just built correctly.
-    #[test]
-    fn the_current_tags_are_not_legacy() {
-        use super::is_legacy_marketplace_tag;
-        assert!(!is_legacy_marketplace_tag("onv-instance"));
-        assert!(!is_legacy_marketplace_tag("onv-gateway;g-1"));
-        assert!(!is_legacy_marketplace_tag("onv-worker"));
-    }
-
-    /// And nothing that merely resembles one of ours counts. *The safe reading
-    /// of "we do not know whose this is" is "not ours".*
-    #[test]
-    fn a_name_that_only_resembles_ours_is_not_legacy() {
-        use super::is_legacy_marketplace_tag;
-        assert!(!is_legacy_marketplace_tag(""));
-        assert!(!is_legacy_marketplace_tag("someone-elses-vm"));
-        assert!(!is_legacy_marketplace_tag("omnuv-something-else"));
-        assert!(!is_legacy_marketplace_tag("omnu-backup"));
-    }
-
     /// Maintenance restarts what crashed and does nothing else. Every other
     /// combination is a decision, and decisions belong to Core.
     #[test]

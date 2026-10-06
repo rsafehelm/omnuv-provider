@@ -233,27 +233,11 @@ pub async fn import(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// **PROVIDER-9: this import's own debris, and nothing that resembles it.**
-    #[test]
-    fn only_this_imports_unfinished_guest_is_recognised() {
-        let debris = |name: &str, desc: String, template: u64, tags: &str| {
-            serde_json::json!({"name": name, "description": desc, "template": template, "tags": tags})
-        };
-        let ours = super::description("ubuntu-2604", "ab12");
-        assert!(super::is_unfinished_import(&debris("onv-ubuntu-2604", ours.clone(), 0, ""), "ubuntu-2604"));
-        for (why, cfg) in [
-            ("a finished template", debris("onv-ubuntu-2604", ours.clone(), 1, "")),
-            ("another image's", debris("onv-debian-13", super::description("debian-13", "ab12"), 0, "")),
-            ("a different name", debris("my-vm", ours.clone(), 0, "")),
-            ("a buyer's machine", debris("onv-ubuntu-2604", ours.clone(), 0, "onv-instance;onv-0a0b0c0d0e0f")),
-            ("an older claim", debris("onv-ubuntu-2604", ours.clone(), 0, "omnuv-instance")),
-            ("build-template's wording", debris("onv-ubuntu-2604", "Omnuv marketplace base image".into(), 0, "")),
-            ("no description", serde_json::json!({"name": "onv-ubuntu-2604", "template": 0})),
-        ] {
-            assert!(!super::is_unfinished_import(&cfg, "ubuntu-2604"), "{why} was taken for this import's debris");
-        }
-    }
+    /// The digest the import tests carry. The same value pins
+    /// `onv_images::images`' own tests, which moved there with A1b.
+    const A: &str = "4d3e9997536968ae6ec7f0cf51b953e4523b3ff319bdf558e2f16e5295525620";
 
     /// Through `import`: its own stopped debris is cleared and the import goes
     /// on; the same debris *running* is refused; an operator's machine at the
@@ -534,111 +518,4 @@ mod tests {
         assert_eq!(held_with("l26", &[]).await.len(), 1, "a Linux template stopped being held");
     }
 
-    /// The guard alone, for what `import`'s own "a machine, not a template"
-    /// check would otherwise hide: our words on a machine are not a template.
-    #[test]
-    fn this_images_template_is_a_template() {
-        let cfg = |template: u64| {
-            serde_json::json!({"name": "onv-ubuntu-2604", "template": template,
-                               "description": super::description("ubuntu-2604", "ab12")})
-        };
-        assert!(super::is_this_images_template(&cfg(1), "ubuntu-2604"));
-        assert!(!super::is_this_images_template(&cfg(0), "ubuntu-2604"), "a machine was taken for a template");
-        assert!(!super::is_this_images_template(&cfg(1), "ubuntu-26"), "a prefix of the id was taken for it");
-    }
-
-    /// A partial for an id still being fetched survives, a partial for any
-    /// other id goes with its sidecar, and a finished artefact is never a
-    /// candidate whatever its id.
-    #[test]
-    fn stale_partials_go_and_nothing_else_does() {
-        let d = tempfile::tempdir().unwrap();
-        for f in ["old.part", "old.part.sha256", "live.part", "live.part.sha256",
-                  "old.qcow2", "notes.txt"] {
-            std::fs::write(d.path().join(f), b"x").unwrap();
-        }
-        let removed = super::reap_stale_partials(d.path(), &["live"]);
-        assert_eq!(removed, vec!["old.part", "old.part.sha256"]);
-        for f in ["live.part", "live.part.sha256", "old.qcow2", "notes.txt"] {
-            assert!(d.path().join(f).exists(), "{f} should have survived");
-        }
-        assert!(super::reap_stale_partials(&d.path().join("absent"), &[]).is_empty());
-    }
-
-    use super::*;
-    use omnuv_protocol::ImageArtefact;
-
-    fn artefact(id: &str, sha: &str) -> ImageArtefact {
-        ImageArtefact {
-            id: id.into(),
-            sha256: sha.into(),
-            bytes: 1,
-            url: "https://example.invalid/x".into(),
-        }
-    }
-
-    const A: &str = "4d3e9997536968ae6ec7f0cf51b953e4523b3ff319bdf558e2f16e5295525620";
-    const B: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-    #[test]
-    fn a_template_reports_the_digest_it_was_imported_from() {
-        assert_eq!(digest_in(&description("ubuntu-26.04", A)).as_deref(), Some(A));
-    }
-
-    #[test]
-    fn a_locally_built_template_claims_nothing() {
-        // What `build-template.yml` writes. Not an error: it predates the
-        // catalogue, and the honest report is "I cannot compare this".
-        assert_eq!(
-            digest_in("Omnuv marketplace base image - Ubuntu 26.04 cloud-init. Managed by Ansible."),
-            None
-        );
-    }
-
-    #[test]
-    fn a_malformed_marker_is_not_a_digest() {
-        // Truncated, uppercase, and non-hex all have to fail closed. A bad
-        // value here would be reported to Core as a digest we hold, and the
-        // next comparison would silently never match.
-        for bad in ["onv-artefact-sha256: deadbeef", &format!("{DIGEST_MARKER} {}", A.to_uppercase()), "onv-artefact-sha256: zz"] {
-            assert_eq!(digest_in(bad), None, "accepted {bad}");
-        }
-    }
-
-    #[test]
-    fn only_offered_images_are_fetched() {
-        let cat = vec![artefact("ubuntu-26.04", A), artefact("ubuntu-26.04-gaming", B)];
-        let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
-        let out = outstanding(&cat, &offered, &[]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0.id, "ubuntu-26.04");
-        assert_eq!(out[0].1, 9000);
-    }
-
-    #[test]
-    fn an_image_already_held_at_that_digest_is_left_alone() {
-        let cat = vec![artefact("ubuntu-26.04", A)];
-        let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
-        let held = vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into() }];
-        assert!(outstanding(&cat, &offered, &held).is_empty());
-    }
-
-    #[test]
-    fn a_republished_image_is_fetched_again() {
-        // The digest changed, so the bytes changed. Holding the old ones is
-        // exactly the case the digest exists to detect.
-        let cat = vec![artefact("ubuntu-26.04", B)];
-        let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
-        let held = vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into() }];
-        assert_eq!(outstanding(&cat, &offered, &held).len(), 1);
-    }
-
-    #[test]
-    fn the_volume_id_is_one_proxmox_can_parse() {
-        // `import/<name>\.(ova|ovf|qcow2|raw|vmdk)` — verified against
-        // PVE::Storage::Plugin on the host, not from memory.
-        let v = artefact_volid("onv-snippets", "ubuntu-26.04");
-        assert_eq!(v, "onv-snippets:import/ubuntu-26.04.qcow2");
-        assert!(v.ends_with(".qcow2"));
-    }
 }

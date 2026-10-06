@@ -218,3 +218,83 @@ pub fn scrub_of(config: &serde_json::Value) -> Option<String> {
     let first = config.get("description").and_then(|d| d.as_str()).and_then(|d| d.lines().next())?;
     first.strip_prefix(&onv_agent_lib::names::stamped(TAG, "")).map(str::to_string).filter(|s| !s.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onv_agent_lib::dur::Dur;
+
+    fn report(status: &str) -> GuestReport {
+        serde_json::from_value(serde_json::json!({
+            "status": status, "stage": "done", "uptime_s": 95, "cards": 1, "total_mib": 24576,
+            "covered_mib": 24200, "residue_mib": 18000, "verified": status == "clean", "seconds": 41.5,
+            "persistent": {"vbios": "94.02.42.00.01", "inforom": "G001.0000.03.03", "ecc": "N/A", "serial": ""},
+            "detail": ""
+        }))
+        .unwrap()
+    }
+
+    /// **The program's word is the verdict**, and the agent adds only what
+    /// the program cannot say: that its guest stopped first, or ran past the
+    /// deadline. Still scrubbing inside it is a wait, never a failure.
+    #[test]
+    fn a_guest_is_done_when_its_program_says_or_when_it_cannot() {
+        let deadline = Dur::mins(20);
+        let clean = step(Some(&report("clean")), true, 100, deadline);
+        assert!(matches!(&clean, Step::Done(Outcome::Clean, d) if d["covered_mib"] == 24200 && d["residue_mib"] == 18000), "{clean:?}");
+        assert!(matches!(step(Some(&report("failed")), true, 100, deadline), Step::Done(Outcome::Failed, _)));
+        assert_eq!(step(Some(&report("running")), true, 100, deadline), Step::Wait);
+        assert_eq!(step(None, true, 100, deadline), Step::Wait, "a guest still booting is not a failure");
+        let late = step(Some(&report("running")), true, 1200, deadline);
+        assert!(matches!(&late, Step::Done(Outcome::Failed, d) if d["detail"].as_str().unwrap().contains("scrubGuestDeadline")), "{late:?}");
+        let stopped = step(None, false, 0, deadline);
+        assert!(matches!(&stopped, Step::Done(Outcome::Failed, d) if d["detail"].as_str().unwrap().contains("stopped")), "{stopped:?}");
+        // A verdict read before the stop is still the verdict.
+        assert!(matches!(step(Some(&report("clean")), false, 0, deadline), Step::Done(Outcome::Clean, _)));
+    }
+
+    /// **The wire is Core's** (`scrubs::tests::the_wire_is_the_agents` pins
+    /// the same bytes): what Core lists deserializes here, and what this
+    /// agent says is what Core reads.
+    #[test]
+    fn the_wire_is_cores() {
+        let w: Wants = serde_json::from_str(
+            r#"{"scrubs":[{"id":"6f1c2f2e-58a4-4b43-9b0a-0d7b6c3c1d11","attempt":1,"card":"0000:01:00.0",
+                "node":"pluto","model":"GA102 [GeForce RTX 3090]","image":"scrub-nvidia"}]}"#,
+        )
+        .unwrap();
+        assert_eq!((w.scrubs[0].attempt, w.scrubs[0].image.as_str()), (1, "scrub-nvidia"));
+        let said = [Said {
+            id: "6f1c2f2e-58a4-4b43-9b0a-0d7b6c3c1d11".into(),
+            attempt: 2,
+            outcome: Outcome::Failed,
+            detail: serde_json::json!({"detail": "the guest never reported", "seconds": 1200.0}),
+        }];
+        assert_eq!(
+            serde_json::to_value(Report { scrubs: &said }).unwrap(),
+            serde_json::json!({"scrubs":[{"id":"6f1c2f2e-58a4-4b43-9b0a-0d7b6c3c1d11","attempt":2,"outcome":"failed",
+                "detail":{"detail":"the guest never reported","seconds":1200.0}}]})
+        );
+        let mut held = Held::default();
+        held.0.insert(("a".into(), 1), said[0].clone());
+        held.0.insert(("b".into(), 1), said[0].clone());
+        held.answered(&[
+            Recorded { id: "a".into(), attempt: 1, result: "clean".into() },
+            Recorded { id: "b".into(), attempt: 1, result: "held".into() },
+        ]);
+        assert_eq!(held.0.keys().cloned().collect::<Vec<_>>(), vec![("b".to_string(), 1)], "held is kept, the rest forgotten");
+    }
+
+    #[test]
+    fn a_stamp_names_its_scrub_and_its_attempt() {
+        let id = "6f1c2f2e-58a4-4b43-9b0a-0d7b6c3c1d11";
+        let config = serde_json::json!({"description": format!("{}\nattempt 3", onv_agent_lib::names::description(TAG, id))});
+        assert_eq!((scrub_of(&config).as_deref(), attempt_of(&config)), (Some(id), Some(3)));
+        let config = serde_json::json!({"description": onv_agent_lib::names::description(TAG, id)});
+        assert_eq!((scrub_of(&config).as_deref(), attempt_of(&config)), (Some(id), None), "no attempt line, no attempt");
+        // An instance's stamp is not a scrub's.
+        let other = serde_json::json!({"description": onv_agent_lib::names::description(onv_agent_lib::names::TAG_INSTANCE, id)});
+        assert_eq!(scrub_of(&other), None);
+    }
+
+}
