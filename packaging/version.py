@@ -58,6 +58,10 @@ def inputs(root: pathlib.Path, depinfos: list[pathlib.Path]) -> list[str]:
     """The inputs, relative to root, sorted."""
     found: set[str] = set()
     for d in depinfos:
+        if not d.is_file():
+            # No build has run in this tree, or not this one's: said, never a
+            # traceback (omnuv's agent-package-current.yml prints it).
+            sys.exit(f"version: no dep-info at {d}; build the package first")
         listed = dep_paths(d.read_text())
         if not listed:
             sys.exit(f"version: {d} lists no input; it is not a dep-info file")

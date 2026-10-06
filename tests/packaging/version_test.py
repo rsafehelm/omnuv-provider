@@ -145,6 +145,10 @@ def main(argv: list[str]) -> None:
               rc != 0 and "src/opening.rs" in msg, msg)
         gone.write_bytes(saved)
 
+        rc, msg = run_version(root, [*depinfos, root / "target/release/absent.d"])
+        check("a dep-info that is not there is refused, and named",
+              rc != 0 and "no dep-info at" in msg and "absent.d" in msg and "Traceback" not in msg, msg)
+
     if failed:
         print(f"version: {failed} cases failed")
         sys.exit(1)
