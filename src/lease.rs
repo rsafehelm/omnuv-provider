@@ -418,12 +418,21 @@ pub(crate) async fn take_lock(file: &std::path::Path) -> Option<std::fs::File> {
 /// file's leases are resumed before this returns, so the first view renews
 /// or releases them rather than racing their resumption. Returns what the
 /// resumption found, which gates the boot-time maintain path (A6).
-pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf) -> Result<usize, Unread> {
+///
+/// `on_unread` is told why nothing was resumed **before the task can write
+/// the file**: that write keeps only what was resumed, so from it on the next
+/// start reads an empty book as a whole one. What depends on the file having
+/// been read (the held view, `heldview::retire`) is taken out of use there,
+/// in this start, or never.
+pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf, on_unread: impl FnOnce(&Unread)) -> Result<usize, Unread> {
     let found = resumed(&book, &file);
     match &found {
         Ok(0) | Err(Unread::Missing) => {}
         Ok(n) => println!("run lease: {n} lease(s) resumed from {}", file.display()),
         Err(e) => eprintln!("run lease: {e:#}, so no lease is resumed"),
+    }
+    if let Err(why) = &found {
+        on_unread(why);
     }
     let task = tokio::spawn(async move {
         let _held = take_lock(&file).await;
@@ -665,7 +674,7 @@ mod tests {
         let mock = crate::pvemock::Mock::start(|_, _, _| (404, serde_json::Value::Null)).await;
         let dir = tempfile::tempdir().expect("a directory");
         let file = dir.path().join("run-lease.json");
-        let _ = spawn(book(), Arc::new(mock.client()), file.clone());
+        let _ = spawn(book(), Arc::new(mock.client()), file.clone(), |_| {});
         let probe = open_lock(&lock_file(&file)).unwrap();
         let mut held = false;
         for _ in 0..250 {

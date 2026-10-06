@@ -16,7 +16,9 @@
 //! acts      starts only, through `Client::maintain`: a machine whose intent
 //!           is Running, which exists, and which its node calls stopped.
 //!           Nothing is created, stopped or destroyed
-//! gated     the run-lease file read whole (missing or refused: nothing),
+//! gated     the run-lease file read whole (missing or refused: nothing,
+//!           and the view is retired in that start, `retire`, so a later
+//!           start cannot read the lease task's rewrite as a whole book),
 //!           no expired lease (`lease::may_restart`), the restore bit kept
 //!           in the head (`restore::held_at_boot`), the same Core url, and a
 //!           view no older than `timings.heldViewMaxAge` (15 min)
@@ -92,6 +94,49 @@ pub fn write(file: &Path, held: &Persisted) {
     if let Err(e) = written {
         eprintln!("held view: {} not written: {e:#}", file.display());
     }
+}
+
+/// Where a retired view goes: kept for whoever reads the host, never read.
+pub fn retired(file: &Path) -> PathBuf {
+    file.with_extension("json.refused")
+}
+
+/// **A start whose run-lease file was not resumed takes the held view out of
+/// use** (`lease::spawn`'s `on_unread`). That start's own passes refuse on the
+/// lease result; this is for the next start in the same outage, which would
+/// read the file the lease task wrote from an empty book, find nothing run
+/// out, and start machines whose leases in the lost file had. The view comes
+/// back when Core answers and a pass writes a fresh one.
+///
+/// Renamed aside, or removed when it cannot be; when neither works it is said,
+/// and a later start may still read it.
+pub fn retire(file: &Path, why: &crate::lease::Unread) {
+    match std::fs::rename(file, retired(file)) {
+        Ok(()) => eprintln!("held view: {why}, so {} is retired until Core answers", file.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => match std::fs::remove_file(file) {
+            Ok(()) => eprintln!("held view: {why}, so {} is removed (not renamed: {e:#})", file.display()),
+            Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e2) => eprintln!(
+                "held view: {why}, and {} could be neither renamed ({e:#}) nor removed ({e2:#}); a later start may maintain from it",
+                file.display()
+            ),
+        },
+    }
+}
+
+/// **The lease task, as `agent::run` starts it**: [`lease::spawn`] with the
+/// held view retired when the run-lease file is not resumed, before the
+/// task's first write.
+///
+/// [`lease::spawn`]: crate::lease::spawn
+pub fn spawn_leases(
+    book: crate::lease::Shared,
+    driver: Arc<crate::proxmox::Client>,
+    lease_file: PathBuf,
+    held_view: &Path,
+) -> Result<usize, crate::lease::Unread> {
+    crate::lease::spawn(book, driver, lease_file, |why| retire(held_view, why))
 }
 
 /// **The file, if it may be maintained from now**: there, read whole, from
@@ -437,6 +482,46 @@ mod tests {
             assert!(matches!(&p, Pass::Refused(w) if w.contains(why)), "{why}: {p:?}");
             assert_eq!(acts(&host.mock), Vec::<String>::new(), "{why}: something was started");
         }
+    }
+
+    /// **A torn lease file holds for every start of the outage, not only the
+    /// first.** Start one refuses on the lease result; its lease task then
+    /// writes the file from an empty book, so start two resumes it whole
+    /// (`Ok(0)`) and finds no lease run out. Start two must still start
+    /// nothing: the view was retired in start one, before that write.
+    #[tokio::test]
+    async fn a_torn_lease_file_starts_nothing_on_the_next_start_either() {
+        let host = Host::new(Duration::from_secs(60)).await;
+        let lf = host.dir.path().join("run-lease.json");
+        let hv = host.dir.path().join("held-view.json");
+        std::fs::write(&lf, b"{\"leases\": [").unwrap();
+
+        // Start one, as `agent::run` makes it (`spawn_leases`).
+        let lease: crate::lease::Shared = Default::default();
+        let leases = spawn_leases(lease.clone(), Arc::new(host.mock.client()), lf.clone(), &hv);
+        assert!(matches!(leases, Err(crate::lease::Unread::Refused(_))), "{leases:?}");
+        let first = Gates { leases, lease, ..host.gates() };
+        let p = pass(&first, &host.mock.client()).await;
+        assert!(matches!(&p, Pass::Refused(w) if w.contains("was refused")), "{p:?}");
+        assert!(retired(&hv).exists(), "the view was not set aside");
+
+        // The lease task's first write, polled for: bounded, it is immediate.
+        let mut rewritten = false;
+        for _ in 0..250 {
+            if std::fs::read_to_string(&lf).is_ok_and(|b| crate::lease::read_body(&b).is_ok()) {
+                rewritten = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(rewritten, "the lease task never rewrote the torn file");
+
+        // Start two: the file now reads whole, and empty.
+        let second = host.gates();
+        assert_eq!(second.leases, Ok(0), "the premise: the rewrite reads as a whole, empty book");
+        let p = pass(&second, &host.mock.client()).await;
+        assert!(matches!(&p, Pass::Refused(_)), "{p:?}");
+        assert_eq!(acts(&host.mock), Vec::<String>::new(), "the second start in the outage started something");
     }
 
     /// **Off is off**: heldViewMaxAge 0s.
