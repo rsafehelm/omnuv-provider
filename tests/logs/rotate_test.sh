@@ -7,10 +7,11 @@
 #   - logrotate, with the package's own file, rotates /var/log/onv as the
 #     package and deploy-agent.yml leave it (onv:adm 0750, the audit log
 #     onv:onv 0640), and the new audit.log keeps that owner and mode;
-#   - the packaged binary, as onv, then appends to the new audit.log and
-#     not to the rotated one;
-#   - systemd-analyze verify loads onv-provider.service with nothing to say,
-#     so a directive it does not know, or a value it cannot parse, fails;
+#   - the packaged host timer (onv-lease-expire, A3), as onv, then appends
+#     to the new audit.log and not to the rotated one;
+#   - systemd-analyze verify loads each of the package's three services with
+#     nothing to say, so a directive it does not know, or a value it cannot
+#     parse, fails;
 #   - the package's postinst, under a stub systemctl, restarts journald on a
 #     first install, not on an unchanged reconfigure, again after the cap is
 #     edited, and records nothing when the restart fails.

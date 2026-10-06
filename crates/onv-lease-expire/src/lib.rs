@@ -48,6 +48,10 @@
 //! VMIDs, nodes and the hypervisor's own error text; never a credential. It
 //! never writes `run-lease.json`, whose one writer is the agent.
 
+// The test mock's server tasks are bare spawns, as the agent's own are under
+// test (src/main.rs); the timer itself spawns nothing (A4's lint, clippy.toml).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 mod pve;
 #[cfg(test)]
 mod mock;
@@ -304,9 +308,31 @@ pub async fn pass(driver: &anyhow::Result<Client>, file: &Path, log: &Log, now: 
         }
         stopped += out.stopped.len();
         refused += out.refused.len();
-        if let Err(e) = result {
-            failed += 1;
-            log.say(&l.id, "failed", &format!("not stopped; the next run tries again: {e:#}"));
+        match result {
+            Err(e) => {
+                failed += 1;
+                log.say(&l.id, "failed", &format!("not stopped; the next run tries again: {e:#}"));
+            }
+            // **Not visible is not absent** (R1 rule 9). This token lists only
+            // the guests it may VM.Audit, those in the buyers' pool, so a
+            // leased machine outside it (built before the pool and not yet
+            // moved, or taken out of it) answers exactly as a deleted one.
+            // The timer cannot tell which, so it has not done its work.
+            Ok(()) if out.claimed == 0 => {
+                failed += 1;
+                log.say(
+                    &l.id,
+                    "failed",
+                    &format!(
+                        "no guest carrying {}'s claim is visible to {} (outside /pool/{}, or gone); \
+                         nothing stopped, and the next run asks again",
+                        l.id,
+                        driver.token_id(),
+                        onv_agent_lib::names::POOL_BUYERS
+                    ),
+                );
+            }
+            Ok(()) => {}
         }
     }
     Verdict::Acted { due: due.len(), stopped, refused, failed }
@@ -620,6 +646,47 @@ mod tests {
             said.contains(&format!("{ID} refused: vm 702 on n1 carries {ID}'s tag but not its stamp")),
             "the decoy's refusal was not said: {said}"
         );
+    }
+
+    /// **A leased guest this token cannot see is a failure, not a done**:
+    /// onv@pve!lease lists only what it may VM.Audit, the buyers' pool, so a
+    /// leased machine outside the pool is missing from the listing exactly
+    /// as a deleted one is. The listing here omits it (only the decoy, then
+    /// nothing at all), and the run must count it failed, say so naming the
+    /// token and the pool, and exit 1, never report 0 stopped and exit 0.
+    #[tokio::test]
+    async fn a_leased_guest_the_token_cannot_see_fails_the_run() {
+        let tags = format!("onv-instance;{}", names::short_tag(ID));
+        for listing in [
+            serde_json::json!([{"node": "n1", "vmid": 702, "tags": tags, "status": "running"}]),
+            serde_json::json!([]),
+        ] {
+            let decoys = listing.as_array().unwrap().len();
+            let mock = Mock::start(move |method, path| match (method, path) {
+                ("GET", "/cluster/resources?type=vm") => (200, listing.clone()),
+                // The node's own listing, asked when the cluster's has no
+                // claimed guest: it omits the guest too, as it does for a
+                // token without VM.Audit on it.
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
+                ("GET", "/nodes/n1/qemu/702/config") => {
+                    (200, serde_json::json!({"description": "Omnuv instance 0b1f7a2e-1111-4222-8333-000000000000"}))
+                }
+                _ => (404, serde_json::Value::Null),
+            })
+            .await;
+            let h = host(Some(&expired_body(60)), Duration::from_secs(120));
+            let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
+            assert_eq!(v, Verdict::Acted { due: 1, stopped: 0, refused: decoys, failed: 1 }, "{}", v.describe());
+            assert_eq!(v.exit_code(), 1, "an unseen leased guest exited 0");
+            assert!(stops(&mock).is_empty(), "something was stopped");
+            let said = own_log(&h);
+            assert!(
+                said.contains(&format!("{ID} failed: no guest carrying {ID}'s claim is visible to "))
+                    && said.contains("(outside /pool/onv-buyers, or gone)"),
+                "the unseen guest was not said: {said}"
+            );
+        }
     }
 
     /// **Nothing is stopped while the agent is alive**: its lease task holds

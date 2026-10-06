@@ -212,7 +212,15 @@ async fn main() -> anyhow::Result<()> {
     // with only the credential it needs. Said, rather than read as an unknown
     // command, so a hand run from an old runbook learns where they went.
     if let Some(moved) = MOVED.iter().find(|(old, _)| *old == command) {
-        eprintln!("onv-provider {}: moved to {}; nothing done", moved.0, moved.1);
+        // A play that still calls one is older than this package: omnuv's
+        // deploy-agent.yml before A3, which neither mints the host timer's
+        // token nor proves it. Exit 2 fails that play loudly rather than let
+        // it end green over a timer that cannot start (243/CREDENTIALS).
+        eprintln!(
+            "onv-provider {}: moved to {}; nothing done. A play calling this is older than this \
+             package: deploy it with omnuv's deploy-agent.yml from A3 on",
+            moved.0, moved.1
+        );
         std::process::exit(2);
     }
 

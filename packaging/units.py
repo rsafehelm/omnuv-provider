@@ -7,8 +7,21 @@
 Every unit's sandbox was copied by hand and nothing asserted one, so a line
 lost in an edit was a privilege regained in silence. This reads each service
 the package installs, from the extracted package, and holds it to the table
-below: the lines it must carry, the lines it must not, and the binary its
-ExecStart names, which must be in the package.
+below, the way systemd applies it rather than the way it reads:
+
+    a later line wins          ProtectSystem=no after ProtectSystem=strict,
+                               User=root after User=onv
+    an empty line resets       InaccessiblePaths= empties the list before it
+    list lines merge           a second CapabilityBoundingSet= or
+                               ReadWritePaths= widens the first
+
+So a key the table requires must appear **exactly once**, with the value
+given: a second line of it, an empty reset included, fails. A key the table
+neither requires nor names as free fails too, so a new directive is decided
+in the change that adds it. Credential and ambient-capability keys are
+refused by prefix, so LoadCredentialEncrypted= and SetCredentialEncrypted=
+are refused with the plain forms. A drop-in directory in the package fails:
+it would apply after the unit and is read by nothing here.
 
 Each of the three host binaries holds only its own credential:
 
@@ -19,13 +32,17 @@ Each of the three host binaries holds only its own credential:
     onv-opening       root, two capabilities, and no credential at all: both
                       files out of its view, CAP_DAC_READ_SEARCH or not
 
-A unit the table does not name fails the check: a new unit is held to a
-sandbox in the change that adds it. `--self-test` drops each required line and
-adds each forbidden one, one at a time, and every such unit must fail; the
-units as written must pass.
+Not covered: a drop-in an operator writes under /etc/systemd/system on the
+host. That is the host's configuration, not the package's.
+
+`--self-test` drops each required line, appends a second line of each
+required key (empty, and with another value), adds each forbidden key and an
+unknown one, and every such unit must fail; the units as written must pass,
+and so must one whose free key is changed.
 """
 
 import pathlib
+import shutil
 import sys
 import tempfile
 
@@ -44,6 +61,11 @@ COMMON = [
 AGENT_SECRETS = "/etc/onv/agent-secrets.yaml"
 LEASE_SECRETS = "/etc/onv/lease-secrets.yaml"
 
+# Keys refused by prefix wherever the table does not require them: any form of
+# a credential handed in by systemd, and a capability raised for a non-root
+# user.
+CREDENTIAL_PREFIXES = ["LoadCredential", "SetCredential", "ImportCredential", "AmbientCapabilities"]
+
 UNITS = {
     "onv-provider.service": {
         "binary": "onv-provider",
@@ -52,9 +74,16 @@ UNITS = {
             "User=onv",
             "Group=onv",
             "ProtectKernelTunables=yes",
+            "ReadWritePaths=/var/lib/onv /var/log/onv",
             f"InaccessiblePaths=-{LEASE_SECRETS}",
+            "UMask=0027",
+            # A4's supervision (tests/supervision_units.rs asserts the why).
+            "Restart=always",
+            "RestartPreventExitStatus=3",
+            "MemoryMax=1G",
         ],
-        "forbid_prefix": ["LoadCredential", "SetCredential", "ImportCredential", "AmbientCapabilities"],
+        "free": ["Type", "RestartSec", "TimeoutStopSec", "StateDirectory"],
+        "forbid_prefix": CREDENTIAL_PREFIXES,
     },
     "onv-lease-expire.service": {
         "binary": "onv-lease-expire",
@@ -64,15 +93,21 @@ UNITS = {
             "Group=onv",
             f"LoadCredential=lease:{LEASE_SECRETS}",
             f"InaccessiblePaths=-{AGENT_SECRETS}",
+            "ReadWritePaths=/var/lib/onv /var/log/onv",
+            "UMask=0027",
             "CapabilityBoundingSet=",
             "ProtectKernelTunables=yes",
             "ProtectKernelModules=yes",
+            "ProtectKernelLogs=yes",
+            "ProtectClock=yes",
             "RestrictNamespaces=yes",
+            "RestrictRealtime=yes",
+            "SystemCallArchitectures=native",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
         ],
-        # Its token and nothing else: one LoadCredential line, the one above.
-        "only_one": ["LoadCredential"],
-        "forbid_prefix": ["SetCredential", "ImportCredential", "AmbientCapabilities"],
+        "free": ["Type", "TimeoutStartSec"],
+        # Its token and nothing else: the LoadCredential line above, once.
+        "forbid_prefix": CREDENTIAL_PREFIXES,
     },
     "onv-opening.service": {
         "binary": "onv-opening",
@@ -82,13 +117,18 @@ UNITS = {
             f"InaccessiblePaths=-{AGENT_SECRETS} -{LEASE_SECRETS}",
             "RestrictAddressFamilies=AF_NETLINK AF_UNIX AF_INET",
         ],
-        "forbid_prefix": ["LoadCredential", "SetCredential", "ImportCredential", "AmbientCapabilities"],
+        "free": ["Type", "TimeoutStartSec"],
+        "forbid_prefix": CREDENTIAL_PREFIXES,
     },
 }
 
 
+def key_of(line):
+    return line.split("=", 1)[0].strip()
+
+
 def service_lines(text):
-    """The [Service] section's settings, as written, comments dropped."""
+    """The [Service] section's settings, in order, comments dropped."""
     out, section = [], None
     for raw in text.splitlines():
         line = raw.strip()
@@ -102,36 +142,101 @@ def service_lines(text):
     return out
 
 
+def check_unit(name, want, lines):
+    bad = []
+    required = {}
+    for line in want["require"]:
+        required.setdefault(key_of(line), []).append(line)
+    for key, wanted in required.items():
+        held = [l for l in lines if key_of(l) == key]
+        if len(wanted) != 1:
+            raise SystemExit(f"units.py: {name} requires {key} twice in its table")
+        if held != wanted:
+            if not held:
+                bad.append(f"{name}: lacks {wanted[0]!r}")
+            elif len(held) > 1:
+                bad.append(f"{name}: holds {len(held)} {key} lines {held!r}; exactly {wanted[0]!r} is required, "
+                           "since a later line overrides, resets or widens it")
+            else:
+                bad.append(f"{name}: holds {held[0]!r}, not {wanted[0]!r}")
+    free = set(want.get("free", []))
+    for line in lines:
+        key = key_of(line)
+        if key in required:
+            continue
+        if any(key.startswith(p) for p in want.get("forbid_prefix", [])):
+            bad.append(f"{name}: holds {line!r}, which it must not")
+        elif key not in free:
+            bad.append(f"{name}: holds {line!r}, a key this check does not know; require it or name it free in UNITS")
+    for key in free:
+        n = sum(1 for l in lines if key_of(l) == key)
+        if n > 1:
+            bad.append(f"{name}: holds {n} {key} lines; one is the most it may hold")
+    return bad
+
+
 def check(root):
     """Every failure under `root`, in words; empty when every unit passes."""
     root = pathlib.Path(root)
     units = root / "lib/systemd/system"
     bad = []
-    found = sorted(p.name for p in units.glob("*.service"))
-    for name in found:
-        if name not in UNITS:
-            bad.append(f"{name}: a service this check does not know; give it a sandbox in UNITS")
+    for p in sorted(units.iterdir()) if units.is_dir() else []:
+        if p.is_dir():
+            bad.append(f"{p.name}: a drop-in directory in the package; it would override the units checked here")
+        elif p.suffix == ".service" and p.name not in UNITS:
+            bad.append(f"{p.name}: a service this check does not know; give it a sandbox in UNITS")
     for name, want in UNITS.items():
         path = units / name
         if not path.is_file():
             bad.append(f"{name}: not in the package")
             continue
-        lines = service_lines(path.read_text())
-        for line in want["require"]:
-            if line not in lines:
-                bad.append(f"{name}: lacks {line!r}")
-        for line in lines:
-            key = line.split("=", 1)[0]
-            if key in want.get("forbid_prefix", []):
-                bad.append(f"{name}: holds {line!r}, which it must not")
-        for key in want.get("only_one", []):
-            n = sum(1 for line in lines if line.split("=", 1)[0] == key)
-            if n != 1:
-                bad.append(f"{name}: holds {n} {key} lines, not one")
+        bad += check_unit(name, want, service_lines(path.read_text()))
         binary = root / "usr/bin" / want["binary"]
         if not binary.is_file():
             bad.append(f"{name}: runs /usr/bin/{want['binary']}, which the package does not hold")
     return bad
+
+
+def append_to_service(text, line):
+    """`line` as the last setting of [Service], where systemd applies it last."""
+    out, inside, done = [], False, False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if inside and not done:
+                out.append(line)
+                done = True
+            inside = s == "[Service]"
+        out.append(raw)
+    if inside and not done:
+        out.append(line)
+        done = True
+    assert done, "no [Service] section"
+    return "\n".join(out) + "\n"
+
+
+# The overrides measured to pass the line-presence check this replaced, each
+# appended as the unit's last [Service] line (review of wp/A3).
+OVERRIDES = {
+    "onv-lease-expire.service": [
+        "ProtectSystem=no",
+        "CapabilityBoundingSet=CAP_SYS_ADMIN",
+        "User=root",
+        "ReadWritePaths=/etc",
+        f"LoadCredentialEncrypted=agent:{AGENT_SECRETS}",
+    ],
+    "onv-opening.service": [
+        "InaccessiblePaths=",
+        "User=root",
+        f"LoadCredentialEncrypted=lease:{LEASE_SECRETS}",
+    ],
+    "onv-provider.service": [
+        "InaccessiblePaths=",
+        f"LoadCredentialEncrypted=lease:{LEASE_SECRETS}",
+        f"SetCredentialEncrypted=lease:{LEASE_SECRETS}",
+        "ReadWritePaths=/etc",
+    ],
+}
 
 
 def self_test(here):
@@ -142,10 +247,9 @@ def self_test(here):
         tmp = pathlib.Path(tmp)
 
         def build(edit=None):
-            units = tmp / "root/lib/systemd/system"
             if (tmp / "root").exists():
-                import shutil
                 shutil.rmtree(tmp / "root")
+            units = tmp / "root/lib/systemd/system"
             units.mkdir(parents=True)
             (tmp / "root/usr/bin").mkdir(parents=True)
             for want in UNITS.values():
@@ -160,33 +264,60 @@ def self_test(here):
         if said:
             failures.append(f"the units as written fail: {said}")
         cases = 0
+
+        def must_fail(what, edit):
+            nonlocal cases
+            cases += 1
+            if not check(build(edit)):
+                failures.append(f"{what} passed")
+
+        def appended(name, line):
+            def edit(units):
+                p = units / name
+                p.write_text(append_to_service(p.read_text(), line))
+            return edit
+
         for name, want in UNITS.items():
             for line in want["require"]:
                 def drop(units, name=name, line=line):
                     p = units / name
                     p.write_text("\n".join(l for l in p.read_text().splitlines() if l.strip() != line) + "\n")
-                cases += 1
-                if not check(build(drop)):
-                    failures.append(f"{name} without {line!r} passed")
-            for key in want.get("forbid_prefix", []) + want.get("only_one", []):
-                def add(units, name=name, key=key):
-                    p = units / name
-                    p.write_text(p.read_text().replace("[Service]\n", f"[Service]\n{key}=x:/etc/onv/agent-secrets.yaml\n"))
-                cases += 1
-                if not check(build(add)):
-                    failures.append(f"{name} with an added {key} line passed")
+                must_fail(f"{name} without {line!r}", drop)
+                key = key_of(line)
+                must_fail(f"{name} with {key}= (a reset) appended", appended(name, f"{key}="))
+                must_fail(f"{name} with {key}=onv-other appended", appended(name, f"{key}=onv-other"))
+            for prefix in want["forbid_prefix"]:
+                for form in (prefix, prefix + "Encrypted"):
+                    must_fail(f"{name} with an added {form} line", appended(name, f"{form}=x:{AGENT_SECRETS}"))
+            for line in OVERRIDES.get(name, []):
+                must_fail(f"{name} with {line!r} appended", appended(name, line))
+            must_fail(f"{name} with an unknown ExecStartPre", appended(name, "ExecStartPre=/bin/sh -c true"))
+            for key in want.get("free", []):
+                must_fail(f"{name} with a second {key} line", appended(name, f"{key}=onv-other"))
 
             def no_binary(units, want=want):
                 (units.parent.parent.parent / "usr/bin" / want["binary"]).unlink()
-            cases += 1
-            if not check(build(no_binary)):
-                failures.append(f"{name} passed with /usr/bin/{want['binary']} absent")
+            must_fail(f"{name} with /usr/bin/{want['binary']} absent", no_binary)
+
+            # The nearest thing it must accept: a free key's value changed.
+            def retimed(units, name=name, want=want):
+                p = units / name
+                key = want["free"][-1]
+                text = "\n".join(f"{key}=onv-other" if key_of(l.strip()) == key else l
+                                 for l in p.read_text().splitlines()) + "\n"
+                p.write_text(text)
+            said = check(build(retimed))
+            if said:
+                failures.append(f"{name} with its free key changed fails: {said}")
 
         def stray(units):
             (units / "onv-stray.service").write_text("[Service]\nExecStart=/bin/true\n")
-        cases += 1
-        if not check(build(stray)):
-            failures.append("an unknown service passed")
+        must_fail("an unknown service", stray)
+
+        def dropin(units):
+            (units / "onv-provider.service.d").mkdir()
+            (units / "onv-provider.service.d/x.conf").write_text("[Service]\nUser=root\n")
+        must_fail("a drop-in directory", dropin)
     return cases, failures
 
 
@@ -197,7 +328,7 @@ def main(argv):
             print(f"units self-test: {f}", file=sys.stderr)
         if failures:
             return 1
-        print(f"units self-test: the units pass, and each of {cases} broken copies fails")
+        print(f"units self-test: the units pass, a changed free key passes, and each of {cases} broken copies fails")
         return 0
     if len(argv) != 2:
         print(__doc__.split("\n\n")[1], file=sys.stderr)

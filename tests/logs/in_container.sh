@@ -6,7 +6,9 @@ ok() { echo "ok    $*"; }
 
 addgroup --system onv >/dev/null
 adduser --system --ingroup onv --no-create-home --home /var/lib/onv --shell /usr/sbin/nologin onv >/dev/null
-install -m 0755 /pkg/usr/bin/onv-provider /usr/bin/onv-provider
+for b in onv-provider onv-lease-expire onv-opening; do
+    install -m 0755 "/pkg/usr/bin/$b" "/usr/bin/$b"
+done
 install -m 0644 /pkg/etc/logrotate.d/onv-provider /etc/logrotate.d/onv-provider
 install -d -o onv -g adm -m 0750 /var/log/onv
 install -d -o onv -g onv /var/lib/onv
@@ -24,24 +26,29 @@ got="$(stat -c '%U:%G %a' /var/log/onv/audit.log)"
 [ "$got" = "onv:onv 640" ] || fail "the new audit.log is $got, not onv:onv 640"
 ok "logrotate rotated audit.log by rename and made it again as onv:onv 0640"
 
-# The host timer refuses root; as onv, against a configuration that is not
-# there, it refuses and says so in the audit log (packaging/check.sh).
+# The host timer refuses root; as onv, without its credential and against a
+# configuration that is not there, it refuses and says so in the audit log
+# (packaging/check.sh). Its own binary since A3.
 rc=0
 setpriv --reuid onv --regid onv --init-groups \
-    env OMNUV_LEASE_TIMER_LOG=/var/log/onv/run-lease-expire.log \
-    /usr/bin/onv-provider run-lease-expire --config /nonexistent.yaml > /tmp/timer.out 2>&1 || rc=$?
+    env -u CREDENTIALS_DIRECTORY OMNUV_LEASE_TIMER_LOG=/var/log/onv/run-lease-expire.log \
+    /usr/bin/onv-lease-expire --config /nonexistent.yaml > /tmp/timer.out 2>&1 || rc=$?
 [ "$rc" -eq 1 ] || { cat /tmp/timer.out; fail "the host timer exited $rc, not 1"; }
 grep -q '"actor":"host-timer"' /var/log/onv/audit.log || fail "the agent wrote nothing to the new audit.log"
 grep -q '"actor":"host-timer"' /var/log/onv/audit.log.1 && fail "the agent wrote to the rotated file"
 ok "the packaged binary appends to the new audit.log, as onv"
 
-systemd-analyze verify /pkg/lib/systemd/system/onv-provider.service > /tmp/verify.out 2>&1 \
-    || { cat /tmp/verify.out; fail "systemd-analyze verify refused onv-provider.service"; }
-if grep -q 'onv-provider.service' /tmp/verify.out; then
-    cat /tmp/verify.out
-    fail "systemd-analyze verify has something to say about onv-provider.service"
-fi
-ok "systemd-analyze verify loads onv-provider.service with nothing to say"
+# Every service the package ships (A3 added two), each loaded by systemd
+# itself: a directive it does not know, or a value it refuses, is said here.
+for unit in onv-provider.service onv-lease-expire.service onv-opening.service; do
+    systemd-analyze verify "/pkg/lib/systemd/system/$unit" > /tmp/verify.out 2>&1 \
+        || { cat /tmp/verify.out; fail "systemd-analyze verify refused $unit"; }
+    if grep -q "$unit" /tmp/verify.out; then
+        cat /tmp/verify.out
+        fail "systemd-analyze verify has something to say about $unit"
+    fi
+    ok "systemd-analyze verify loads $unit with nothing to say"
+done
 # The package's postinst restarts journald only when the cap changed since
 # the restart that last succeeded. systemctl is a stub first on PATH that
 # records its arguments, and fails try-restart while /tmp/stub/fail exists;

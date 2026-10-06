@@ -15,6 +15,8 @@ pub struct Client {
     http: reqwest::Client,
     base: String,
     auth: omnuv_protocol::Redacted,
+    /// `<user>@<realm>!<name>`: not a secret, and what a refusal names.
+    token_id: String,
 }
 
 impl Client {
@@ -26,7 +28,13 @@ impl Client {
             http: onv_core_link::tls::client(tls)?,
             base: api_url.trim_end_matches('/').to_string(),
             auth: format!("PVEAPIToken={token_id}={token_secret}").into(),
+            token_id: token_id.to_string(),
         })
+    }
+
+    /// The token this client asks as, without its secret.
+    pub fn token_id(&self) -> &str {
+        &self.token_id
     }
 
     /// One request's `data`, or what Proxmox said, the token scrubbed.

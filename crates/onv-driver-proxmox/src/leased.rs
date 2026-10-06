@@ -164,6 +164,12 @@ pub struct Stops<'a> {
     pub stopped: Vec<String>,
     /// Guests carrying the claim that were left, and why: another stamp.
     pub refused: Vec<String>,
+    /// How many guests carried the claim tag and its whole stamp, stopped
+    /// by this call or already stopped. **Zero is not "nothing to do"**: a
+    /// token that cannot see a guest (the host timer's, outside
+    /// /pool/onv-buyers) lists the same as a guest that is gone, and the
+    /// caller decides which answer it can give (R1 rule 9).
+    pub claimed: usize,
     /// Told `vm <vmid> on <node>` just before its stop is sent, so a run
     /// that dies mid-stop has said what it was doing, and a machine already
     /// stopped says nothing at all.
@@ -192,6 +198,7 @@ pub async fn stop_leased<A: Api>(api: &A, id: &str, out: &mut Stops<'_>) -> anyh
             ));
             continue;
         }
+        out.claimed += 1;
         if live_status(api, &g.node, g.vmid).await? == "stopped" {
             continue;
         }
