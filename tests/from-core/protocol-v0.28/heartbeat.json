@@ -1,0 +1,20 @@
+{
+  "config_hash": "0123456789ab",
+  "settings_hash": "44bdab13b1d22884",
+  "components": [
+    {
+      "name": "onv-provider",
+      "version": "0.10.0-3-gabc1234",
+      "config_hash": "0123456789ab"
+    },
+    {
+      "name": "onv-opening",
+      "version": "0.10.0-3-gabc1234"
+    },
+    {
+      "name": "onv-lease-expire",
+      "version": "0.10.0-3-gabc1234"
+    }
+  ],
+  "workloadd_sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+}

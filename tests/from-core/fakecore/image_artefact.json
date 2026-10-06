@@ -1,0 +1,6 @@
+{
+  "id": "ubuntu-26.04",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "bytes": 2147483648,
+  "url": "https://api.test.omnuv.com/provider/v1/images/ubuntu-26.04/artefact"
+}

@@ -28,7 +28,7 @@ name = "onv-opening"
 path = "src/bin/onv-opening.rs"
 
 [dependencies]
-omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.28.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
@@ -86,6 +86,11 @@ members = [
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# **The released v0.27.0 contract, for the tests alone** (omnuv's modular
+# design, A7): a Core still on v0.27.0 reads what this agent sends with these
+# types, so `agent_goldens` holds every message to them. Already in the lock
+# for onv-workloadd, which stays on v0.27.0; nothing new is fetched.
+v027 = { package = "omnuv-protocol", git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
 # Fault injection over a simulated network: the tunnel under partitions and
 # silence, in simulated time (tunnel.rs, `mod partition`).
 turmoil = "0.7.2"

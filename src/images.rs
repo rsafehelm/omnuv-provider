@@ -91,7 +91,7 @@ pub async fn held(
         }
         let desc = cfg.get("description").and_then(serde_json::Value::as_str).unwrap_or_default();
         if let Some(sha256) = digest_in(desc) {
-            out.push(HeldImage { id: id.clone(), sha256 });
+            out.push(HeldImage { id: id.clone(), sha256, node: Some(node.to_string()) });
         }
     }
     out

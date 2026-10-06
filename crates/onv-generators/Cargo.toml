@@ -17,7 +17,7 @@ doctest = false
 # `url` is the crate behind `reqwest::Url`, which the join file's origin check
 # used before the move.
 [dependencies]
-omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.28.0" }
 anyhow = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

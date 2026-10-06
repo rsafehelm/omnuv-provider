@@ -438,6 +438,27 @@ pub(crate) fn said(gone: &Gone) -> String {
     }
 }
 
+/// **The same outcome, typed** (protocol v0.28.0, contract change 3): what
+/// [`said`]'s words carry, as `InstanceStatus::outcome` and `residue` (and a
+/// worker's). Sent beside the words, which a Core that predates the field
+/// still reads; a Core that reads both prefers this.
+///
+/// A residue is typed only when it passes the protocol's grammar
+/// (`StatusOutcome::residue_valid`): one that does not is no proof in words
+/// either (Core's parser refuses it), so it is sent as no conclusion rather
+/// than as a typed proof the words would not make.
+pub(crate) fn outcome(gone: &Gone) -> (Option<omnuv_protocol::StatusOutcome>, Vec<String>) {
+    use omnuv_protocol::StatusOutcome;
+    match gone {
+        Gone::Proven => (Some(StatusOutcome::Deleted), Vec::new()),
+        Gone::Residue(volids) if StatusOutcome::residue_valid(volids) => {
+            (Some(StatusOutcome::DeletedWithResidue), volids.clone())
+        }
+        Gone::Residue(_) => (None, Vec::new()),
+        Gone::NotYet(_) => (Some(StatusOutcome::NotProvenGone), Vec::new()),
+    }
+}
+
 /// **The agent's record of a machine it destroyed** (RC5, TD2; the model's
 /// G_agentTomb). Written before the destroy is asked for, so an agent stopped
 /// inside one still owes the proof; kept after the proof, so a machine this
@@ -1247,6 +1268,34 @@ mod tests {
         destroyed(mock)
     }
 
+    /// **The typed outcome is what the words say** (protocol v0.28.0,
+    /// contract change 3), by the protocol's own reading of the words, for
+    /// each outcome and both kinds of report; and a residue outside the
+    /// grammar, which the words cannot prove, is typed as no conclusion, not
+    /// as a proof. The words say `deleted; residue` there too, and Core's
+    /// parser refuses them, so the two still agree.
+    #[test]
+    fn the_typed_outcome_is_what_the_words_say() {
+        use omnuv_protocol::StatusOutcome;
+        let too_many: Vec<String> = (0..=StatusOutcome::RESIDUE_MAX).map(|n| format!("local-lvm:vm-1-disk-{n}")).collect();
+        for gone in [
+            Gone::Proven,
+            Gone::Residue(vec![CLOUDINIT.to_string(), DISK.to_string()]),
+            Gone::NotYet("the listing was incomplete".into()),
+            Gone::Residue(vec!["no colon here".to_string()]),
+            Gone::Residue(Vec::new()),
+            Gone::Residue(too_many),
+        ] {
+            let (o, r) = outcome(&gone);
+            let words = said(&gone);
+            assert_eq!(StatusOutcome::from_instance_words(&words), o.map(|o| (o, r.clone())), "machine: {words}");
+            assert_eq!(StatusOutcome::from_worker_words(&words), o.map(|o| (o, r.clone())), "worker: {words}");
+        }
+        assert_eq!(outcome(&Gone::Proven).0, Some(StatusOutcome::Deleted));
+        assert_eq!(outcome(&Gone::NotYet(String::new())).0, Some(StatusOutcome::NotProvenGone));
+        assert_eq!(outcome(&Gone::Residue(vec!["no colon here".into()])), (None, Vec::new()));
+    }
+
     /// **A delete is proven one listing later** (RC1, TD3). The pass that
     /// destroys says only that; the next pass's complete listing says
     /// `deleted`; every pass after says it again and destroys nothing. The
@@ -1289,6 +1338,10 @@ mod tests {
         let second = pass(&mock, &dir).await;
         assert_eq!(second, Gone::Residue(vec![CLOUDINIT.to_string(), DISK.to_string()]));
         assert_eq!(said(&second), format!("deleted; residue {CLOUDINIT} {DISK}"));
+        assert_eq!(
+            outcome(&second),
+            (Some(omnuv_protocol::StatusOutcome::DeletedWithResidue), vec![CLOUDINIT.to_string(), DISK.to_string()])
+        );
         assert!(
             mock.calls.lock().unwrap().iter().any(|c| c.method == "DELETE" && c.path.contains("/storage/local-lvm/content/")),
             "the left volumes were never asked to go"

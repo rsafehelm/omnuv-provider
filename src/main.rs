@@ -36,6 +36,7 @@ use onv_agent_lib::dur;
 use onv_agent_lib::timings;
 use onv_agent_lib::workload_config;
 mod scrub;
+mod settings;
 mod stream_devices;
 use onv_core_link::installwatch;
 mod opening;

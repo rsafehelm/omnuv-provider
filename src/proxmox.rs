@@ -261,6 +261,13 @@ pub struct Client {
     /// Which of `images` are Windows images (`config::ProxmoxRuntime::windows_images`):
     /// the shape the mirror imports each into, and the shape `held` holds it to.
     windows_images: std::collections::BTreeSet<String>,
+    /// **What family each catalogue image boots, as Core's catalogue says**
+    /// (`ImageArtefact::os_family`, protocol v0.28.0, contract change 7): the
+    /// last full catalogue's word for each id it gave one, which outranks
+    /// `windows_images` (`template_shape`). An id it says nothing of, from a
+    /// Core that predates the field or a family this build does not know,
+    /// falls back to that list.
+    catalogue_families: std::sync::Mutex<std::collections::BTreeMap<String, omnuv_protocol::OsFamily>>,
     /// `timings` in `agent.yaml`: the start gate, the clone budget's cap, and
     /// what workers are told. The defaults until `with_timings`, which are the
     /// values these were compiled in as.
@@ -484,6 +491,7 @@ impl Client {
             workload: crate::workload::Store::new(),
             images: Default::default(),
             windows_images: Default::default(),
+            catalogue_families: Default::default(),
             timings: Default::default(),
             refreshes: Default::default(),
             started_destroys: Default::default(),
@@ -523,9 +531,23 @@ impl Client {
         self
     }
 
-    /// The template shape an image is mirrored into and held to.
+    /// The catalogue as Core's last full view sent it: each id's family,
+    /// where it said one. Replaces what the previous catalogue said, so an id
+    /// it no longer gives a family falls back to `windows_images` again.
+    pub fn hear_catalogue(&self, catalogue: &[omnuv_protocol::ImageArtefact]) {
+        let families = catalogue.iter().filter_map(|a| Some((a.id.clone(), a.os_family?))).collect();
+        *crate::poison::lock(&self.catalogue_families, "catalogue families") = families;
+    }
+
+    /// The template shape an image is mirrored into and held to: the family
+    /// Core's catalogue says (v0.28.0), else this provider's own list.
     pub(crate) fn template_shape(&self, id: &str) -> crate::images::TemplateShape {
-        if self.windows_images.contains(id) {
+        let said = crate::poison::lock(&self.catalogue_families, "catalogue families").get(id).copied();
+        let windows = match said {
+            Some(family) => family == omnuv_protocol::OsFamily::Windows,
+            None => self.windows_images.contains(id),
+        };
+        if windows {
             crate::images::TemplateShape::Windows
         } else {
             crate::images::TemplateShape::Linux
@@ -1394,10 +1416,9 @@ impl Client {
         // mirrored them: a template destroyed since the last fetch must stop
         // being advertised, and only observation can notice that.
         //
-        // One node's worth. Every provider we run is single-node, and
-        // `HeldImage` carries no node of its own, so a genuine cluster needs
-        // the protocol to say *where* before this can honestly answer for more
-        // than the node the agent was pointed at.
+        // One node's worth, and each image says which node (`HeldImage::node`,
+        // protocol v0.28.0): a template is per node, so this answers for the
+        // node the agent was pointed at and claims nothing of the others.
         let held_images = match nodes.first() {
             Some(n) => {
                 let node = self.node.clone().unwrap_or_else(|| n.local_id.clone());

@@ -360,16 +360,25 @@ pub fn hex(bytes: &[u8]) -> String {
 /// publishes, not an instruction. An entry the provider does not offer is
 /// ignored, and one it offers at the right digest is left alone — re-importing
 /// bytes that are already here would cost an hour and change nothing.
+///
+/// **Held on `node`, the one being mirrored onto** (`HeldImage::node`,
+/// protocol v0.28.0): a template is per node, so an image held on another
+/// node is not held here. One that names no node is taken as this one's,
+/// which is what every holding read before the field meant.
 pub fn outstanding<'a>(
     catalogue: &'a [ImageArtefact],
     offered: &std::collections::BTreeMap<String, u32>,
     held: &[HeldImage],
+    node: &str,
 ) -> Vec<(&'a ImageArtefact, u32)> {
     catalogue
         .iter()
         .filter_map(|a| {
             let vmid = *offered.get(&a.id)?;
-            let current = held.iter().find(|h| h.id == a.id).map(|h| h.sha256.as_str());
+            let current = held
+                .iter()
+                .find(|h| h.id == a.id && h.node.as_deref().is_none_or(|n| n == node))
+                .map(|h| h.sha256.as_str());
             (current != Some(a.sha256.as_str())).then_some((a, vmid))
         })
         .collect()
@@ -439,6 +448,7 @@ mod tests {
             sha256: sha.into(),
             bytes: 1,
             url: "https://example.invalid/x".into(),
+            os_family: None,
         }
     }
 
@@ -474,7 +484,7 @@ mod tests {
     fn only_offered_images_are_fetched() {
         let cat = vec![artefact("ubuntu-26.04", A), artefact("ubuntu-26.04-gaming", B)];
         let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
-        let out = outstanding(&cat, &offered, &[]);
+        let out = outstanding(&cat, &offered, &[], "pve");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.id, "ubuntu-26.04");
         assert_eq!(out[0].1, 9000);
@@ -484,8 +494,8 @@ mod tests {
     fn an_image_already_held_at_that_digest_is_left_alone() {
         let cat = vec![artefact("ubuntu-26.04", A)];
         let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
-        let held = vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into() }];
-        assert!(outstanding(&cat, &offered, &held).is_empty());
+        let held = vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into(), node: None }];
+        assert!(outstanding(&cat, &offered, &held, "pve").is_empty());
     }
 
     #[test]
@@ -494,8 +504,21 @@ mod tests {
         // exactly the case the digest exists to detect.
         let cat = vec![artefact("ubuntu-26.04", B)];
         let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
-        let held = vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into() }];
-        assert_eq!(outstanding(&cat, &offered, &held).len(), 1);
+        let held = vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into(), node: None }];
+        assert_eq!(outstanding(&cat, &offered, &held, "pve").len(), 1);
+    }
+
+    /// **An image held on another node is not held on this one**
+    /// (`HeldImage::node`, protocol v0.28.0): the mirror fetches it for the
+    /// node it mirrors onto, and leaves alone one held here, said or unsaid.
+    #[test]
+    fn an_image_held_on_another_node_is_fetched_for_this_one() {
+        let cat = vec![artefact("ubuntu-26.04", A)];
+        let offered = std::collections::BTreeMap::from([("ubuntu-26.04".to_string(), 9000u32)]);
+        let on = |node: Option<&str>| vec![HeldImage { id: "ubuntu-26.04".into(), sha256: A.into(), node: node.map(str::to_string) }];
+        assert_eq!(outstanding(&cat, &offered, &on(Some("pve2")), "pve").len(), 1, "held on pve2 read as held on pve");
+        assert!(outstanding(&cat, &offered, &on(Some("pve")), "pve").is_empty(), "held here was fetched again");
+        assert!(outstanding(&cat, &offered, &on(None), "pve").is_empty(), "a holding that names no node was fetched again");
     }
 
     /// Half of our words is not our words: the description's opening without

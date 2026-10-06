@@ -14,17 +14,13 @@ use crate::windows::GuestKind;
 /// `enp6s19`, …) and it differs by image and by slot. Deriving the address from
 /// the machine's own id gives cloud-init something deterministic to match on,
 /// and keeps it stable across a rebuild.
+///
+/// **The protocol's derivation** since v0.28.0 (contract change 13): Core
+/// sends the same address as `NetworkAttachment::mac`, and the two were
+/// separate copies of this function until then. The copy this was is kept in
+/// the tests, which hold every MAC it derived to the protocol's.
 pub fn marketplace_mac(id: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in id.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    // 02: locally administered, unicast.
-    format!(
-        "02:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        (h >> 32) as u8, (h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, h as u8
-    )
+    omnuv_protocol::marketplace_mac(id)
 }
 
 /// The egress interface's MAC, derived the same way and from the same id.
@@ -36,16 +32,10 @@ pub fn marketplace_mac(id: &str) -> String {
 ///
 /// One more round over a fixed salt, so the two NICs of one machine can never
 /// collide — which they would if the same hash were reused for both.
+///
+/// The protocol's derivation too (v0.28.0).
 pub fn egress_mac(id: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in id.as_bytes().iter().chain(b"onv-egress") {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    format!(
-        "02:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        (h >> 32) as u8, (h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, h as u8
-    )
+    omnuv_protocol::egress_mac(id)
 }
 
 /// Shell that resolves the marketplace interface by MAC and exports `$DEV`.
@@ -791,3 +781,35 @@ pub fn private_network(net: &NetworkAttachment, vmid: u32) -> String {
 
 /// The prefix the segment range is carved from — see `names::SEGMENT_RANGE`.
 pub const SEGMENT_PREFIX: u8 = 16;
+
+#[cfg(test)]
+mod mac_tests {
+    /// The derivation this crate carried until protocol v0.28.0, kept only
+    /// to hold the protocol's to it: a MAC that moved would leave every
+    /// existing machine's first boot matching an interface it no longer has.
+    fn as_it_was(id: &str, salt: &[u8]) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in id.as_bytes().iter().chain(salt) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        format!(
+            "02:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            (h >> 32) as u8, (h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, h as u8
+        )
+    }
+
+    /// **Every MAC is the one the old copy derived**, both interfaces, over
+    /// ids of the shapes machines have (a uuid, a short test id, empty, and
+    /// one long enough to wrap the hash many times); and the two interfaces
+    /// of one machine still differ.
+    #[test]
+    fn the_protocols_macs_are_the_ones_this_crate_derived() {
+        let long = "x".repeat(300);
+        for id in ["c4d90fd2-be3d-4225-a4a6-265138a76e49", "m-a", "", long.as_str(), "0a0b0c0d-0000-4000-8000-ffffffffffff"] {
+            assert_eq!(super::marketplace_mac(id), as_it_was(id, b""), "the marketplace MAC of {id:?} moved");
+            assert_eq!(super::egress_mac(id), as_it_was(id, b"onv-egress"), "the egress MAC of {id:?} moved");
+            assert_ne!(super::marketplace_mac(id), super::egress_mac(id));
+        }
+    }
+}

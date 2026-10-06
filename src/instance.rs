@@ -548,6 +548,8 @@ impl Client {
                         }
                         _ => None,
                     },
+                    outcome: None,
+                    residue: Vec::new(),
                 });
             }
             .await;
@@ -577,6 +579,8 @@ impl Client {
                 message: Some("already removed".into()),
                 recipe_progress: None,
                 ready_to_start: None,
+                outcome: None,
+                residue: Vec::new(),
             });
         }
 
@@ -619,6 +623,10 @@ impl Client {
                 message: Some(LOST.into()),
                 recipe_progress: None,
                 ready_to_start: None,
+                // The words for a Core that predates the typed field; the
+                // type for one that reads it (v0.28.0, contract change 3).
+                outcome: Some(omnuv_protocol::StatusOutcome::Lost),
+                residue: Vec::new(),
             });
         }
 
@@ -997,6 +1005,8 @@ impl Client {
             // Just created: first boot has not started, let alone finished.
             recipe_progress: None,
             ready_to_start: None,
+            outcome: None,
+            residue: Vec::new(),
         })
     }
 
@@ -1057,6 +1067,8 @@ impl Client {
             message: Some(message),
             recipe_progress: None,
             ready_to_start: None,
+            outcome: None,
+            residue: Vec::new(),
         };
         if let Some(owed) = crate::pending::owed_for(&crate::pending::dir(snippet_dir), &spec.id) {
             eprintln!("instance {}: not cloned again; waiting on {}", spec.id, owed.waiting_on());
@@ -2515,6 +2527,13 @@ mod tests {
                 // 0260, `workers::LOST_WORDS`): their start is the grammar.
                 assert_eq!(status.message.as_deref(), Some(LOST));
                 assert!(LOST.starts_with("this machine is no longer on its provider"), "Core parses this start: {LOST}");
+                // And typed (protocol v0.28.0), as the words read.
+                assert_eq!(status.outcome, Some(omnuv_protocol::StatusOutcome::Lost), "{status:?}");
+                assert_eq!(
+                    omnuv_protocol::StatusOutcome::from_instance_words(LOST).map(|(o, _)| o),
+                    status.outcome,
+                    "the type and the words disagree"
+                );
             } else {
                 assert!(cloned, "a machine never built was not built");
             }
@@ -4307,12 +4326,19 @@ mod gpu_placement_is_one_shot {
     /// hardware. A test that asserts a copy of the logic asserts the copy.
     #[test]
     fn a_placement_that_cannot_succeed_is_not_retried() {
-        // The image refusal is still a phrase, and still the hazard.
-        let classify = |why: &str| !why.contains("is not offered by this provider");
-
-        assert!(!classify("image ubuntu-26.04-nvidia is not offered by this provider"));
-        assert!(classify("proxmox task failed: got no worker upid - start worker failed"));
-        assert!(classify("connection refused"));
+        // **The image refusal is a type too** since protocol v0.28.0, and its
+        // words are still the ones Core's fallback parser reads.
+        let no_image = anyhow::Error::new(super::ImageNotOffered { image: "ubuntu-26.04-nvidia".into() });
+        assert!(no_image.downcast_ref::<super::ImageNotOffered>().is_some());
+        assert_eq!(no_image.to_string(), "image ubuntu-26.04-nvidia is not offered by this provider");
+        assert_eq!(
+            omnuv_protocol::StatusOutcome::from_instance_words(&no_image.to_string()).map(|(o, _)| o),
+            Some(omnuv_protocol::StatusOutcome::ImageNotOffered),
+            "the words no longer read as the image refusal to a Core that predates the type"
+        );
+        for transient in ["proxmox task failed: got no worker upid - start worker failed", "connection refused"] {
+            assert!(anyhow::anyhow!(transient).downcast_ref::<super::ImageNotOffered>().is_none());
+        }
 
         // **And the capacity refusal is a type**, so no wording can break it.
         // Whatever the message says — and it has already changed once — the
@@ -4363,6 +4389,26 @@ impl std::fmt::Display for Unplaceable {
 }
 
 impl std::error::Error for Unplaceable {}
+
+/// **The image a spec names is not one this provider offers**: placed where
+/// it was wrong to place it, so not retryable here. Its words are the ones
+/// every agent has sent (`image <id> is not offered by this provider`, which
+/// a Core that predates the typed outcome parses); the type is what decides,
+/// here and on the wire as `StatusOutcome::ImageNotOffered` (protocol
+/// v0.28.0). It was matched by `contains` on its own words until then, the
+/// hazard `Unplaceable` names.
+#[derive(Debug)]
+pub struct ImageNotOffered {
+    pub image: String,
+}
+
+impl std::fmt::Display for ImageNotOffered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "image {}{}", self.image, omnuv_protocol::WORDS_IMAGE_NOT_OFFERED)
+    }
+}
+
+impl std::error::Error for ImageNotOffered {}
 
 impl crate::proxmox::Client {
     /// Can **this node** take this machine? Asked before anything is created.
