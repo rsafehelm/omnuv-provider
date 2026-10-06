@@ -53,6 +53,7 @@ USAGE:
     onv-provider check-config [--config /etc/onv/agent.yaml] [--secrets PATH]
     onv-provider print-config
     onv-provider discover --provider <id> [--config <path>]
+    onv-provider version
 
 CONFIGURATION:
     --secrets defaults to agent-secrets.yaml beside --config: this provider's
@@ -136,6 +137,14 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let command = std::env::args().nth(1).unwrap_or_default();
+
+    // What this agent tells Core it is (agent.rs, AGENT_VERSION): the crate
+    // version, never the package's, which is the content hash of its inputs
+    // (omnuv's modular design, A5). packaging/check.sh asks the packaged binary.
+    if command == "version" {
+        println!("{}", agent::AGENT_VERSION);
+        return Ok(());
+    }
 
     if command == "join" {
         let need = |name: &str| -> anyhow::Result<String> {

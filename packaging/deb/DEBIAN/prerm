@@ -16,6 +16,12 @@ case "$1" in
         systemctl stop onv-opening.path onv-opening.service || true
         systemctl disable onv-opening.path onv-opening.service >/dev/null 2>&1 || true
     fi
+    # **The record says what runs** (omnuv's modular design, A5): postinst
+    # restarts a unit only when its sum differs from the one recorded, and
+    # every unit above is now stopped. Kept, the record would make a later
+    # install of the same bytes start nothing, and leave the agent down and
+    # the opening's table gone (tests/packaging/restart_in_container.sh).
+    rm -f /var/lib/onv/units.sha256
     if command -v nft >/dev/null 2>&1; then
         nft delete table inet onv_opening 2>/dev/null || true
     fi

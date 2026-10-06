@@ -34,23 +34,19 @@ use crate::config::AgentConfig;
 use crate::driver::ComputeDriver;
 use crate::proxmox;
 
-/// What this agent tells Core it is.
+/// What this agent tells Core it is: the crate version, and nothing else.
 ///
-/// **The crate version plus the commit it was built from**, because the crate
-/// version alone does not move between iterations and two different binaries
-/// then call themselves the same thing. On 12 September that stopped a fix
-/// reaching either provider: the package carried the same `0.5.0` as the one
-/// already installed, apt saw nothing to do, and the play reported success
-/// while both hosts went on running the previous binary.
-///
-/// `OMNUV_BUILD` is set by `packaging/build-deb.sh` from `git describe`, so it
-/// carries the commit and a `-dirty` marker when the tree was not clean. An
-/// ordinary `cargo build` sets nothing and this reads as the bare crate
-/// version, which is the honest answer for a binary nobody packaged.
-const AGENT_VERSION: &str = match option_env!("OMNUV_BUILD") {
-    Some(b) => b,
-    None => env!("CARGO_PKG_VERSION"),
-};
+/// **Not the package version** (omnuv's modular design, A5). This was the
+/// package's `<crate>+g<commit>` until the package version became the content
+/// hash of everything the package is built from: compiled into the binary,
+/// that hash moved the agent's bytes whenever a unit file or another binary
+/// changed, and postinst, which restarts a unit only when its bytes move,
+/// then restarted the agent on every upgrade again. Which build is running
+/// is the binary's sha256, which postinst records
+/// (/var/lib/onv/units.sha256); the 12 September failure, a rebuilt package
+/// apt would not install, is answered by the package version, which moves
+/// with the inputs.
+pub(crate) const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Cloned rather than borrowed, and that is what lets the image mirror run off
 // the reconcile path: `reqwest::Client` is an Arc around one connection pool,

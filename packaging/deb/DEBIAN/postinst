@@ -7,6 +7,63 @@
 # join time, not the packager's at install time.
 set -e
 
+# **What each unit runs, and when its bytes last took effect** (omnuv's
+# modular design, A5). A unit's sum covers its binary, its unit files and
+# every drop-in or override systemd reads for them; /var/lib/onv/units.sha256
+# holds, per unit, the sum of the bytes its last successful restart started,
+# as `<unit> <sha256>` lines. A restart that fails records nothing, so the
+# next configure tries again; a unit with no line (a first install, or an
+# upgrade from a package before A5) counts as changed. prerm deletes the
+# record when a remove stops the units, so the record says what runs now.
+# tests/packaging/restart_test.sh holds it.
+UNITS_RECORD=/var/lib/onv/units.sha256
+
+unit_files() { # <unit>: the binary and unit files the unit's sum covers
+    case "$1" in
+        onv-provider.service) echo /usr/bin/onv-provider onv-provider.service ;;
+        onv-opening.service) echo /usr/bin/onv-opening onv-opening.service onv-opening.path ;;
+        onv-lease-expire.timer) echo /usr/bin/onv-lease-expire onv-lease-expire.service onv-lease-expire.timer ;;
+    esac
+}
+
+unit_sum() { # <unit>
+    for f in $(unit_files "$1"); do
+        case "$f" in
+            /*) if [ -f "$f" ]; then sha256sum "$f"; else echo "absent $f"; fi ;;
+            *)
+                for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+                    if [ -f "$d/$f" ]; then sha256sum "$d/$f"; fi
+                    for c in "$d/$f.d"/*.conf; do
+                        if [ -f "$c" ]; then sha256sum "$c"; fi
+                    done
+                done
+                ;;
+        esac
+    done | sha256sum | cut -d' ' -f1
+}
+
+unit_changed() { # <unit>: true when its sum is not the one recorded
+    [ "$(unit_sum "$1")" != "$(awk -v u="$1" '$1 == u { print $2 }' "$UNITS_RECORD" 2>/dev/null || true)" ]
+}
+
+unit_record() { # <unit>: record its sum now
+    sum="$(unit_sum "$1")"
+    { grep -v "^$1 " "$UNITS_RECORD" 2>/dev/null || true; echo "$1 $sum"; } > "$UNITS_RECORD.new"
+    mv "$UNITS_RECORD.new" "$UNITS_RECORD"
+}
+
+apply_unit() { # <unit> <verb> <target> [<verb> <target>]...: run each, record if all succeeded
+    unit="$1"; shift
+    while [ "$#" -ge 2 ]; do
+        if ! systemctl "$1" "$2"; then
+            echo "onv-provider: systemctl $1 $2 failed; $unit is tried again at the next configure" >&2
+            return 0
+        fi
+        shift 2
+    done
+    unit_record "$unit"
+}
+
 case "$1" in
   configure)
     if ! getent group onv >/dev/null; then
@@ -66,15 +123,29 @@ case "$1" in
         fi
     fi
 
-    # Enabled, but not started: there is nothing to start until `join` has
-    # written a configuration. The unit's ConditionPathExists keeps it from
-    # starting, and restart-looping, before that.
     if [ -d /run/systemd/system ]; then
+        # Before anything is enabled or restarted: dpkg has just replaced
+        # the unit files, and a restart must start what they now say.
         systemctl daemon-reload || true
+
+        # Enabled, but not started: there is nothing to start until `join`
+        # has written a configuration. The unit's ConditionPathExists keeps
+        # it from starting, and restart-looping, before that.
         systemctl enable onv-provider.service >/dev/null 2>&1 || true
-        if [ -f /etc/onv/agent.yaml ]; then
-            systemctl restart onv-provider.service || true
-        else
+        # **The agent restarts only when its bytes moved** (omnuv's
+        # modular design, A5): its binary, its unit or a drop-in it reads.
+        # Every upgrade restarted it, cutting every console and tunnelled
+        # stream, though most upgrades changed another unit or nothing it
+        # runs. Joined, a changed agent is restarted, which also starts one
+        # that was stopped; not joined, only a running one is.
+        if unit_changed onv-provider.service; then
+            if [ -f /etc/onv/agent.yaml ]; then
+                apply_unit onv-provider.service restart onv-provider.service
+            else
+                apply_unit onv-provider.service try-restart onv-provider.service
+            fi
+        fi
+        if [ ! -f /etc/onv/agent.yaml ]; then
             echo "onv-provider installed. Enrol this machine with:"
             echo
             echo "    sudo onv-provider join --core <https://your-core> --token <your enrolment token>"
@@ -85,8 +156,13 @@ case "$1" in
         # running. Enabled and started after the agent's restart above, so
         # its first run meets the agent this package installed, which holds
         # the lease lock, and never the one it replaced. Before `join` its
-        # service's ConditionPathExists skips each run.
+        # service's ConditionPathExists skips each run. Each run executes
+        # the binary afresh, so only the timer is re-armed, and only when
+        # the binary, the service or the timer moved.
         systemctl enable --now onv-lease-expire.timer >/dev/null 2>&1 || true
+        if unit_changed onv-lease-expire.timer; then
+            apply_unit onv-lease-expire.timer try-restart onv-lease-expire.timer
+        fi
         # Its one credential, its own Proxmox token (omnuv's modular design,
         # A3), is written by deploy-agent.yml or `join`, never by a package.
         # A joined host without it has a timer whose every run fails; said
@@ -96,13 +172,17 @@ case "$1" in
             echo "  deploy-agent.yml or onv-provider join writes the host timer's token there." >&2
         fi
         # **The provider opening's applier** (opening.rs): at boot, and again
-        # whenever the agent rewrites its ports. Started once now so the
-        # kernel holds what the configuration says from this install on:
-        # off, which is the default, removes the table. Before `join` its
-        # ConditionPathExists skips it.
+        # whenever the agent rewrites its ports. Run again here only when its
+        # binary, its service or its path unit moved, so the kernel holds
+        # what the new applier makes of the configuration: off, which is the
+        # default, removes the table. Before `join` its ConditionPathExists
+        # skips it. The path unit first, so no rewrite of the ports falls
+        # between the two.
         systemctl enable onv-opening.service >/dev/null 2>&1 || true
         systemctl enable --now onv-opening.path >/dev/null 2>&1 || true
-        systemctl start onv-opening.service >/dev/null 2>&1 || true
+        if unit_changed onv-opening.service; then
+            apply_unit onv-opening.service try-restart onv-opening.path restart onv-opening.service
+        fi
     fi
     ;;
 esac

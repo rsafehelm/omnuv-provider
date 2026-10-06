@@ -68,3 +68,18 @@ fn the_agent_names_where_the_two_commands_went() {
         assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("moved to {new}")), "{old}");
     }
 }
+
+/// **The agent says its crate version, and only that** (omnuv's modular
+/// design, A5): the package version is the content hash of the package's
+/// inputs, and compiled in it would move the agent's bytes, and so restart
+/// it, with every unit file or other binary that moved.
+#[test]
+fn onv_provider_reports_its_crate_version() {
+    let out = Command::new(env!("CARGO_BIN_EXE_onv-provider"))
+        .env_clear()
+        .arg("version")
+        .output()
+        .expect("onv-provider runs");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n", env!("CARGO_PKG_VERSION")));
+}
