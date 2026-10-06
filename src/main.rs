@@ -26,6 +26,7 @@ use onv_agent_lib::poison;
 mod session;
 use onv_core_link::restore;
 mod lease;
+mod heldview;
 mod hosttimer;
 use onv_core_link::report;
 mod teardown;
