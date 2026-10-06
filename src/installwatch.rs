@@ -26,6 +26,11 @@ use tokio::time::Instant;
 /// How soon to look again while an install runs: Core's own fastest poll.
 pub const EVERY: Duration = Duration::from_secs(10);
 
+/// How long a machine whose streaming devices were changed is followed
+/// closely for its converger to apply them (pairing by certificate): the
+/// converger's 30 s timer and Sunshine's restart, measured within a minute.
+pub const STREAM_MAX: Duration = Duration::from_secs(3 * 60);
+
 /// How long a machine with a recipe may say nothing before it stops being
 /// followed closely. Twice the recipe test's install ceiling, measured
 /// installs being two to four minutes.
@@ -41,12 +46,16 @@ pub struct Seen<'a> {
     pub recipe: bool,
     /// Its install's status, when the guest's file said one.
     pub progress: Option<&'a str>,
+    /// Installed, and what it admits differs from the devices Core sent it
+    /// (`stream_devices::pending`).
+    pub stream_pending: bool,
 }
 
 /// Which machines are installing, and since when each has said nothing.
 #[derive(Debug, Default)]
 pub struct InstallWatch {
     unread_since: HashMap<String, Instant>,
+    stream_since: HashMap<String, Instant>,
     installing: bool,
 }
 
@@ -54,8 +63,19 @@ impl InstallWatch {
     /// What a pass saw. Machines it did not see are forgotten.
     pub fn after_pass(&mut self, now: Instant, seen: &[Seen<'_>]) {
         let mut unread = HashMap::new();
+        let mut streams = HashMap::new();
         let mut installing = false;
         for s in seen {
+            // **A changed list, followed until the machine admits it**: the
+            // client waits on Play, and the poll is two minutes (run
+            // 12a8bf0e, 6 October 2026: reported 3.5 min after registration).
+            if s.stream_pending {
+                let since = self.stream_since.get(s.id).copied().unwrap_or(now);
+                if now.saturating_duration_since(since) <= STREAM_MAX {
+                    installing = true;
+                }
+                streams.insert(s.id.to_string(), since);
+            }
             match s.progress {
                 Some("running") => installing = true,
                 Some(_) => {}
@@ -70,6 +90,7 @@ impl InstallWatch {
             }
         }
         self.unread_since = unread;
+        self.stream_since = streams;
         self.installing = installing;
     }
 
@@ -84,7 +105,26 @@ mod tests {
     use super::*;
 
     fn seen<'a>(id: &'a str, running: bool, recipe: bool, progress: Option<&'a str>) -> Seen<'a> {
-        Seen { id, running, recipe, progress }
+        Seen { id, running, recipe, progress, stream_pending: false }
+    }
+
+    #[test]
+    fn a_changed_device_list_is_followed_until_admitted_or_for_a_while() {
+        let mut w = InstallWatch::default();
+        let start = Instant::now();
+        let pending = |p| Seen { stream_pending: p, ..seen("a", true, true, Some("done")) };
+        w.after_pass(start, &[pending(true)]);
+        assert_eq!(w.due(start), Some(start + EVERY), "a list the machine has not applied waited for the poll");
+        w.after_pass(start + STREAM_MAX, &[pending(true)]);
+        assert!(w.due(start + STREAM_MAX).is_some(), "stopped before its time");
+        let past = start + STREAM_MAX + Duration::from_secs(1);
+        w.after_pass(past, &[pending(true)]);
+        assert_eq!(w.due(past), None, "a machine that never applies its list is followed for ever");
+        // Applied: no longer followed, and a later change starts a new clock.
+        w.after_pass(past, &[pending(false)]);
+        assert_eq!(w.due(past), None);
+        w.after_pass(past, &[pending(true)]);
+        assert!(w.due(past).is_some(), "a new change kept the old clock");
     }
 
     #[test]

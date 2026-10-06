@@ -3221,6 +3221,11 @@ async fn reconcile_workers(
                 running: i.state == InstanceState::Running,
                 recipe: desired.instances.iter().any(|s| s.id == i.id && s.recipe.is_some()),
                 progress: i.recipe_progress.as_ref().map(|p| p.status.as_str()),
+                stream_pending: i.recipe_progress.as_ref().is_some_and(|p| p.status == "done")
+                    && crate::stream_devices::pending(
+                        desired.instances.iter().find(|s| s.id == i.id).and_then(|s| s.stream_devices.as_deref()),
+                        i.recipe_progress.as_ref().and_then(|p| p.stream_identity.as_ref()),
+                    ),
             })
             .collect();
         crate::poison::lock(&core.install_watch, "the install watch").after_pass(tokio::time::Instant::now(), &seen);

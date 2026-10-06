@@ -40,6 +40,18 @@ pub(crate) fn identity_from(raw: &str) -> Option<StreamIdentity> {
         .then_some(seen)
 }
 
+/// The machine does not yet admit exactly the devices Core sent it: the
+/// agent looks again soon (`installwatch::STREAM_MAX`). No list from Core is
+/// nothing to wait for; an identity not read yet is still waiting.
+pub(crate) fn pending(want: Option<&[StreamDevice]>, seen: Option<&StreamIdentity>) -> bool {
+    let Some(want) = want else { return false };
+    let mut want: Vec<&str> = want.iter().map(|d| d.id.as_str()).collect();
+    want.sort_unstable();
+    let mut got: Vec<&str> = seen.map(|s| s.devices.iter().map(String::as_str).collect()).unwrap_or_default();
+    got.sort_unstable();
+    seen.is_none() || want != got
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +185,23 @@ mod tests {
                 .count();
             assert_eq!(writes, 1);
         }
+    }
+
+    #[test]
+    fn pending_until_the_machine_admits_exactly_what_was_sent() {
+        let seen = |devices: &[&str]| StreamIdentity {
+            unique_id: "U".into(),
+            certificate: "C".into(),
+            devices: devices.iter().map(|d| d.to_string()).collect(),
+        };
+        let sent = [device("b"), device("a")];
+        assert!(!pending(None, Some(&seen(&["a"]))), "nothing sent is nothing to wait for");
+        assert!(pending(Some(&sent), None), "an identity not read yet is not applied");
+        assert!(pending(Some(&sent), Some(&seen(&["a"]))));
+        assert!(!pending(Some(&sent), Some(&seen(&["a", "b"]))));
+        assert!(!pending(Some(&sent), Some(&seen(&["b", "a"]))), "order is not a difference");
+        assert!(pending(Some(&[]), Some(&seen(&["a"]))), "a revoked device still admitted");
+        assert!(!pending(Some(&[]), Some(&seen(&[]))));
     }
 
     #[test]
