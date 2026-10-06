@@ -106,7 +106,8 @@ docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     tests/packaging/manifest_test.sh crates/onv-generators/guest/onv-certificate.sh \
     tests/opening/nft_test.sh tests/opening/in_container.sh \
     tests/logs/rotate_test.sh tests/logs/in_container.sh \
-    tests/packaging/restart_test.sh tests/packaging/restart_in_container.sh
+    tests/packaging/restart_test.sh tests/packaging/restart_in_container.sh \
+    tests/packaging/reproducible_test.sh
 
 # The script a web machine runs to fetch its project's certificate rides in
 # its first-boot data, so this package never installs it: it is run instead,

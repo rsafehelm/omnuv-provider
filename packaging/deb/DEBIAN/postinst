@@ -13,7 +13,8 @@ set -e
 # holds, per unit, the sum of the bytes its last successful restart started,
 # as `<unit> <sha256>` lines. A restart that fails records nothing, so the
 # next configure tries again; a unit with no line (a first install, or an
-# upgrade from a package before A5) counts as changed.
+# upgrade from a package before A5) counts as changed. prerm deletes the
+# record when a remove stops the units, so the record says what runs now.
 # tests/packaging/restart_test.sh holds it.
 UNITS_RECORD=/var/lib/onv/units.sha256
 
