@@ -44,8 +44,18 @@ hyper = { version = "1", default-features = false, features = ["client", "http1"
 # made as root (its own log) is one its unit, running as onv, cannot write.
 # The version tokio already pulls in; no new crate in the build.
 libc = "0.2"
+# A machine's first boot, rendered (the agent workspace, omnuv's modular
+# design A1). Moved out with no behaviour change; pinned by tests/linux and
+# tests/windows.
+onv-generators = { path = "crates/onv-generators" }
 
+# **The agent's workspace** (omnuv's modular design, A1). The root package is
+# the agent and stays the only default member, so `cargo build` and the
+# package build what they always did. Members are listed, never globbed:
+# packaging/workspace-members.txt records them and packaging/check.sh refuses
+# any other set.
 [workspace]
+members = ["crates/onv-generators"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

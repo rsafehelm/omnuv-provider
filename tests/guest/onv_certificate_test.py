@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The guest's certificate fetch (src/guest/onv-certificate.sh), run for real
+"""The guest's certificate fetch (crates/onv-generators/guest/onv-certificate.sh), run for real
 against a fake Core over TLS.
 
     python3 tests/guest/onv_certificate_test.py
@@ -30,7 +30,7 @@ import unittest
 import urllib.parse
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[2] / "src" / "guest" / "onv-certificate.sh"
+SCRIPT = Path(__file__).resolve().parents[2] / "crates" / "onv-generators" / "guest" / "onv-certificate.sh"
 BOOTSTRAP = "cbt_" + "ab" * 32
 
 

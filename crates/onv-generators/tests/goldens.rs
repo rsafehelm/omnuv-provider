@@ -1,6 +1,8 @@
-//! **A Linux machine's first boot, pinned byte for byte.** The user-data and
-//! network config every case below renders are compared with the files in
-//! `tests/linux/`; `ONV_GOLDEN=write` rewrites them. A machine's drive is a
+//! **A machine's first boot, pinned byte for byte.** The user-data and
+//! network config every Linux case below renders are compared with the files
+//! in `tests/linux/` at the workspace root, and a Windows machine's user-data
+//! and meta-data with `tests/windows/`; `ONV_GOLDEN=write` rewrites the Linux
+//! ones (the agent's own Windows test rewrites its own, with its drive). A machine's drive is a
 //! contract with every machine already built from it: a byte that moves is a
 //! drive refreshed, so a change here is a diff a person reads, never a
 //! side effect of moving code.
@@ -9,14 +11,16 @@
 //! certificate bootstrap are the shapes the agent writes, and neither was ever
 //! issued by anything.
 
-use super::*;
+use omnuv_protocol::{FirstBoot, ImageSpec, InstanceSpec, NetworkAttachment, OsFamily, OverlayEnrolment};
+use onv_generators::linux::{first_boot_user_data, network_config};
+use onv_generators::windows::{meta_data, user_data};
 
 const KEY: &str = "0E38B183-B8B6-45CE-B93B-2EF63F3D14E4";
 
 /// Core's own fixture (`tests/from-core`): a machine with nothing but its size.
 fn bare() -> InstanceSpec {
     let desired: serde_json::Value =
-        serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        serde_json::from_str(include_str!("../../../tests/from-core/desired-state.json")).unwrap();
     serde_json::from_value(desired["instances"][0].clone()).unwrap()
 }
 
@@ -74,7 +78,7 @@ fn gaming() -> InstanceSpec {
 
 /// Every case: its file name and the bytes the agent writes.
 fn cases() -> Vec<(String, String)> {
-    let opened = crate::opening::Opened { port: 31845, public: std::net::Ipv4Addr::new(203, 0, 113, 7) };
+    let opened = onv_generators::opening::Opened { port: 31845, public: std::net::Ipv4Addr::new(203, 0, 113, 7) };
     let mirror = Some(" http://mirror.example/ubuntu ");
     let mut out = Vec::new();
     for (name, spec, apt, open) in [
@@ -93,7 +97,7 @@ fn cases() -> Vec<(String, String)> {
 }
 
 fn dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/linux")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/linux")
 }
 
 #[test]
@@ -117,4 +121,44 @@ fn a_linux_machine_s_first_boot_is_its_golden_file() {
     on_disk.sort();
     rendered.sort();
     assert_eq!(on_disk, rendered, "tests/linux holds exactly the rendered cases");
+}
+
+/// The Windows machine of the agent's own golden test (`src/guest_windows.rs`),
+/// built the same way, against the same files.
+fn windows() -> InstanceSpec {
+    let mut spec = bare();
+    spec.id = "3f2a9c1b-04de-4a6f-9b1e-7c5d2e8f9a10".into();
+    spec.name = "rig".into();
+    spec.image = ImageSpec {
+        id: "windows-11-gaming".into(),
+        os_family: OsFamily::Windows,
+        first_boot: FirstBoot::CloudbaseInit,
+        default_user: "omnuv".into(),
+        auth_mode: omnuv_protocol::AuthMode::SshKey,
+    };
+    spec.ssh_keys = vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKeyOnlyForTheGoldenFile buyer@example".into()];
+    spec.gpu_local_ids = vec!["0000:01:00.0".into()];
+    spec.overlay = Some(OverlayEnrolment {
+        setup_key: KEY.into(),
+        management_url: "https://api.omnuv.com:8443".into(),
+        hostname: None,
+    });
+    spec.recipe = Some(omnuv_protocol::RecipeSpec {
+        id: "steam-gaming-windows".into(),
+        compose: "services: {}\n".into(),
+        gpu: true,
+        post_up: vec!["Write-Output 'a recipe step'".into()],
+    });
+    spec
+}
+
+#[test]
+fn a_windows_machine_s_first_boot_is_its_golden_file() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/windows");
+    let spec = windows();
+    for (name, actual) in [("user-data.yaml", user_data(&spec).unwrap()), ("meta-data.yaml", meta_data(&spec))] {
+        let path = dir.join(name);
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(actual, expected, "{name} differs from its golden file");
+    }
 }
