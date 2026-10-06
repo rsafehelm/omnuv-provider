@@ -61,6 +61,12 @@ pub mod defaults {
     /// and looks at the scrubs it runs. A held card idles at most this long
     /// after its program's verdict before it is reported.
     pub const SCRUB_EVERY: Dur = Dur::secs(30);
+    /// omnuv's modular design, A6: how old a persisted held view may be and
+    /// still be maintained from at boot, before Core has answered. The run
+    /// lease's T, Core's default (15 min), so a view is never trusted for
+    /// longer than Core waits on a silent lease. Unmeasured; it is a bound,
+    /// not a reading.
+    pub const HELD_VIEW_MAX_AGE: Dur = Dur::mins(15);
 }
 
 /// The poll this agent keeps while Core says none: a Core that predates
@@ -144,6 +150,11 @@ pub struct Timings {
     /// How often this agent asks Core which of its cards to scrub, and looks
     /// at the scrubs it runs (lifecycle phase 9).
     pub scrub_every: Dur,
+    /// How old the persisted held view (`/var/lib/onv/held-view.json`) may
+    /// be when an agent that cannot reach Core at start maintains from it
+    /// (omnuv's modular design, A6). Older, it starts nothing. 0s: the
+    /// boot-time maintain path is off.
+    pub held_view_max_age: Dur,
 }
 
 impl Default for Timings {
@@ -164,6 +175,7 @@ impl Default for Timings {
             started_destroys_per_hour: 0,
             scrub_guest_deadline: SCRUB_GUEST_DEADLINE,
             scrub_every: SCRUB_EVERY,
+            held_view_max_age: HELD_VIEW_MAX_AGE,
         }
     }
 }
@@ -225,6 +237,11 @@ impl Timings {
              reports holds its card out of sale for as long as this");
         within(&mut bad, "scrubEvery", self.scrub_every, Dur::secs(5), Dur::mins(10),
             "each look asks Core and the hypervisor, and a scrubbed card waits this long to be reported");
+        if self.held_view_max_age != Dur::secs(0) {
+            within(&mut bad, "heldViewMaxAge", self.held_view_max_age, Dur::mins(1), defaults::HELD_VIEW_MAX_AGE,
+                "longer than the run lease's T (15m) starts a machine from a view Core may have overruled for \
+                 longer than it waits on a silent lease; 0s turns the boot-time maintain path off");
+        }
         if self.started_destroys_per_hour > 10_000 {
             bad.push(format!(
                 "timings.startedDestroysPerHour ({}) is past 10000: a cap nothing can reach caps nothing; \
@@ -288,10 +305,12 @@ mod tests {
         // Lifecycle phase 7 added `tombstoneKeep`: a57be9feb152 became
         // 3cf6624da40e; phase 8 added `startedDestroysPerHour` (0, no cap):
         // bac073f3123c; phase 9 added `scrubGuestDeadline` and `scrubEvery`:
-        // c2961f8ee260.
+        // c2961f8ee260; the modular design's A6 added `heldViewMaxAge`:
+        // a21e21d51d90.
         assert_eq!(t.started_destroys_per_hour, 0, "lifecycle phase 8: a new key, shipped off");
         assert_eq!((secs(t.scrub_guest_deadline), secs(t.scrub_every)), (1200.0, 30.0), "lifecycle phase 9: two new keys");
-        assert_eq!(t.hash(), "c2961f8ee260");
+        assert_eq!(secs(t.held_view_max_age), 900.0, "A6: a new key, the run lease's T");
+        assert_eq!(t.hash(), "a21e21d51d90");
     }
 
     /// Core's poll is obeyed inside Core's own range, and zero or absent is
@@ -330,6 +349,8 @@ mod tests {
             ("workloadStuckAfterReads: 1", "timings.workload.reportEvery (15s) must be at most"),
             ("scrubGuestDeadline: 4m", "timings.scrubGuestDeadline"),
             ("scrubEvery: 11m", "timings.scrubEvery"),
+            ("heldViewMaxAge: 59s", "timings.heldViewMaxAge"),
+            ("heldViewMaxAge: 16m", "timings.heldViewMaxAge"),
         ] {
             let e = refused(yaml);
             assert!(e.iter().any(|m| m.starts_with(key)), "{yaml:?} was not refused as {key}: {e:?}");
@@ -346,6 +367,10 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(t.check(), Ok(()));
+        for edge in ["heldViewMaxAge: 0s", "heldViewMaxAge: 1m", "heldViewMaxAge: 15m"] {
+            let t: Timings = serde_yaml_ng::from_str(edge).expect("parses");
+            assert_eq!(t.check(), Ok(()), "{edge}");
+        }
     }
 
     /// An unknown key is refused, not defaulted: a misspelling is a value

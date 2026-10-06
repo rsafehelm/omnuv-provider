@@ -528,8 +528,14 @@ async fn startup_checks(
 /// start on Pluto and Titan printed "SELFCHECK FAILED ... answered 426 Upgrade
 /// Required to an authenticated heartbeat" while the agent ran fine (found
 /// 5 October 2026). After the handshake the heartbeat is the agent's own.
-async fn handshake_then_core_check(core: &Core, driver: &impl ComputeDriver, url: &str, config_hash: &str) -> anyhow::Result<(u64, String)> {
-    let heartbeat_secs = handshake(core, driver).await?;
+async fn handshake_then_core_check(
+    core: &Core,
+    driver: &impl ComputeDriver,
+    url: &str,
+    config_hash: &str,
+    unreachable: &(dyn Fn() + Sync),
+) -> anyhow::Result<(u64, String)> {
+    let heartbeat_secs = handshake_telling(core, driver, unreachable).await?;
     Ok((heartbeat_secs, core_check(core, url, config_hash).await))
 }
 
@@ -669,7 +675,13 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     // partition held its machines' leases in nobody's hands. It resumes the
     // leases its predecessor wrote, and takes the lock the host timer
     // defers to.
-    crate::lease::spawn(core.lease.clone(), driver.clone(), crate::lease::file(&cfg.proxmox.snippet_dir));
+    //
+    // A lease file not resumed retires the held view before the task writes
+    // the file again (A6): the write keeps only what was resumed, so the next
+    // start would read an empty book as a whole one and start from the view.
+    let held_view = crate::heldview::file(&cfg.proxmox.snippet_dir);
+    let leases =
+        crate::heldview::spawn_leases(core.lease.clone(), driver.clone(), crate::lease::file(&cfg.proxmox.snippet_dir), &held_view);
 
     // Worker id -> local endpoint, so a tunnelled request can be resolved
     // without Core ever learning this provider's addressing.
@@ -691,7 +703,27 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         println!("{line}");
     }
 
-    let (heartbeat_secs, accepted) = handshake_then_core_check(&core, &driver, &cfg.core.url, &cfg.timings.hash()).await?;
+    // **The held view, maintained from while the handshake finds Core
+    // unreachable** (omnuv's modular design, A6): starts only, gated by the
+    // lease file, the kept restore bit and the view's age (`heldview`). It
+    // ends before anything below decides, a pass in flight finished first.
+    let (unreachable_tx, unreachable_rx) = tokio::sync::watch::channel(0u64);
+    let boot = crate::heldview::spawn(
+        crate::heldview::Gates {
+            file: held_view,
+            core_url: cfg.core.url.clone(),
+            max_age: cfg.timings.held_view_max_age.std(),
+            leases,
+            lease: core.lease.clone(),
+            restore: core.restore.clone(),
+        },
+        driver.clone(),
+        unreachable_rx,
+    );
+    let tell = move || unreachable_tx.send_modify(|n| *n += 1);
+    let shook = handshake_then_core_check(&core, &driver, &cfg.core.url, &cfg.timings.hash(), &tell).await;
+    boot.finish().await;
+    let (heartbeat_secs, accepted) = shook?;
     println!("{accepted}");
 
     // Woken by Core over the tunnel; the poll below is the safety net for when
@@ -1304,6 +1336,122 @@ mod handshake_tests {
         assert_eq!(leases, [crate::lease::Written { id: "m1".into(), until_unix: until }], "the lease was not resumed");
     }
 
+    /// **A restarted agent that cannot reach Core maintains from the held
+    /// view it kept** (omnuv's modular design, A6). Core is a port nothing
+    /// listens on, so the handshake never succeeds. The host holds a
+    /// run-lease file and a held view a minute old naming five stopped
+    /// machines: Running under a lease, Running with its lease run out,
+    /// Running with none, Stopped, Absent. The two Running within their lease
+    /// are started; nothing else on the hypervisor is touched: no stop, no
+    /// delete, no create. Before A6 the view was in memory only, and this
+    /// agent started nothing until Core answered.
+    #[tokio::test]
+    async fn a_restart_that_cannot_reach_core_starts_its_held_machines_and_nothing_else() {
+        use crate::names::{TAG_INSTANCE as TAG, description, short_tag};
+        use std::time::Duration;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ids = [
+            ("aaaaaaaa-1111-4111-8111-111111111111", Lifecycle::Running), // under a lease
+            ("aaaaaaaa-2222-4222-8222-222222222222", Lifecycle::Running), // its lease run out
+            ("aaaaaaaa-3333-4333-8333-333333333333", Lifecycle::Running), // no lease
+            ("aaaaaaaa-4444-4444-8444-444444444444", Lifecycle::Stopped),
+            ("aaaaaaaa-5555-4555-8555-555555555555", Lifecycle::Absent),
+        ];
+        let guests: Vec<(u32, String, String)> =
+            ids.iter().enumerate().map(|(n, (id, _))| (800 + n as u32, short_tag(id), description(TAG, id))).collect();
+        let pve = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(r) = crate::pvemock::task_ok(path) {
+                return r;
+            }
+            if (method, path) == ("GET", "/version") {
+                return (200, serde_json::json!({"version": "9.2.20"}));
+            }
+            if (method, path) == ("GET", "/cluster/resources?type=vm") {
+                let list: Vec<_> = guests
+                    .iter()
+                    .map(|(vmid, tag, _)| serde_json::json!({"node": "n1", "vmid": vmid, "status": "stopped", "tags": format!("{TAG};{tag}")}))
+                    .collect();
+                return (200, serde_json::Value::Array(list));
+            }
+            for (vmid, _, stamp) in &guests {
+                if path == format!("/nodes/n1/qemu/{vmid}/status/current") {
+                    return (200, serde_json::json!({"status": "stopped"}));
+                }
+                if method == "GET" && path == format!("/nodes/n1/qemu/{vmid}/config") {
+                    return (200, serde_json::json!({"description": stamp}));
+                }
+                if method == "POST" && path == format!("/nodes/n1/qemu/{vmid}/status/start") {
+                    return (200, serde_json::json!(format!("UPID:n1:start:{vmid}")));
+                }
+            }
+            crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null))
+        })
+        .await;
+        // A port nothing listens on: every call to Core is refused.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let core_url = format!("https://127.0.0.1:{port}");
+        let dir = tempfile::tempdir().expect("a directory");
+        let now = std::time::SystemTime::now();
+        let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(
+            dir.path().join("run-lease.json"),
+            serde_json::json!({"leases": [{"id": ids[0].0, "until_unix": unix + 600}, {"id": ids[1].0, "until_unix": unix - 10}]})
+                .to_string(),
+        )
+        .unwrap();
+        let view = DesiredState {
+            protocol_version: omnuv_protocol::PROTOCOL_VERSION,
+            version: 7,
+            unchanged: false,
+            inference_workers: vec![],
+            instances: ids
+                .iter()
+                .map(|(id, intent)| omnuv_protocol::InstanceSpec { id: id.to_string(), intent: *intent, ..Default::default() })
+                .collect(),
+            images: vec![],
+            poll_interval_secs: None,
+        };
+        crate::heldview::write(&dir.path().join("held-view.json"), &crate::heldview::of(&core_url, &view, now - Duration::from_secs(60)));
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {core_url}\n  token: t\nproxmox:\n  apiUrl: {}\n  tokenId: onv@pve!agent\n  \
+             tokenSecret: s\n  tlsFingerprintSha256: \"{}\"\n  snippetDir: {}\n",
+            pve.base,
+            "AB".repeat(32),
+            dir.path().join("snippets").display()
+        ))
+        .expect("config");
+        let agent = tokio::spawn(run(cfg));
+
+        let start = |n: u32| format!("POST /nodes/n1/qemu/{}/status/start", 800 + n);
+        let acts = || -> Vec<String> {
+            let calls = pve.calls.lock().unwrap();
+            let mut a: Vec<String> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
+            a.sort();
+            a
+        };
+        // Bounded: the first handshake fails at once, and the pass is a few
+        // loopback reads. Ten seconds is padding over that, never a wait.
+        let mut started = false;
+        for _ in 0..500 {
+            let a = acts();
+            if a.contains(&start(0)) && a.contains(&start(2)) {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!agent.is_finished(), "the agent ended instead of waiting for Core");
+        agent.abort();
+        assert!(started, "the held machines were not started while Core was unreachable: {:?}", acts());
+        // The pass looks at its machines in the view's order and the last one
+        // started is the last Running one, so nothing is still to come; and
+        // every later pass meets the same machines, which a start does not
+        // move in this mock, so a second start of them is allowed and nothing
+        // else is.
+        let others: Vec<String> = acts().into_iter().filter(|a| *a != start(0) && *a != start(2)).collect();
+        assert_eq!(others, Vec::<String>::new(), "the boot path did more than start the held machines");
+    }
+
     /// **PROVIDER-12: the self-check is Core accepting this token.** A 204
     /// passes; a 401 says the token was refused; a 404 — a server that does
     /// not know the route, which is what every answer to the old ping was —
@@ -1491,7 +1639,7 @@ mod handshake_tests {
         let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
         // Before the handshake, the check is refused, as every start was.
         assert!(core_check(&core, &base, "0123456789ab").await.contains("426"));
-        let (_, said) = handshake_then_core_check(&core, &HeartbeatDriver, &base, "0123456789ab").await.expect("the handshake");
+        let (_, said) = handshake_then_core_check(&core, &HeartbeatDriver, &base, "0123456789ab", &|| {}).await.expect("the handshake");
         assert!(said.contains("accepts this agent"), "{said}");
     }
 
@@ -1986,6 +2134,153 @@ mod handshake_tests {
         (sent, calls)
     }
 
+    /// **The running agent writes the held view itself** (A6): every other
+    /// held-view test plants the file, so this is what proves the file a
+    /// restart reads is the one a pass leaves. A full view is written with
+    /// its version, its machines' ids and intents and when it was asked for;
+    /// an `unchanged` answer writes the copy in hand again, freshly dated; an
+    /// unreachable Core writes nothing, so the view keeps its true age.
+    #[tokio::test]
+    async fn a_pass_writes_the_held_view_and_an_outage_leaves_it() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let unix = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let (on, off) = ("66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777");
+        let mut view: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+        view["version"] = serde_json::json!(7);
+        view["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+        let mut second = view["instances"][0].clone();
+        view["instances"][0]["id"] = on.into();
+        second["id"] = off.into();
+        second["lifecycle"] = "absent".into();
+        view["instances"].as_array_mut().unwrap().push(second);
+        let unchanged = serde_json::json!({
+            "protocol_version": omnuv_protocol::PROTOCOL_VERSION, "version": 7, "unchanged": true,
+            "instances": [], "inference_workers": [], "images": [],
+        });
+        // Core in the phase the test sets: a full view; `unchanged` to an ask
+        // naming version 7 (a full view to any other, as Core answers); down.
+        // A pass asks for the view more than once, so phases, not a count.
+        let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let at = phase.clone();
+        let unchanged_said = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let said_unchanged = unchanged_said.clone();
+        let (base, _rx) = session_stub(move |line, _| {
+            if !line.starts_with("GET /provider/v1/desired-state") {
+                return ("204 No Content", String::new());
+            }
+            match at.load(std::sync::atomic::Ordering::SeqCst) {
+                1 if line.contains("known=7") => {
+                    said_unchanged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ("200 OK", unchanged.to_string())
+                }
+                0 | 1 => ("200 OK", view.to_string()),
+                _ => ("503 Service Unavailable", String::new()),
+            }
+        })
+        .await;
+        let pve = crate::pvemock::Mock::start(an_empty_node).await;
+        let snippets = tempfile::tempdir().unwrap();
+        let snippet_dir = snippets.path().join("snippets");
+        std::fs::create_dir_all(&snippet_dir).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippet_dir.display()
+        ))
+        .expect("config");
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        let file = crate::heldview::file(&cfg.proxmox.snippet_dir);
+        let read = || crate::heldview::read(&file, &base, Duration::from_secs(900), SystemTime::now()).expect("the held view");
+        let want = vec![
+            crate::heldview::Held { id: on.into(), intent: omnuv_protocol::Lifecycle::Running },
+            crate::heldview::Held { id: off.into(), intent: omnuv_protocol::Lifecycle::Absent },
+        ];
+
+        // Pass 1: a full view.
+        let before = unix(SystemTime::now());
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        let one = read();
+        assert_eq!((one.version, &one.instances), (7, &want), "the full view was not kept as it came");
+        assert!(one.asked_unix >= before, "asked {} before the pass began ({before})", one.asked_unix);
+
+        // Pass 2: `unchanged`. The file is dated back first, so a rewrite shows.
+        crate::heldview::write(&file, &crate::heldview::Persisted { asked_unix: before - 600, instances: vec![], ..one });
+        let before = unix(SystemTime::now());
+        phase.store(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        let two = read();
+        assert!(unchanged_said.load(std::sync::atomic::Ordering::SeqCst) > 0, "the premise: Core never answered `unchanged`");
+        assert!(two.asked_unix >= before, "an unchanged answer did not refresh when the view was asked for: {}", two.asked_unix);
+        assert_eq!((two.version, &two.instances), (7, &want), "an unchanged answer did not keep the copy in hand");
+
+        // Pass 3: Core answers 503. Nothing is written.
+        let planted = crate::heldview::Persisted { asked_unix: before - 60, version: 99, ..two };
+        crate::heldview::write(&file, &planted);
+        let bytes = std::fs::read(&file).unwrap();
+        phase.store(2, std::sync::atomic::Ordering::SeqCst);
+        let _ = reconcile_workers(&core, &pve.client(), &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+        assert_eq!(std::fs::read(&file).unwrap(), bytes, "a pass that could not reach Core rewrote the held view");
+    }
+
+    /// **Which handshake answers count as Core unreachable** (A6), each a
+    /// real exchange: one answer of the status, then a 200. A transport
+    /// failure is covered by the acceptance test; 5xx and 429 are the front
+    /// door up and Core behind it down, and tell once; a 4xx is Core up and
+    /// answering, and a 409 is another agent holding the provider: neither
+    /// tells. Cases run side by side, so the backoff is paid once.
+    #[tokio::test]
+    async fn only_5xx_and_429_at_the_handshake_count_as_unreachable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // SAFETY: as above.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = omnuv_protocol::Redacted::from("t".to_string());
+        let cases = [(500u16, 1usize), (502, 1), (503, 1), (429, 1), (400, 0), (403, 0), (404, 0), (409, 0)];
+        let mut runs = Vec::new();
+        for (status, want) in cases {
+            let token = token.clone();
+            runs.push(tokio::spawn(async move {
+                let answered = Arc::new(AtomicUsize::new(0));
+                let n = answered.clone();
+                let mock = crate::pvemock::Mock::start(move |_, _, _| {
+                    if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (status, serde_json::Value::Null)
+                    } else {
+                        (200, serde_json::json!({"provider_id": "p", "protocol_version": omnuv_protocol::PROTOCOL_VERSION}))
+                    }
+                })
+                .await;
+                let core = Core::new(&format!("{}/api2/json", mock.base), &token).expect("a client");
+                let told = Arc::new(AtomicUsize::new(0));
+                let t = told.clone();
+                let tell = move || {
+                    t.fetch_add(1, Ordering::SeqCst);
+                };
+                let shook = handshake_telling(&core, &HeartbeatDriver, &tell).await;
+                assert!(shook.is_ok(), "{status}: the handshake after it did not succeed: {shook:?}");
+                assert_eq!(answered.load(Ordering::SeqCst), 2, "{status}: not one answer then a 200");
+                (status, told.load(Ordering::SeqCst), want)
+            }));
+        }
+        let mut wrong = Vec::new();
+        for run in runs {
+            let (status, told, want) = run.await.expect("a case");
+            if told != want {
+                wrong.push(format!("{status}: told {told}, want {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "unreachable was told wrongly: {wrong:?}");
+    }
+
     /// A Proxmox with one empty node, on which a clone can be asked for (the
     /// clone itself is refused: what is asserted is whether it was asked).
     pub(super) fn an_empty_node(method: &str, path: &str, _: &str) -> (u16, serde_json::Value) {
@@ -2371,7 +2666,7 @@ mod handshake_tests {
         let file = crate::lease::file(&cfg.proxmox.snippet_dir);
         let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 60;
         std::fs::write(&file, serde_json::json!({"leases": [{"id": M, "until_unix": until}]}).to_string()).unwrap();
-        assert_eq!(crate::lease::resume(&core.lease, &file), 1);
+        assert_eq!(crate::lease::resumed(&core.lease, &file), Ok(1));
         crate::lease::check(&core.lease, &driver, &file).await;
 
         let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
@@ -2471,6 +2766,13 @@ mod handshake_tests {
 }
 
 async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u64> {
+    handshake_telling(core, driver, &|| {}).await
+}
+
+/// [`handshake`], telling `unreachable` each time an attempt finds Core
+/// unreachable: no answer, 5xx or 429 (`Refusal::Unreachable`). Not a 409:
+/// Core is up and another agent holds this provider.
+async fn handshake_telling(core: &Core, driver: &impl ComputeDriver, unreachable: &(dyn Fn() + Sync)) -> anyhow::Result<u64> {
     let body = serde_json::json!({
         "agent_version": AGENT_VERSION,
         // **A range, not a point**, and the same defect Core had from the other
@@ -2532,8 +2834,14 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
                     tokio::time::sleep(HELD_RETRY).await;
                     continue;
                 }
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    unreachable();
+                }
             }
-            Err(e) => eprintln!("handshake failed: {e:#}"),
+            Err(e) => {
+                eprintln!("handshake failed: {e:#}");
+                unreachable();
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         delay = (delay * 2).min(60);
@@ -2740,6 +3048,8 @@ async fn reconcile_workers(
 
     let known = crate::poison::lock(held, "held desired state").as_ref().map(|d| d.version).unwrap_or(0);
 
+    // When the view was asked for, which is how old the persisted copy is (A6).
+    let asked = std::time::SystemTime::now();
     let (fetched, restore_named): (DesiredState, Option<String>) =
         match core.get_view(known).await {
             Ok(d) => d,
@@ -2841,6 +3151,13 @@ async fn reconcile_workers(
     if crate::restore::observe(&core.restore, &desired, restore_named.as_deref(), torn) {
         return report_restoring(core, driver, cfg, &desired).await;
     }
+    // **The view this agent may act on, kept for a restart that cannot reach
+    // Core** (omnuv's modular design, A6). After the restore check, so a view
+    // this agent may not act on is never the one kept.
+    crate::heldview::write(
+        &crate::heldview::file(&cfg.proxmox.snippet_dir),
+        &crate::heldview::of(&cfg.core.url, &desired, asked),
+    );
 
     // **The journal, settled on every pass** (26 September 2026). This ran at
     // the start of every create, and that one fact is the cause of four

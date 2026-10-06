@@ -52,6 +52,13 @@ pub struct Head {
     /// Restore mode, while in it.
     #[serde(default)]
     pub mode: Option<Mode>,
+    /// **Whether the last Core this agent handshook with holds restores**
+    /// (omnuv's modular design, A6): the `armed` bit, kept so that a restart
+    /// that cannot reach Core still knows whether the mode above binds it.
+    /// None is a head written before the bit was kept, read as armed: a
+    /// start is an act, and not knowing is not a licence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -125,8 +132,28 @@ pub fn arm(s: &Shared, answer: &serde_json::Value) {
         st.head = Head { provider, ..Head::default() };
         save(&st);
     }
+    // The bit kept beside the head, for a restart that cannot ask (A6). An
+    // agent that was never armed writes no file, as before.
+    let armed = st.armed;
+    if st.head.armed != Some(armed) && (armed || st.path.as_ref().is_some_and(|p| p.exists())) {
+        st.head.armed = Some(armed);
+        save(&st);
+    }
     if !st.armed {
         println!("Core holds no restores (no restore_mode in its handshake answer): restore detection is not armed");
+    }
+}
+
+/// **Whether the kept head holds this agent before any Core has answered**
+/// (omnuv's modular design, A6: the boot-time maintain path). The mode as it
+/// was kept, bound unless the kept bit says the last Core held no restores.
+/// An unreadable head was loaded as a restore (`load`), so it holds too.
+/// Some(evidence) when it holds.
+pub fn held_at_boot(s: &Shared) -> Option<String> {
+    let st = lock(s);
+    match (&st.head.mode, st.head.armed) {
+        (Some(m), armed) if armed != Some(false) => Some(m.evidence.clone()),
+        _ => None,
     }
 }
 
@@ -327,6 +354,37 @@ mod tests {
         assert!(observe(&s, &view(1, &[]), Some("r-2"), |_| false));
         assert!(to_tell(&s).is_none(), "an agent told Core what Core had told it");
         assert!(!observe(&s, &view(1, &[]), None, |_| false));
+    }
+
+    /// **The restore bit outlives the process** (A6): a restart that has not
+    /// reached Core yet reads the kept mode as binding while the kept bit says
+    /// armed, or says nothing (a head kept before the bit was); only a kept
+    /// "this Core holds no restores" frees it. An unreadable head holds.
+    #[test]
+    fn the_restore_bit_is_read_back_before_core_answers() {
+        let t = scratch("boot");
+        let d = t.path();
+        let s = armed(d);
+        observe(&s, &view(9, &[]), None, |_| false);
+        assert_eq!(held_at_boot(&s), None, "a head in no restore held the agent");
+        assert!(observe(&s, &view(4, &[]), None, |_| false));
+        // Restarted, and no handshake yet: not armed in memory, held from the file.
+        let again = load(d.join("restore-head.json"));
+        assert!(!active(&again), "armed before any Core answered");
+        assert!(held_at_boot(&again).is_some_and(|e| e.contains("below revision 9")), "{:?}", held_at_boot(&again));
+        // A head kept before the bit existed: the mode binds.
+        let kept: Head = serde_json::from_slice(&std::fs::read(d.join("restore-head.json")).unwrap()).unwrap();
+        assert_eq!(kept.armed, Some(true));
+        let old = Head { armed: None, ..kept.clone() };
+        std::fs::write(d.join("restore-head.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(held_at_boot(&load(d.join("restore-head.json"))).is_some(), "an old head's mode was read as free");
+        // The last Core said it holds no restores: the kept mode does not bind.
+        let s = load(d.join("restore-head.json"));
+        arm(&s, &serde_json::json!({"provider_id": "p-1"}));
+        assert_eq!(held_at_boot(&load(d.join("restore-head.json"))), None, "a Core without restores still held the agent");
+        // Unreadable: held.
+        std::fs::write(d.join("restore-head.json"), b"{not json").unwrap();
+        assert!(held_at_boot(&load(d.join("restore-head.json"))).is_some(), "an unreadable head read as free");
     }
 
     /// **Against a Core that holds no restores, nothing changes**: no

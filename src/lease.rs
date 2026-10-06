@@ -222,27 +222,43 @@ pub fn read_body(body: &str) -> Result<Vec<Written>, String> {
     Ok(f.leases)
 }
 
+/// Why the file's leases were not resumed ([`resumed`]): what the boot-time
+/// maintain path (omnuv's modular design, A6) is gated on. Read before the
+/// lease task writes the file again, since that write keeps only what was
+/// resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unread {
+    /// No file: an agent that never ran here, or one somebody removed.
+    Missing,
+    /// There, and not readable.
+    Unreadable(String),
+    /// Read, and refused whole (`read_body`).
+    Refused(String),
+}
+
+impl std::fmt::Display for Unread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unread::Missing => write!(f, "no run-lease file"),
+            Unread::Unreadable(e) => write!(f, "the run-lease file could not be read ({e})"),
+            Unread::Refused(e) => write!(f, "the run-lease file was refused ({e})"),
+        }
+    }
+}
+
 /// **A restarted agent resumes its predecessor's leases**: each deadline in
 /// the file, mapped from the wall clock onto this process's monotonic one (one
 /// already past is past now), unless the book already holds a later one. An
 /// expired lease resumed here is never restarted by maintenance and is stopped
-/// by the first pass, as it would have been. Returns how many were resumed.
-pub fn resume(book: &Shared, file: &std::path::Path) -> usize {
+/// by the first pass, as it would have been. Returns how many were resumed,
+/// or why none were ([`Unread`]).
+pub fn resumed(book: &Shared, file: &std::path::Path) -> Result<usize, Unread> {
     let body = match std::fs::read_to_string(file) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
-        Err(e) => {
-            eprintln!("run lease: {} could not be read, so no lease is resumed: {e:#}", file.display());
-            return 0;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Unread::Missing),
+        Err(e) => return Err(Unread::Unreadable(format!("{}: {e:#}", file.display()))),
     };
-    let leases = match read_body(&body) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("run lease: {} refused, so no lease is resumed: {e:#}", file.display());
-            return 0;
-        }
-    };
+    let leases = read_body(&body).map_err(|e| Unread::Refused(format!("{}: {e}", file.display())))?;
     let (now, wall) = (Instant::now(), SystemTime::now());
     let mut b = crate::poison::lock(book, "run lease");
     let mut n = 0;
@@ -255,7 +271,7 @@ pub fn resume(book: &Shared, file: &std::path::Path) -> usize {
         b.leases.insert(l.id, Lease { deadline, wall: until, stopped: false });
         n += 1;
     }
-    n
+    Ok(n)
 }
 
 /// What one stop of a leased machine did, guest by guest, for whoever logs it.
@@ -400,11 +416,23 @@ pub(crate) async fn take_lock(file: &std::path::Path) -> Option<std::fs::File> {
 /// The lease task: beside the reconcile loop, never inside it, because it
 /// must run exactly when Core cannot be reached. Every [`WRITE_EVERY`]. The
 /// file's leases are resumed before this returns, so the first view renews
-/// or releases them rather than racing their resumption.
-pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf) {
-    let n = resume(&book, &file);
-    if n > 0 {
-        println!("run lease: {n} lease(s) resumed from {}", file.display());
+/// or releases them rather than racing their resumption. Returns what the
+/// resumption found, which gates the boot-time maintain path (A6).
+///
+/// `on_unread` is told why nothing was resumed **before the task can write
+/// the file**: that write keeps only what was resumed, so from it on the next
+/// start reads an empty book as a whole one. What depends on the file having
+/// been read (the held view, `heldview::retire`) is taken out of use there,
+/// in this start, or never.
+pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf, on_unread: impl FnOnce(&Unread)) -> Result<usize, Unread> {
+    let found = resumed(&book, &file);
+    match &found {
+        Ok(0) | Err(Unread::Missing) => {}
+        Ok(n) => println!("run lease: {n} lease(s) resumed from {}", file.display()),
+        Err(e) => eprintln!("run lease: {e:#}, so no lease is resumed"),
+    }
+    if let Err(why) = &found {
+        on_unread(why);
     }
     let task = tokio::spawn(async move {
         let _held = take_lock(&file).await;
@@ -426,6 +454,7 @@ pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf) {
             std::process::exit(70);
         }
     });
+    found
 }
 
 /// Where the file goes: beside the restore head.
@@ -571,7 +600,7 @@ mod tests {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         std::fs::write(&file, serde_json::json!({"leases": [{"id": "f35783b3", "until_unix": now - 600}]}).to_string()).unwrap();
         let b = book();
-        assert_eq!(resume(&b, &file), 1);
+        assert_eq!(resumed(&b, &file), Ok(1));
         check(&b, &mock.client(), &file).await;
         assert_eq!(read_body(&std::fs::read_to_string(&file).unwrap()).unwrap().len(), 1, "stopped, and not yet told");
         heard(&b, Asked::now(), Some("900".into()));
@@ -608,7 +637,7 @@ mod tests {
         ]});
         std::fs::write(&file, body.to_string()).unwrap();
         let b = book();
-        assert_eq!(resume(&b, &file), 2);
+        assert_eq!(resumed(&b, &file), Ok(2));
         let t = Instant::now();
         assert_eq!(expired(&b, t), ["gone"], "the expired lease was not resumed as expired");
         assert!(!may_restart(&b, "gone", t), "maintenance may restart a machine past its lease");
@@ -617,8 +646,8 @@ mod tests {
         assert_eq!(file_body(&b), body, "the file was not written back as it was read");
         // A file that does not read resumes nothing, and neither does none.
         std::fs::write(&file, "{\"leases\": [").unwrap();
-        assert_eq!(resume(&book(), &file), 0);
-        assert_eq!(resume(&book(), &dir.path().join("absent.json")), 0);
+        assert!(matches!(resumed(&book(), &file), Err(Unread::Refused(_))), "a torn file was resumed");
+        assert_eq!(resumed(&book(), &dir.path().join("absent.json")), Err(Unread::Missing));
     }
 
     /// **A lock file the agent cannot write to still locks**: one a person
@@ -645,7 +674,7 @@ mod tests {
         let mock = crate::pvemock::Mock::start(|_, _, _| (404, serde_json::Value::Null)).await;
         let dir = tempfile::tempdir().expect("a directory");
         let file = dir.path().join("run-lease.json");
-        spawn(book(), Arc::new(mock.client()), file.clone());
+        let _ = spawn(book(), Arc::new(mock.client()), file.clone(), |_| {});
         let probe = open_lock(&lock_file(&file)).unwrap();
         let mut held = false;
         for _ in 0..250 {
