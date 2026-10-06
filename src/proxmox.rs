@@ -627,6 +627,20 @@ impl Client {
         Ok(())
     }
 
+    /// Writes one file into a running guest, through qemu-guest-agent: the
+    /// list of devices a streaming machine admits (pairing by certificate,
+    /// the operator's P-1). `VM.GuestAgent.FileWrite`, granted on the buyer
+    /// pool only (deploy-agent.yml). Proxmox base64-encodes the content on
+    /// the way (`encode`, its default), so it is sent as it is.
+    pub(crate) async fn write_guest_file(&self, node: &str, vmid: u32, path: &str, content: &str) -> anyhow::Result<()> {
+        self.post_form::<Option<serde_json::Value>>(
+            &format!("/nodes/{node}/qemu/{vmid}/agent/file-write"),
+            &[("file", path.to_string()), ("content", content.to_string())],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Brings a VM's cloud-init drive up to date with its snippet on disk.
     ///
     /// The snippet is read when the drive is regenerated, not when the file

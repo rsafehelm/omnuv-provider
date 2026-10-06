@@ -393,12 +393,14 @@ pub fn run(a: JoinArgs) -> anyhow::Result<()> {
         // arbitrary command execution inside the guest.
         ("OnvWorkloadFiles", "VM.GuestAgent.FileRead,Pool.Audit", GATEWAY_POOL),
         ("OnvConsole", "VM.Console", BUYER_POOL),
-        // Reads one file: the outcome a recipe writes about its own install.
-        // Deliberately `FileRead` and not `Unrestricted` — the latter is
-        // arbitrary command execution inside a buyer's machine, which is
-        // exactly what the marketplace must never be able to do. Scoped to the
-        // pool of machines the marketplace built, never the host.
-        ("OnvRecipeStatus", "VM.GuestAgent.FileRead", BUYER_POOL),
+        // Reads the files a recipe writes about its own install and its
+        // streaming identity, and writes one: the devices allowed to stream
+        // (pairing by certificate, the operator's P-1, 5 October 2026), which
+        // the machine's own converger applies. `FileRead` and `FileWrite`, not
+        // `Unrestricted` — the latter is arbitrary command execution inside a
+        // buyer's machine. Scoped to the pool of machines the marketplace
+        // built, never the host.
+        ("OnvRecipeStatus", "VM.GuestAgent.FileRead,VM.GuestAgent.FileWrite", BUYER_POOL),
         // Sets a buyer's console password when they reset it (BUYER-18).
         // `set-user-password` needs `Unrestricted`, which is also `exec`: root
         // inside the guest. The operator granted it on 23 September 2026, on

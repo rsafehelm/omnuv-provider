@@ -691,7 +691,7 @@ dependencies = [
 [[package]]
 name = "omnuv-protocol"
 version = "0.4.0"
-source = "git+https://github.com/rsafehelm/omnuv-protocol?tag=v0.26.0#d4a35eb8244b49e4d15ccb284da890f7dc2222e1"
+source = "git+https://github.com/rsafehelm/omnuv-protocol?tag=v0.27.0#f9596184f203f7065315cf73ea1de19898b94b74"
 dependencies = [
  "serde",
 ]

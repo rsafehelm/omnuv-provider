@@ -33,6 +33,7 @@ mod dur;
 mod timings;
 mod workload_config;
 mod scrub;
+mod stream_devices;
 mod installwatch;
 mod opening;
 #[cfg(test)]

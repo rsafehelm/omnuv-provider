@@ -515,6 +515,7 @@ pub(crate) fn progress_from(status: &str) -> Option<omnuv_protocol::RecipeProgre
             label,
             detail: None,
             stream_credentials: None,
+            stream_identity: None,
         });
     };
     Some(omnuv_protocol::RecipeProgress {
@@ -525,6 +526,7 @@ pub(crate) fn progress_from(status: &str) -> Option<omnuv_protocol::RecipeProgre
             format!("The recipe stopped with exit code {rc}. Its output is in the machine's own /var/log/cloud-init-output.log.")
         }),
         stream_credentials: None,
+        stream_identity: None,
     })
 }
 
@@ -1300,7 +1302,14 @@ impl Client {
                     // Only asked for a machine that was given a recipe, and only
                     // while it is up: there is nothing to ask otherwise.
                     recipe_progress: if running && spec.recipe.is_some() {
-                        self.recipe_progress(node, vm.vmid, &spec.image).await
+                        let mut progress = self.recipe_progress(node, vm.vmid, &spec.image).await;
+                        // Pairing by certificate: once installed, the machine
+                        // is handed its allowed devices and read for what it
+                        // admits (stream_devices.rs).
+                        if let Some(p) = progress.as_mut().filter(|p| p.status == "done") {
+                            p.stream_identity = self.stream_identity(node, vm.vmid, spec).await;
+                        }
+                        progress
                     } else {
                         None
                     },
@@ -1905,6 +1914,36 @@ impl Client {
                 .and_then(|c| parse_stream_credentials(&c));
         }
         Some(progress)
+    }
+
+    /// **Pairing by certificate** (stream_devices.rs): when Core sent this
+    /// machine its allowed devices, the list is written where the machine's
+    /// converger reads it, only when it differs from what is there; then what
+    /// the machine says Sunshine is and admits is read back. A write that
+    /// fails is said and tried again on the next pass; the read is
+    /// best-effort, None meaning "not known".
+    pub(crate) async fn stream_identity(
+        &self,
+        node: &str,
+        vmid: u32,
+        spec: &InstanceSpec,
+    ) -> Option<omnuv_protocol::StreamIdentity> {
+        let (devices_path, identity_path) = match crate::guest_windows::guest_kind(&spec.image).ok()? {
+            GuestKind::Linux => (crate::stream_devices::LINUX_DEVICES, crate::stream_devices::LINUX_IDENTITY),
+            GuestKind::Windows => (crate::stream_devices::WINDOWS_DEVICES, crate::stream_devices::WINDOWS_IDENTITY),
+        };
+        if let Some(devices) = spec.stream_devices.as_deref() {
+            let want = crate::stream_devices::desired_file(devices);
+            if self.read_guest_file(node, vmid, devices_path).await.as_deref() != Some(want.as_str()) {
+                match self.write_guest_file(node, vmid, devices_path, &want).await {
+                    Ok(()) => audit::record("stream.devices", "agent", &spec.id, "written", Some(&devices.len().to_string())),
+                    Err(e) => eprintln!("stream devices {}: the list was not written, tried again next pass: {e:#}", spec.id),
+                }
+            }
+        }
+        self.read_guest_file(node, vmid, identity_path)
+            .await
+            .and_then(|raw| crate::stream_devices::identity_from(&raw))
     }
 
     /// One known path out of a guest, or None.
@@ -4697,6 +4736,7 @@ mod tests {
             overlay: None,
             attempt: None,
             certificate: None,
+            stream_devices: None,
         }
     }
 
