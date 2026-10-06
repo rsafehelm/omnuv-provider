@@ -15,7 +15,7 @@
 #
 # Sections, in order:
 #     crate      the workspace's members as recorded; onv-workloadd's closure
-#                as recorded; build, test and clippy of every member (warnings
+#                as recorded, with the files it includes by #[path]; build, test and clippy of every member (warnings
 #                refused), then the review's defect classes: semgrep's tests of
 #                its own rules, then src and crates
 #     package    shellcheck; the manifest check's own cases; the .deb built as
@@ -65,6 +65,12 @@ packaging/baselines.sh members
 # onv-workloadd's own crate (omnuv's modular design, A2): what it is compiled
 # from, as recorded, and never one of the agent's members, so a split of the
 # agent cannot move the digest every inference worker's snippet carries.
+# Its closure includes, by sha256, the files it compiles by #[path], which
+# cargo tree cannot see; the reader of those attributes is tested first.
+step "The #[path] reader lists a right tree and refuses each wrong one"
+tests/packaging/workloadd_includes_test.py > "$out/includes-test.log" 2>&1 || { cat "$out/includes-test.log"; exit 1; }
+test "$(tail -1 "$out/includes-test.log")" = "includes: every case passed"
+
 step "onv-workloadd is built from its own closure, as recorded"
 packaging/baselines.sh closure
 

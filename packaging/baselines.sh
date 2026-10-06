@@ -35,17 +35,25 @@
 #                                     is the same decision. A2 moved it once,
 #                                     fdeb27d8 to 6dad09d1, taking it out of
 #                                     the agent's package into its own crate;
-#                                     since then a split of the agent cannot.
+#                                     since then a split of the agent that
+#                                     leaves dur.rs and workload_config.rs
+#                                     alone cannot.
 #   packaging/workloadd-closure.txt   every package onv-workloadd is compiled
 #                                     from, name and version, asked of `cargo
-#                                     tree` for its musl target (A2). Its
-#                                     digest moves only with this list or its
-#                                     own sources, so a split of the agent,
-#                                     which changes neither, cannot move it;
-#                                     and a workspace member other than
-#                                     onv-workloadd in it is refused outright,
-#                                     whatever is recorded, since that is the
-#                                     coupling A2 removed.
+#                                     tree` for its musl target (A2), then
+#                                     each file it compiles from outside its
+#                                     crate by `#[path]` (onv-agent-lib's
+#                                     dur.rs and workload_config.rs), as
+#                                     `include <path> <sha256>`. Its digest
+#                                     moves only with this list or its own
+#                                     sources, so a split of the agent that
+#                                     leaves those two files alone cannot
+#                                     move it, and one that edits or moves
+#                                     them fails here; a workspace member
+#                                     other than onv-workloadd in it is
+#                                     refused outright, whatever is
+#                                     recorded, since that is the coupling
+#                                     A2 removed.
 set -euo pipefail
 
 # A package named relative to the caller's directory, resolved before the cd.
@@ -114,6 +122,16 @@ print("\n".join(sorted(p["name"] for p in m["packages"] if p["id"] in members an
         while IFS= read -r line; do echo "  $line" >&2; done <<< "$coupled"
         exit 1
     fi
+    # **The files it includes from outside its crate, by content.** cargo
+    # tree does not see a `#[path]` module, and onv-workloadd compiles two of
+    # onv-agent-lib's files that way (dur.rs, workload_config.rs), so a split
+    # of the agent that edits or moves either moves the digest. Each is
+    # recorded by its path from the workspace root and its sha256, read from
+    # the attributes themselves so a third cannot be added unseen. A file that
+    # pulls in more (an out-of-line `mod x;`, an include!) is refused: that
+    # would be a source this list does not name.
+    included="$(python3 packaging/workloadd_includes.py crates/onv-workloadd/src)"
+    actual="$actual"$'\n'"$included"
     compare workloadd-closure.txt "$actual"
     ;;
 *)

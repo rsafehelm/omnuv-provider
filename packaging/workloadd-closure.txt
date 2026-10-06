@@ -110,3 +110,5 @@ zerotrie v0.2.5
 zerovec v0.11.8
 zerovec-derive v0.11.6
 zmij v1.0.23
+include crates/onv-agent-lib/src/dur.rs a7f23edabe5a9f00401da86a2b20083063b1cc2013955f40b9a5c92f133fd747
+include crates/onv-agent-lib/src/workload_config.rs 2673fa3ea1ed94f9974f895e88064bd3e43bd91cdb988b2c04c36637d305d722

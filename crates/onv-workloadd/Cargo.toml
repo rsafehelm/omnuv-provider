@@ -14,8 +14,10 @@ publish = false
 # digest is compiled into every inference worker's snippet (worker.rs), and a
 # changed snippet reboots the worker. Now its closure is this file, the two
 # files it includes from onv-agent-lib by path, and the locked versions below;
-# packaging/workloadd-closure.txt records the closure and packaging/check.sh
-# holds it, so it never grows a workspace member.
+# packaging/workloadd-closure.txt records the closure, with those two files'
+# sha256, and packaging/check.sh holds it, so it never grows a workspace
+# member. A split of the agent that leaves those two files alone cannot move
+# the digest; one that edits or moves them fails the closure check.
 #
 # Its version is its own: the agent's moving does not move it, and moving this
 # one moves the digest.
