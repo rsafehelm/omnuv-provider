@@ -79,6 +79,16 @@ struct Core {
     /// by the loop, which then looks again sooner than the poll
     /// (`crate::installwatch`, 3 October 2026).
     install_watch: std::sync::Arc<std::sync::Mutex<crate::installwatch::InstallWatch>>,
+    /// **Core's answer to the last handshake, typed** (protocol v0.28.0): what
+    /// it said it serves (`HandshakeAccepted::served`, contract change 5), so
+    /// a 404 from a route it serves reads as an outage, never as "this Core
+    /// predates the route". `None` before a handshake, or when the answer
+    /// does not read as the protocol's type.
+    accepted: std::sync::Arc<std::sync::Mutex<Option<omnuv_protocol::HandshakeAccepted>>>,
+    /// **The agent settings Core's last view sent** (`DesiredState::agent_settings`,
+    /// v0.28.0, contract change 6), `None` from a Core that sends none. What
+    /// the heartbeat's `settings_hash` answers (`crate::settings`).
+    settings: std::sync::Arc<std::sync::Mutex<Option<omnuv_protocol::AgentSettings>>>,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -96,14 +106,15 @@ struct Core {
 /// ```
 pub async fn leave_core(url: &str, token: &omnuv_protocol::Redacted, reason: &str) -> anyhow::Result<CoreLeft> {
     let core = Core::new(url, token)?;
-    let r = core.post("/provider/v1/leave", Some(serde_json::json!({ "reason": reason }))).await?;
+    let leave = omnuv_protocol::Leave { reason: Some(reason.to_string()) };
+    let r = core.post(omnuv_protocol::ROUTE_LEAVE, Some(serde_json::to_value(&leave)?)).await?;
     let status = r.status();
     let body = r.text().await.unwrap_or_default();
     match status.as_u16() {
         200..=299 => Ok(CoreLeft::Removed(body)),
         401 => Ok(CoreLeft::AlreadyForgotten),
         409 => anyhow::bail!("Core refused: {body}"),
-        _ => Err(CoreAnswered { path: "/provider/v1/leave".into(), status: status.as_u16() }.into()),
+        _ => Err(CoreAnswered { path: omnuv_protocol::ROUTE_LEAVE.into(), status: status.as_u16(), code: None }.into()),
     }
 }
 
@@ -121,12 +132,55 @@ pub enum CoreLeft {
 pub struct CoreAnswered {
     pub path: String,
     pub status: u16,
+    /// The refusal's `code`, from Core's body (protocol v0.28.0, contract
+    /// change 4): read before the status where this build knows it
+    /// (`omnuv_protocol::answer_means`). `None` from a Core that predates it.
+    pub code: Option<omnuv_protocol::RefusalCode>,
 }
 
 impl std::fmt::Display for CoreAnswered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} answered {}", self.path, self.status)
+        write!(f, "{} answered {}", self.path, self.status)?;
+        match self.code {
+            Some(code) => write!(f, " ({})", code_word(code)),
+            None => Ok(()),
+        }
     }
+}
+
+/// A refusal code as Core writes it, for a log line.
+fn code_word(code: omnuv_protocol::RefusalCode) -> String {
+    serde_json::to_value(code).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| format!("{code:?}"))
+}
+
+/// **The most of a refusal's body read**: Core's are a sentence and a code,
+/// and anything far longer is not Core's (a proxy's error page), so it is
+/// not worth holding.
+const REFUSAL_BODY_MAX: usize = 64 * 1024;
+
+impl CoreAnswered {
+    /// A refusal as Core wrote it, and its words for the log: the status, and
+    /// the `code` its body carries (`omnuv_protocol::RefusalBody`). A body
+    /// that is not one, or too long to be one, carries no code.
+    async fn read(path: impl Into<String>, mut res: reqwest::Response) -> (Self, String) {
+        let status = res.status().as_u16();
+        let mut body = Vec::new();
+        while let Ok(Some(chunk)) = res.chunk().await {
+            if body.len() + chunk.len() > REFUSAL_BODY_MAX {
+                body.clear();
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        (Self { path: path.into(), status, code: refusal_code(&body) }, String::from_utf8_lossy(&body).into_owned())
+    }
+}
+
+/// The `code` a refusal's body carries, read as the protocol's
+/// `RefusalBody`; `None` for a body that is not one, which is every body a
+/// Core that predates codes writes without one.
+fn refusal_code(body: &[u8]) -> Option<omnuv_protocol::RefusalCode> {
+    serde_json::from_slice::<omnuv_protocol::RefusalBody>(body).ok().and_then(|b| b.code)
 }
 
 impl std::error::Error for CoreAnswered {}
@@ -152,34 +206,79 @@ pub enum Refusal {
     Final,
     /// Any other answer: a request Core considered wrong. Decided nothing.
     Other,
+    /// **Not decided against, and not acted for yet** (protocol v0.28.0,
+    /// contract change 4): a provider awaiting admission (`admission_*`, 403),
+    /// or one another agent still holds (`held`). Backed off and asked again;
+    /// never a reason to stop, and nothing is maintained on it.
+    Wait,
 }
 
+/// **What a failed call means, in the protocol's one table**
+/// (`omnuv_protocol::answer_means`, v0.28.0). With no code it is the table
+/// this agent has always kept: 401 or 426 at the handshake and 409 anywhere
+/// else (superseded, lifecycle phase 7, RC12) are final; 426 elsewhere
+/// renegotiates; 401 and 403 are refused; 429 and 5xx are an outage. A code
+/// decides first: `admission_*` and `held` wait, `retry` is an outage, and
+/// `superseded` is final.
 pub fn refusal(e: &anyhow::Error) -> Refusal {
+    use omnuv_protocol::AnswerMeans;
     match e.downcast_ref::<CoreAnswered>() {
         None => Refusal::Unreachable,
-        Some(a) => match a.status {
-            401 | 426 if a.path == HANDSHAKE => Refusal::Final,
-            // **Superseded is final** (lifecycle phase 7, RC12): another
-            // agent's handshake took this provider over after this one fell
-            // silent past the takeover lease, and Core refuses this session
-            // on every call. At the handshake, 409 is the other half — this
-            // provider is held by an agent Core still hears — and is waited
-            // out by the handshake's own loop, never final: the holder may be
-            // this agent's previous process, whose session lapses in a lease.
-            409 if a.path != HANDSHAKE => Refusal::Final,
-            426 => Refusal::Renegotiate,
-            401 | 403 => Refusal::Refused,
-            429 | 500..=599 => Refusal::Unreachable,
-            _ => Refusal::Other,
-        },
+        Some(a) => {
+            // The route, without the view's `?known=`.
+            let route = a.path.split('?').next().unwrap_or_default();
+            match omnuv_protocol::answer_means(route, a.status, a.code) {
+                AnswerMeans::Unavailable => Refusal::Unreachable,
+                AnswerMeans::Refused => Refusal::Refused,
+                AnswerMeans::Renegotiate => Refusal::Renegotiate,
+                AnswerMeans::Final => Refusal::Final,
+                AnswerMeans::Wait => Refusal::Wait,
+                AnswerMeans::Other => Refusal::Other,
+            }
+        }
     }
 }
 
-const HANDSHAKE: &str = "/provider/v1/handshake";
+const HANDSHAKE: &str = omnuv_protocol::ROUTE_HANDSHAKE;
 
 /// How often a handshake is tried again while another agent holds the
 /// provider: a poll of a condition Core answers at once, so five seconds.
 const HELD_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// **Whether `url` is on `base`'s origin**: the same scheme, host and port,
+/// the default port counted as itself. Anything that does not parse is not.
+fn same_origin(base: &str, url: &str) -> bool {
+    match (reqwest::Url::parse(base), reqwest::Url::parse(url)) {
+        (Ok(b), Ok(u)) => {
+            b.scheme() == u.scheme() && b.host_str() == u.host_str() && b.port_or_known_default() == u.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// **The Core client follows a redirect only within Core's origin.** A
+/// request to Core carries the provider's token and this agent's session and
+/// restore headers; reqwest drops `Authorization` on a redirect to another
+/// host, but not the `onv-*` headers, and not on a change of scheme alone.
+/// So a redirect that leaves the origin of the request that carried them is
+/// an error, not a fetch (contract change 8). A request that started on
+/// another origin carried none of them, and follows as reqwest would.
+fn same_origin_redirects(base: &str) -> anyhow::Result<reqwest::redirect::Policy> {
+    // Parsed now, so a base that cannot be is refused at start, not per call.
+    reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("core url {base} does not parse: {e}"))?;
+    let base = base.to_string();
+    Ok(reqwest::redirect::Policy::custom(move |attempt| {
+        let first = attempt.previous().first().map(|u| u.as_str().to_string()).unwrap_or_default();
+        if attempt.previous().len() > 10 {
+            attempt.error("more than ten redirects")
+        } else if same_origin(&base, &first) && !same_origin(&base, attempt.url().as_str()) {
+            let to = attempt.url().to_string();
+            attempt.error(format!("a redirect from Core's origin to {to} was refused: it would carry this agent's credential"))
+        } else {
+            attempt.follow()
+        }
+    }))
+}
 
 /// The one way this daemon ends on purpose: Core has said, finally, that it
 /// will not work with this agent. Code 3, beside `main`'s 2 for configuration.
@@ -216,6 +315,7 @@ impl Core {
             .use_rustls_tls()
             .https_only(!base.starts_with("http://"))
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(same_origin_redirects(&base)?)
             .build()?;
         Ok(Self {
             http,
@@ -227,7 +327,27 @@ impl Core {
             built: Default::default(),
             report: Default::default(),
             install_watch: Default::default(),
+            accepted: Default::default(),
+            settings: Default::default(),
         })
+    }
+
+    /// **What this client keeps of a view it read**: the workers it sends as
+    /// built (`InferenceWorkerSpec::built`, typed since v0.28.0, finding 6 for
+    /// workers) for a full answer, and the agent settings on every answer,
+    /// `unchanged` ones included (v0.28.0, D33). One function, so the goldens
+    /// (`goldens`) read a view exactly as `get_view` does.
+    fn heard_view(&self, view: &DesiredState) {
+        if !view.unchanged {
+            crate::poison::lock(&self.built, "workers sent as built").heard(view.version, crate::worker::built_workers(view));
+        }
+        crate::poison::lock(&self.settings, "agent settings").clone_from(&view.agent_settings);
+    }
+
+    /// Whether this Core serves `route`, as its last handshake answer said
+    /// (`HandshakeAccepted::serves`): `None` when it did not say.
+    fn serves(&self, route: &str) -> Option<bool> {
+        crate::poison::lock(&self.accepted, "handshake answer").as_ref().and_then(|a| a.serves(route))
     }
 
     /// The same client, keeping its head in `path` (lifecycle phase 8).
@@ -265,19 +385,14 @@ impl Core {
             .send()
             .await?;
         if !res.status().is_success() {
-            return Err(CoreAnswered { path, status: res.status().as_u16() }.into());
+            return Err(CoreAnswered::read(path, res).await.0.into());
         }
         let named = res.headers().get(crate::restore::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let lease = res.headers().get(crate::lease::HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
         // D35: Core's report period, on every view (D33).
         self.report.header(res.headers().get(crate::report::HEADER).and_then(|v| v.to_str().ok()));
-        // **One body, read twice** (finding 6 for workers): as the protocol's
-        // view, and for the `built` Core sends beside a worker's fields.
-        let body = res.bytes().await?;
-        let view: DesiredState = serde_json::from_slice(&body)?;
-        if !view.unchanged {
-            crate::poison::lock(&self.built, "workers sent as built").heard(view.version, crate::worker::built_workers(&body));
-        }
+        let view: DesiredState = res.json().await?;
+        self.heard_view(&view);
         crate::lease::heard(&self.lease, asked, lease);
         Ok((view, named))
     }
@@ -289,7 +404,7 @@ impl Core {
             .send()
             .await?;
         if !res.status().is_success() {
-            return Err(CoreAnswered { path: path.to_string(), status: res.status().as_u16() }.into());
+            return Err(CoreAnswered::read(path, res).await.0.into());
         }
         Ok(res.json().await?)
     }
@@ -347,8 +462,19 @@ impl Core {
             tokio::fs::write(&stamp, &a.sha256).await?;
         }
 
-        let mut req = self
-            .authed(self.http.get(&a.url))
+        // **The provider's token goes only to Core's own origin** (protocol
+        // v0.28.0, contract change 8, a rule and not a field): an artefact
+        // URL on any other origin is fetched with none of this agent's
+        // headers, and the digest checked below is what makes its bytes
+        // trustworthy. A redirect away from Core's origin is refused by the
+        // client itself (`same_origin_redirects`).
+        let req = if same_origin(&self.base, &a.url) {
+            self.authed(self.http.get(&a.url))
+        } else {
+            eprintln!("image {}: {} is not Core's origin; fetched without this agent's credential", a.id, a.url);
+            self.http.get(&a.url)
+        };
+        let mut req = req
             // Deliberately long, and not the 30 seconds every other call uses:
             // a 6 GB transfer over a provider's uplink is not a hung request,
             // and killing it at 30 seconds would mean no image ever arrives.
@@ -545,9 +671,39 @@ async fn handshake_then_core_check(
 /// can be compared. **The self-check's heartbeat says it too**: a heartbeat
 /// without it would tell Core this agent reports none, for the moment until
 /// the next one.
-fn heartbeat_body(config_hash: &str) -> serde_json::Value {
-    serde_json::to_value(omnuv_protocol::Heartbeat { config_hash: Some(config_hash.to_string()) })
-        .expect("a heartbeat serialises")
+///
+/// **And since protocol v0.28.0**: which of Core's agent settings it applied
+/// (`settings_hash`, only to a Core that sent some: `crate::settings`), the
+/// units on this host with what each runs (`components`, contract change
+/// 11), and the Workload Agent's digest its workers verify
+/// (`workloadd_sha256`), which Core holds against the binary it serves.
+fn heartbeat_body(config_hash: &str, settings: Option<&omnuv_protocol::AgentSettings>) -> serde_json::Value {
+    serde_json::to_value(omnuv_protocol::Heartbeat {
+        config_hash: Some(config_hash.to_string()),
+        settings_hash: crate::settings::hash(settings),
+        components: components(config_hash),
+        workloadd_sha256: crate::worker::workloadd_sha256(),
+    })
+    .expect("a heartbeat serialises")
+}
+
+/// **The units on this host, and what each runs** (`Heartbeat::components`).
+///
+/// The agent alone, with its build and the hash of the tunables it runs:
+/// this process is the only binary it has evidence about. The opening
+/// applier and the lease timer run their own files (`/usr/bin/onv-opening`,
+/// `/usr/bin/onv-lease-expire`, since A3), which can be upgraded, replaced
+/// or missing apart from this one, so this process cannot say what they
+/// run; they are left out, which Core reads as "not reported", never as
+/// "not running". Reporting them needs evidence from their own files (a
+/// version stamp each writes, or a build digest recorded in the package),
+/// never this process's version or path.
+fn components(config_hash: &str) -> Vec<omnuv_protocol::Component> {
+    vec![omnuv_protocol::Component {
+        name: "onv-provider".to_string(),
+        version: AGENT_VERSION.to_string(),
+        config_hash: Some(config_hash.to_string()),
+    }]
 }
 
 /// **What this agent can say about its own footing, on every report
@@ -613,7 +769,8 @@ fn check_line(c: &omnuv_protocol::SelfCheck) -> String {
 /// 2xx is Core accepting this token, a 401 or 403 is Core refusing it, and
 /// anything else is not an answer from Core about this agent.
 async fn core_check(core: &Core, url: &str, config_hash: &str) -> String {
-    match core.post("/provider/v1/heartbeat", Some(heartbeat_body(config_hash))).await {
+    let settings = crate::poison::lock(&core.settings, "agent settings").clone();
+    match core.post("/provider/v1/heartbeat", Some(heartbeat_body(config_hash, settings.as_ref()))).await {
         Ok(r) if r.status().is_success() => format!("selfcheck: core reachable over tls at {url}, and accepts this agent"),
         Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
             format!("SELFCHECK FAILED: core at {url} refused this agent's token ({})", r.status())
@@ -975,7 +1132,16 @@ async fn scrub_once(
     }
     let wants: crate::scrub::Wants = match core.get_json(crate::scrub::PATH).await {
         Ok(w) => w,
-        Err(e) if e.downcast_ref::<CoreAnswered>().is_some_and(|a| a.status == 404) => return Ok(()),
+        Err(e) if e.downcast_ref::<CoreAnswered>().is_some_and(|a| a.status == 404) => {
+            // **A 404 is "predates the route" only from a Core that did not
+            // say what it serves** (v0.28.0, contract change 5). One that
+            // listed the route and answers 404 has a service down behind it:
+            // an outage, said and asked again, never a reason to stop asking.
+            return match core.serves(omnuv_protocol::ROUTE_SCRUBS) {
+                Some(true) => Err(e.context("Core serves the scrub route and answered 404: not reachable behind it")),
+                _ => Ok(()),
+            };
+        }
         Err(e) => return Err(e),
     };
     let storage = cfg.proxmox.contribute.storage.first().map(String::as_str).unwrap_or("local");
@@ -989,7 +1155,7 @@ async fn scrub_once(
         .post(crate::scrub::PATH, Some(serde_json::to_value(crate::scrub::Report { scrubs: &said })?))
         .await?;
     if !res.status().is_success() {
-        return Err(CoreAnswered { path: crate::scrub::PATH.into(), status: res.status().as_u16() }.into());
+        return Err(CoreAnswered::read(crate::scrub::PATH, res).await.0.into());
     }
     let answer: crate::scrub::Answer = res.json().await?;
     for r in &answer.results {
@@ -1066,18 +1232,28 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     onv_core_link::supervise::spawn("heartbeat", async move {
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let body = heartbeat_body(&config_hash);
         loop {
             tick.tick().await;
-            match core.post("/provider/v1/heartbeat", Some(body.clone())).await {
+            // Built each beat: the settings Core sent move with its views.
+            let settings = crate::poison::lock(&core.settings, "agent settings").clone();
+            let body = heartbeat_body(&config_hash, settings.as_ref());
+            let r = match core.post(omnuv_protocol::ROUTE_HEARTBEAT, Some(body)).await {
+                Ok(r) if r.status().is_success() => continue,
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("heartbeat failed: {e:#}");
+                    continue;
+                }
+            };
+            let (answered, _) = CoreAnswered::read(omnuv_protocol::ROUTE_HEARTBEAT, r).await;
+            match heartbeat_next(answered.status, answered.code) {
                 // **426 is renegotiated, not obeyed (PROVIDER-23).** Core's
                 // floor rose past the version agreed last time; a new
                 // handshake finds the highest version both still speak, and
-                // only a refusal *there* is final.
-                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED
-                    || r.status() == reqwest::StatusCode::UPGRADE_REQUIRED =>
-                {
-                    eprintln!("heartbeat refused ({}); re-running handshake", r.status());
+                // only a refusal *there* is final. A 401 is a session or a
+                // credential Core no longer knows: handshake again, likewise.
+                HeartbeatNext::Handshake => {
+                    eprintln!("heartbeat refused ({answered}); re-running handshake");
                     if let Err(e) = handshake(&core, &driver).await {
                         if refusal(&e) == Refusal::Final {
                             stop_for_good(&e);
@@ -1087,18 +1263,43 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
                 }
                 // Superseded (RC12): another agent holds this provider now.
                 // Final, as on any other call.
-                Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
-                    stop_for_good(&anyhow::Error::from(CoreAnswered {
-                        path: "/provider/v1/heartbeat".into(),
-                        status: 409,
-                    }).context("another agent's handshake superseded this agent's session"));
+                HeartbeatNext::Stop => {
+                    stop_for_good(&anyhow::Error::from(answered).context("Core will not hear this agent again: superseded"));
                 }
-                Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
-                Err(e) => eprintln!("heartbeat failed: {e:#}"),
-                _ => {}
+                // Awaiting admission, or held (v0.28.0): asked again at the
+                // next beat, never a reason to stop.
+                HeartbeatNext::Wait => eprintln!("heartbeat: {answered}; not admitted yet, asking again at the next beat"),
+                HeartbeatNext::Log => eprintln!("heartbeat: {answered}"),
             }
         }
     })
+}
+
+/// What the heartbeat does after a refusal.
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatNext {
+    /// 401 or 426: handshake again; only a refusal there is final.
+    Handshake,
+    /// Final (409, superseded): stop.
+    Stop,
+    /// Not decided against (`admission_*`, `held`): beat again.
+    Wait,
+    /// Anything else: said, and beat again.
+    Log,
+}
+
+/// **The heartbeat's reading of a refusal**, by the protocol's table: the
+/// three answers it has always acted on, now with a code read first, so a
+/// 403 `admission_*` or a 409 `held` is waited out, never final.
+fn heartbeat_next(status: u16, code: Option<omnuv_protocol::RefusalCode>) -> HeartbeatNext {
+    use omnuv_protocol::AnswerMeans;
+    match omnuv_protocol::answer_means(omnuv_protocol::ROUTE_HEARTBEAT, status, code) {
+        AnswerMeans::Final => HeartbeatNext::Stop,
+        AnswerMeans::Wait => HeartbeatNext::Wait,
+        AnswerMeans::Renegotiate => HeartbeatNext::Handshake,
+        AnswerMeans::Refused if status == 401 => HeartbeatNext::Handshake,
+        _ => HeartbeatNext::Log,
+    }
 }
 
 /// **Core's view, read again just before a start** of a machine or worker
@@ -1139,6 +1340,10 @@ fn incompleteness(
 fn speaks(v: u32) -> bool {
     (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION).contains(&v)
 }
+
+#[cfg(test)]
+#[path = "agent_goldens.rs"]
+mod goldens;
 
 #[cfg(test)]
 mod handshake_tests {
@@ -1410,6 +1615,7 @@ mod handshake_tests {
                 .collect(),
             images: vec![],
             poll_interval_secs: None,
+            agent_settings: None,
         };
         crate::heldview::write(&dir.path().join("held-view.json"), &crate::heldview::of(&core_url, &view, now - Duration::from_secs(60)));
         let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
@@ -1676,7 +1882,7 @@ mod handshake_tests {
         core.get_json::<serde_json::Value>("/provider/v1/desired-state").await.expect("a view");
         let (view, _) = rx.recv().await.unwrap();
         assert!(view.contains("\r\nonv-session: s-1"), "the view was asked without the session: {view}");
-        core.post("/provider/v1/heartbeat", Some(heartbeat_body("abcdefabcdef"))).await.expect("a heartbeat");
+        core.post("/provider/v1/heartbeat", Some(heartbeat_body("abcdefabcdef", None))).await.expect("a heartbeat");
         let (beat, _) = rx.recv().await.unwrap();
         assert!(beat.contains("\r\nonv-session: s-1"), "the heartbeat went without the session: {beat}");
     }
@@ -1705,6 +1911,7 @@ mod handshake_tests {
                 instances: vec![spec],
                 images: vec![],
                 poll_interval_secs: None,
+                agent_settings: None,
             })))
         };
         for (answer, held, want_absent, want_wanted, why) in [
@@ -1794,7 +2001,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -1824,6 +2031,8 @@ mod handshake_tests {
             built: Default::default(),
             report: Default::default(),
             install_watch: Default::default(),
+            accepted: Default::default(),
+            settings: Default::default(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -1904,7 +2113,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -1933,7 +2142,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -1987,7 +2196,7 @@ mod handshake_tests {
         let file = Arc::new(Mutex::new("step=1/3\nlabel=Getting ready\n".to_string()));
         let said = file.clone();
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
         let pve = crate::pvemock::Mock::start(move |method, path, _| {
             if let Some(ok) = crate::pvemock::task_ok(path) {
                 return ok;
@@ -2360,6 +2569,7 @@ mod handshake_tests {
             "{report}"
         );
         assert_eq!(w["message"].as_str(), Some(crate::worker::LOST_WORKER), "{report}");
+        assert_eq!(w["outcome"].as_str(), Some("lost"), "the lost worker was not typed lost (v0.28.0): {report}");
         assert!(crate::worker::LOST_WORKER.starts_with("this worker is no longer on its provider"),
             "Core parses this start: {}", crate::worker::LOST_WORKER);
     }
@@ -2710,6 +2920,7 @@ mod handshake_tests {
         let m = machine(&report);
         assert_eq!(m["state"], serde_json::json!("STOPPED"), "{done:?} {report:?}");
         assert_ne!(m["message"], serde_json::json!("deleted"), "the destroy's own pass said deleted");
+        assert_eq!(m["outcome"], serde_json::json!("not_proven_gone"), "{report:?}");
         // 3. Every pass after proves it gone, and says `deleted`.
         for n in 3..6 {
             let (done, report) = pass().await;
@@ -2719,6 +2930,7 @@ mod handshake_tests {
                 (Some("STOPPED"), Some("deleted")),
                 "pass {n}: the machine is gone from the host and was not reported deleted: {done:?} {report:?}"
             );
+            assert_eq!(m["outcome"], serde_json::json!("deleted"), "pass {n}: proven gone, and not typed so: {report:?}");
             // **And its lease ended with it**: nothing is left to stop, and
             // the host timer's file names it no more. It was kept for good,
             // and "stopped" at T fifteen minutes after the proof.
@@ -2727,6 +2939,489 @@ mod handshake_tests {
             let far = std::time::Instant::now() + std::time::Duration::from_secs(100_000);
             assert!(crate::lease::expired(&core.lease, far).is_empty(), "pass {n}: a lease outlived its machine's proof");
         }
+    }
+
+    /// **The refusals no retry can mend are typed on the report a pass
+    /// sends** (v0.28.0, contract change 3), not only in the hand-built
+    /// statuses the goldens read: a machine whose image this provider does
+    /// not offer reports `image_not_offered`, and one no node can hold (its
+    /// cards sold on a node this provider does not have) `unplaceable`, both
+    /// not retryable. The control: the same view on the shipped image and
+    /// with no card is cloned, so the harness reaches the build at all.
+    #[tokio::test]
+    async fn a_pass_types_the_refusals_no_retry_can_mend() {
+        let view = |image: &str, gpu_node: Option<&str>| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+            v["version"] = serde_json::json!(5);
+            v["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+            v["instances"][0]["image"]["id"] = serde_json::json!(image);
+            v["instances"][0]["gpu_node"] = serde_json::json!(gpu_node);
+            v
+        };
+        let (_, calls) = a_pass_serving(vec![view(crate::config::DEFAULT_IMAGE, None)], an_empty_node).await;
+        assert!(!clones(&calls).is_empty(), "the control asked for no clone, so this test could not see a refusal: {calls:?}");
+
+        for (image, gpu_node, want, waiting) in [
+            ("debian-13", None, "image_not_offered", "a provider that offers this image"),
+            (crate::config::DEFAULT_IMAGE, Some("n9"), "unplaceable", "a provider with free capacity"),
+        ] {
+            let (sent, calls) = a_pass_serving(vec![view(image, gpu_node)], an_empty_node).await;
+            assert!(clones(&calls).is_empty(), "{want}: a refused machine was cloned: {calls:?}");
+            let report = the_report(&sent);
+            let m = &report["instances"][0];
+            assert_eq!(
+                (m["state"].as_str(), m["retryable"].as_bool(), m["outcome"].as_str(), m["waiting_on"].as_str()),
+                (Some("ERROR"), Some(false), Some(want), Some(waiting)),
+                "{report}"
+            );
+            assert!(m.get("residue").is_none_or(|r| r == &serde_json::json!([])), "{want}: a refusal carried a residue: {report}");
+        }
+    }
+
+    /// The report of each of `passes` passes over a worker Core sends Absent,
+    /// on a host where it is vm 200 on n1 holding one volume. `residue`: the
+    /// volume outlives the worker's destroy, as a storage that refuses to
+    /// free it does.
+    async fn a_worker_torn_down(passes: usize, residue: bool) -> Vec<serde_json::Value> {
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        const DISK: &str = "vmdata:vm-200-disk-0";
+        let mut view = a_worker_view(42, Some(true));
+        view["inference_workers"][0]["lifecycle"] = serde_json::json!("deleted");
+        let w = view["inference_workers"][0]["id"].as_str().unwrap().to_string();
+        let body = view.to_string();
+        let (base, mut rx) = session_stub(move |line, _| {
+            if line.starts_with("GET /provider/v1/desired-state") {
+                ("200 OK", body.clone())
+            } else {
+                ("204 No Content", String::new())
+            }
+        })
+        .await;
+        #[derive(Default)]
+        struct Host {
+            present: bool,
+            volumes: Vec<String>,
+        }
+        let host = Arc::new(Mutex::new(Host { present: true, volumes: vec![DISK.into()] }));
+        let claim = crate::names::tags(crate::names::TAG_WORKER, &w, Some("test"));
+        let stamp = crate::names::description(crate::names::TAG_WORKER, &w);
+        let h = host.clone();
+        let pve = crate::pvemock::Mock::start(move |method, path, _| {
+            if let Some(r) = crate::pvemock::task_ok(path) {
+                return r;
+            }
+            let mut h = h.lock().unwrap();
+            match (method, path) {
+                ("GET", "/nodes") => (200, serde_json::json!([{"node": "n1", "status": "online"}])),
+                ("GET", p) if p.starts_with("/cluster/resources") => (
+                    200,
+                    if h.present {
+                        serde_json::json!([{"node": "n1", "vmid": 200, "status": "stopped", "tags": claim, "type": "qemu"}])
+                    } else {
+                        serde_json::json!([])
+                    },
+                ),
+                ("GET", "/nodes/n1/qemu") => (
+                    200,
+                    if h.present { serde_json::json!([{"vmid": 200, "status": "stopped", "tags": claim}]) } else { serde_json::json!([]) },
+                ),
+                ("GET", "/nodes/n1/qemu/200/status/current") if h.present => (200, serde_json::json!({"status": "stopped"})),
+                ("GET", "/nodes/n1/qemu/200/config") if h.present => {
+                    (200, serde_json::json!({"description": stamp, "scsi0": format!("{DISK},size=20G")}))
+                }
+                ("DELETE", p) if p.starts_with("/nodes/n1/qemu/200") => {
+                    h.present = false;
+                    if !residue {
+                        h.volumes.clear();
+                    }
+                    (200, serde_json::json!("UPID:n1:destroy"))
+                }
+                // A storage that will not free the volume: asked, and kept.
+                ("DELETE", p) if p.starts_with("/nodes/n1/storage/vmdata/content") => (200, serde_json::json!("UPID:n1:free")),
+                ("GET", "/cluster/ha/resources") => (200, serde_json::json!([])),
+                ("GET", "/nodes/n1/storage/vmdata/content") => {
+                    (200, serde_json::json!(h.volumes.iter().map(|v| serde_json::json!({"volid": v})).collect::<Vec<_>>()))
+                }
+                _ => crate::pvemock::gate_clear(method, path).unwrap_or((404, serde_json::Value::Null)),
+            }
+        })
+        .await;
+        let snippets = tempfile::tempdir().unwrap();
+        let snippet_dir = snippets.path().join("snippets");
+        std::fs::create_dir_all(&snippet_dir).unwrap();
+        let cfg: AgentConfig = serde_yaml_ng::from_str(&format!(
+            "core:\n  url: {base}\n  token: t\nproxmox:\n  apiUrl: {}\n  node: n1\n  tokenId: onv@pve!agent\n  tokenSecret: s\n  snippetDir: {}\n",
+            pve.base,
+            snippet_dir.display()
+        ))
+        .expect("config");
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        let driver = pve.client();
+        let endpoints: Arc<Mutex<HashMap<String, String>>> = Default::default();
+        let held: Arc<Mutex<Option<DesiredState>>> = Default::default();
+        let wanted: Arc<Mutex<Vec<omnuv_protocol::ImageArtefact>>> = Default::default();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let mut core_poll = None;
+        let mut reports = Vec::new();
+        for _ in 0..passes {
+            let _ = reconcile_workers(&core, &driver, &cfg, &endpoints, &held, &wanted, &kick, &mut core_poll).await;
+            let mut sent = Vec::new();
+            while let Ok(r) = rx.try_recv() {
+                sent.push(r);
+            }
+            let report = the_report(&sent);
+            reports.push(report["workers"].as_array().and_then(|a| a.iter().find(|x| x["id"] == w.as_str())).cloned().unwrap_or_default());
+        }
+        assert!(!host.lock().unwrap().present, "the premise: the Absent worker was never destroyed");
+        reports
+    }
+
+    /// **A worker torn down is typed on the report a pass sends** (v0.28.0,
+    /// contract change 3): the destroy's own pass `not_proven_gone`, and the
+    /// pass that finds nothing left `deleted`, beside the words. With a
+    /// volume its storage would not free, `deleted_with_residue` and the
+    /// volume itself in `residue` on the wire.
+    #[tokio::test]
+    async fn a_worker_torn_down_is_typed_on_the_report() {
+        let reports = a_worker_torn_down(3, false).await;
+        assert_eq!(reports[0]["outcome"], serde_json::json!("not_proven_gone"), "the destroy's own pass: {reports:?}");
+        for (n, w) in reports.iter().enumerate().skip(1) {
+            assert_eq!(
+                (w["state"].as_str(), w["message"].as_str(), w["outcome"].as_str()),
+                (Some("OFFLINE"), Some("deleted"), Some("deleted")),
+                "pass {}: proven gone, and not typed so: {w}",
+                n + 1
+            );
+            assert!(w.get("residue").is_none_or(|r| r == &serde_json::json!([])), "a proof with nothing left carried a residue: {w}");
+        }
+
+        let reports = a_worker_torn_down(3, true).await;
+        let last = reports.last().unwrap();
+        assert_eq!(last["outcome"], serde_json::json!("deleted_with_residue"), "{reports:?}");
+        assert_eq!(last["residue"], serde_json::json!(["vmdata:vm-200-disk-0"]), "the residue was not on the wire: {last}");
+        assert_eq!(last["message"], serde_json::json!("deleted; residue vmdata:vm-200-disk-0"), "{last}");
+    }
+
+    /// **A refusal's code decides before its status** (protocol v0.28.0,
+    /// contract change 4), and without one every answer means what it always
+    /// did. The cases that changed: `admission_*` and `held` wait, on any
+    /// route and any status; `retry` is an outage; and a 409 `held` on an
+    /// ordinary call, which once stopped the agent, waits.
+    #[test]
+    fn a_refusal_code_decides_before_the_status() {
+        use omnuv_protocol::RefusalCode as C;
+        let view = "/provider/v1/desired-state?known=7";
+        let means = |path: &str, status: u16, code: Option<C>| {
+            refusal(&anyhow::Error::from(CoreAnswered { path: path.into(), status, code }))
+        };
+        // Unchanged without a code: the table every agent has kept.
+        for (path, status, want) in [
+            (view, 401, Refusal::Refused),
+            (view, 403, Refusal::Refused),
+            (view, 409, Refusal::Final),
+            (view, 426, Refusal::Renegotiate),
+            (view, 503, Refusal::Unreachable),
+            (view, 404, Refusal::Other),
+            (HANDSHAKE, 401, Refusal::Final),
+            (HANDSHAKE, 426, Refusal::Final),
+            (HANDSHAKE, 409, Refusal::Other),
+        ] {
+            assert_eq!(means(path, status, None), want, "{path} {status} with no code");
+        }
+        // A code decides first.
+        for code in [C::AdmissionPending, C::AdmissionClosed, C::AdmissionFull, C::Held] {
+            for (path, status) in [(view, 403), (HANDSHAKE, 403), (view, 409), (HANDSHAKE, 401)] {
+                assert_eq!(means(path, status, Some(code)), Refusal::Wait, "{path} {status} {code:?}");
+            }
+        }
+        assert_eq!(means(view, 503, Some(C::Retry)), Refusal::Unreachable);
+        assert_eq!(means(view, 409, Some(C::Superseded)), Refusal::Final);
+        // A code this build does not know is read by its status alone.
+        assert_eq!(means(view, 403, Some(C::Unknown)), Refusal::Refused);
+        // And the body Core writes is where the code comes from.
+        assert_eq!(refusal_code(br#"{"error":"x","code":"admission_pending"}"#), Some(C::AdmissionPending));
+        assert_eq!(refusal_code(br#"{"error":"x","code":"a-code-from-later"}"#), Some(C::Unknown));
+        assert_eq!(refusal_code(br#"{"error":"x"}"#), None);
+        assert_eq!(refusal_code(b"<html>bad gateway</html>"), None);
+    }
+
+    /// **The handshake and the heartbeat, after each refusal.** A 403
+    /// `admission_*` backs off and never stops, whatever the status beside
+    /// it; `held` waits out the holder on the short retry, and so does a 409
+    /// without a code, from a Core that predates codes.
+    #[test]
+    fn an_admission_refusal_is_never_final() {
+        use omnuv_protocol::RefusalCode as C;
+        for code in [C::AdmissionPending, C::AdmissionClosed, C::AdmissionFull] {
+            for status in [403u16, 401, 426] {
+                assert_eq!(handshake_next(status, Some(code)), HandshakeNext::Backoff { unreachable: false }, "{status} {code:?}");
+                assert_eq!(heartbeat_next(status, Some(code)), HeartbeatNext::Wait, "{status} {code:?}");
+            }
+        }
+        assert_eq!(handshake_next(403, None), HandshakeNext::Backoff { unreachable: false });
+        assert_eq!(handshake_next(409, None), HandshakeNext::Held);
+        assert_eq!(handshake_next(409, Some(C::Held)), HandshakeNext::Held);
+        assert_eq!(handshake_next(401, None), HandshakeNext::Stop);
+        assert_eq!(handshake_next(426, None), HandshakeNext::Stop);
+        assert_eq!(handshake_next(503, None), HandshakeNext::Backoff { unreachable: true });
+        assert_eq!(handshake_next(409, Some(C::Retry)), HandshakeNext::Backoff { unreachable: true });
+        assert_eq!(heartbeat_next(401, None), HeartbeatNext::Handshake);
+        assert_eq!(heartbeat_next(426, None), HeartbeatNext::Handshake);
+        assert_eq!(heartbeat_next(409, None), HeartbeatNext::Stop);
+        assert_eq!(heartbeat_next(409, Some(C::Held)), HeartbeatNext::Wait);
+        assert_eq!(heartbeat_next(403, None), HeartbeatNext::Log);
+        assert_eq!(heartbeat_next(500, None), HeartbeatNext::Log);
+    }
+
+    /// **A provider awaiting admission backs off and does not exit**, against
+    /// a Core answering as the design's admission does: 403
+    /// `admission_pending` to the handshake, then an approval; and to every
+    /// view and every heartbeat, 403 `admission_pending` or 409 `held`.
+    /// The handshake says this agent reads codes, comes back the moment it
+    /// is admitted, and never counts the refusal as an outage. The view's
+    /// refusal is a wait. The heartbeat beats on through both answers: a
+    /// `stop_for_good` would end this test's process with code 3, which is
+    /// what a 409 on a heartbeat did before codes were read.
+    #[tokio::test]
+    async fn a_provider_awaiting_admission_backs_off_and_never_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pending = r#"{"error":"this provider awaits an operator's approval","code":"admission_pending"}"#;
+        let held = r#"{"error":"another agent holds this provider","code":"held"}"#;
+        let beats = Arc::new(AtomicUsize::new(0));
+        let b = beats.clone();
+        let (base, mut rx) = session_stub(move |line, handshakes| {
+            if line.starts_with("POST /provider/v1/handshake") {
+                return if handshakes == 0 {
+                    ("403 Forbidden", pending.to_string())
+                } else {
+                    ("200 OK", r#"{"protocol_version":6,"provider_id":"p","heartbeat_interval_secs":30}"#.to_string())
+                };
+            }
+            if line.starts_with("POST /provider/v1/heartbeat") {
+                let n = b.fetch_add(1, Ordering::SeqCst);
+                return if n.is_multiple_of(2) { ("403 Forbidden", pending.to_string()) } else { ("409 Conflict", held.to_string()) };
+            }
+            ("403 Forbidden", pending.to_string())
+        })
+        .await;
+        let core = Core::new(&base, &omnuv_protocol::Redacted::from("t".to_string())).unwrap();
+        let outages = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let shook = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            handshake_telling(&core, &HeartbeatDriver, &|| {
+                outages.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .await
+        .expect("the handshake came back once admitted");
+        assert_eq!(shook.expect("admitted"), 30);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2), "the refusal was not backed off from");
+        assert_eq!(outages.load(Ordering::SeqCst), 0, "awaiting admission was counted as Core being unreachable");
+        let mut handshakes = Vec::new();
+        while let Ok((head, body)) = rx.try_recv() {
+            if head.starts_with("post /provider/v1/handshake") {
+                handshakes.push(body);
+            }
+        }
+        assert_eq!(handshakes.len(), 2, "{handshakes:?}");
+        let said: omnuv_protocol::Handshake = serde_json::from_str(&handshakes[0]).expect("a handshake");
+        assert!(said.refusal_codes, "the handshake did not say this agent reads codes");
+
+        let viewed = core.get_view(0).await.expect_err("a pending provider is sent no view");
+        assert_eq!(refusal(&viewed), Refusal::Wait, "{viewed:#}");
+
+        let beating = spawn_heartbeat(core, Arc::new(HeartbeatDriver), std::time::Duration::from_millis(20), "0123456789ab".into());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while beats.load(Ordering::SeqCst) < 6 {
+            assert!(tokio::time::Instant::now() < deadline, "the heartbeat stopped beating: {}", beats.load(Ordering::SeqCst));
+            assert!(!beating.is_finished(), "the heartbeat task ended");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        beating.abort();
+    }
+
+    /// **A cross-origin artefact is fetched without the agent's credential,
+    /// and a redirect off Core's origin is refused** (contract change 8).
+    /// Two servers on two ports, so two origins. Core's own artefact URL is
+    /// asked with the token and the session; one on the other origin with
+    /// neither, and its bytes still kept, since the digest is what vouches
+    /// for them; and Core's URL redirecting to the other origin fails, and
+    /// the other origin is never asked.
+    #[tokio::test]
+    async fn a_cross_origin_artefact_never_carries_the_credential() {
+        use sha2::Digest as _;
+        // SAFETY: set once, to the same value every test here sets.
+        unsafe { std::env::set_var("OMNUV_ALLOW_PLAINTEXT_CORE", "1") };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        const BYTES: &[u8] = b"an image's bytes";
+        async fn origin(redirect_to: Option<String>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else { return };
+                    let request = read_request(&mut socket).await;
+                    let head = String::from_utf8_lossy(&request).split("\r\n\r\n").next().unwrap_or_default().to_lowercase();
+                    let response = match &redirect_to {
+                        Some(to) if head.starts_with("get /redirect") => {
+                            format!("HTTP/1.1 302 Found\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").into_bytes()
+                        }
+                        _ => {
+                            let mut r = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", BYTES.len()).into_bytes();
+                            r.extend_from_slice(BYTES);
+                            r
+                        }
+                    };
+                    let _ = socket.write_all(&response).await;
+                    let _ = tx.send(head);
+                }
+            });
+            (base, rx)
+        }
+        let (other, mut other_heard) = origin(None).await;
+        let (core_base, mut core_heard) = origin(Some(format!("{other}/moved"))).await;
+        let core = Core::new(&core_base, &omnuv_protocol::Redacted::from("the-token".to_string())).unwrap();
+        crate::session::take(&core.session, &serde_json::json!({"session": "the-session"}));
+        let dir = tempfile::tempdir().unwrap();
+        let artefact = |url: String| omnuv_protocol::ImageArtefact {
+            id: "ubuntu-26.04".into(),
+            sha256: crate::images::hex(&sha2::Sha256::digest(BYTES)),
+            bytes: BYTES.len() as u64,
+            url,
+            os_family: None,
+        };
+        let idle = std::time::Duration::from_secs(10);
+        let carries = |head: &str| (head.contains("authorization:"), head.contains("onv-session:"));
+
+        let own = dir.path().join("own.qcow2");
+        core.download_artefact(&artefact(format!("{core_base}/provider/v1/images/ubuntu-26.04/artefact")), &own, idle)
+            .await
+            .expect("Core's own artefact");
+        assert_eq!(carries(&core_heard.recv().await.unwrap()), (true, true), "Core's own origin was not sent the credential");
+
+        let theirs = dir.path().join("theirs.qcow2");
+        core.download_artefact(&artefact(format!("{other}/ubuntu-26.04.qcow2")), &theirs, idle)
+            .await
+            .expect("an artefact on another origin, verified by its digest");
+        assert_eq!(std::fs::read(&theirs).unwrap(), BYTES);
+        let head = other_heard.recv().await.unwrap();
+        assert_eq!(carries(&head), (false, false), "another origin was sent this agent's credential: {head}");
+
+        let moved = dir.path().join("moved.qcow2");
+        let refused = core.download_artefact(&artefact(format!("{core_base}/redirect")), &moved, idle).await;
+        assert!(refused.is_err(), "a redirect off Core's origin was followed");
+        assert!(core_heard.recv().await.unwrap().starts_with("get /redirect"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(other_heard.try_recv().is_err(), "the other origin was asked after Core's redirect");
+        assert!(!moved.exists(), "a refused fetch left an artefact");
+
+        assert!(same_origin("https://api.omnuv.com", "https://api.omnuv.com:443/x"), "the default port is the origin's");
+        assert!(!same_origin("https://api.omnuv.com", "http://api.omnuv.com/x"), "a change of scheme kept the origin");
+        assert!(!same_origin("https://api.omnuv.com", "https://api.omnuv.com.evil.example/x"));
+        assert!(!same_origin("https://api.omnuv.com", "https://images.omnuv.com/x"));
+        assert!(!same_origin("https://api.omnuv.com", "not a url"));
+    }
+
+    /// **A heartbeat says the settings it applied only to a Core that sent
+    /// some**, from the view `get_view` read: none before a view, none after
+    /// a v0.27 view, and after a v0.28 view the hash of what was applied
+    /// (nothing yet: `crate::settings`), which is not the hash of what was
+    /// sent.
+    #[tokio::test]
+    async fn a_heartbeat_says_the_settings_it_applied_after_a_view_that_sent_some() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let said = |(line, body): (String, String)| -> Option<String> {
+            assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
+            serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat").settings_hash
+        };
+        let v28: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/from-core/protocol-v0.28/desired-state.json")).unwrap();
+        let mut v27 = v28.clone();
+        v27.as_object_mut().unwrap().remove("agent_settings");
+        let sent: omnuv_protocol::AgentSettings = serde_json::from_value(v28["agent_settings"].clone()).unwrap();
+        for (view, want) in [(v27, None), (v28, Some(omnuv_protocol::AgentSettings::default().hash()))] {
+            let (base, mut heard) = core_stub(view).await;
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
+            core_check(&core, &base, "0123456789ab").await;
+            assert_eq!(said(heard.recv().await.unwrap()), None, "a settings hash before any view");
+            core.get_view(0).await.expect("a view");
+            let _ = heard.recv().await.unwrap();
+            core_check(&core, &base, "0123456789ab").await;
+            let hash = said(heard.recv().await.unwrap());
+            assert_eq!(hash, want);
+            assert_ne!(hash, Some(sent.hash()), "settings this agent does not apply were acknowledged");
+        }
+    }
+
+    /// **The units a heartbeat names**: the agent alone. The opening
+    /// applier and the lease timer run binaries of their own (A3), so this
+    /// process vouches for neither: not when it is the installed
+    /// `/usr/bin/onv-provider`, and not when their files are missing or a
+    /// different build. The heartbeat body is read as Core reads it.
+    #[test]
+    fn the_components_are_the_ones_this_process_can_vouch_for() {
+        let body = heartbeat_body("0123456789ab", None);
+        let components = body["components"].as_array().expect("components on the wire");
+        assert_eq!(components.len(), 1, "a unit vouched for from another file: {components:?}");
+        assert_eq!(components[0]["name"], "onv-provider");
+        assert_eq!(components[0]["version"], AGENT_VERSION);
+        assert_eq!(components[0]["config_hash"], "0123456789ab");
+        for other in ["onv-opening", "onv-lease-expire"] {
+            assert!(
+                !components.iter().any(|c| c["name"] == other),
+                "{other} runs its own binary; this process cannot say what it runs"
+            );
+        }
+    }
+
+    /// **A destination this agent does not know is acted on not at all**
+    /// (v0.28.0, contract change 12): a machine and a worker whose lifecycle
+    /// is a word from a newer Core are neither built, started, stopped nor
+    /// removed, not reported, and the pass says it did not cover them. The
+    /// control: the same views with `running` build both.
+    #[tokio::test]
+    async fn an_unknown_destination_is_acted_on_not_at_all() {
+        let view = |lifecycle: &str| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).unwrap();
+            v["version"] = serde_json::json!(5);
+            v["protocol_version"] = serde_json::json!(omnuv_protocol::PROTOCOL_VERSION);
+            v["instances"][0]["lifecycle"] = serde_json::json!(lifecycle);
+            v
+        };
+        let (_, calls) = a_pass_serving(vec![view("running"), view("running")], an_empty_node).await;
+        assert!(!clones(&calls).is_empty(), "the control asked for no clone, so this test could not see one: {calls:?}");
+        let (sent, calls) = a_pass_serving(vec![view("hibernating"), view("hibernating")], an_empty_node).await;
+        let writes: Vec<_> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
+        assert!(writes.is_empty(), "an unknown destination was acted on: {writes:?}");
+        // Not even considered for a build: a build's gate reads the view
+        // again (S8), and that gate is what would have refused it here, so
+        // the one view the pass read is the whole of Core's part in it.
+        let views = sent.iter().filter(|(h, _)| h.starts_with("get /provider/v1/desired-state")).count();
+        assert_eq!(views, 1, "an unknown destination was taken towards a build, its view read again");
+        let report = the_report(&sent);
+        assert_eq!(report["instances"], serde_json::json!([]), "{report}");
+        assert_eq!(report["observation"]["complete"], serde_json::json!(false), "{report}");
+
+        let mut worker = a_worker_view(5, None);
+        worker["inference_workers"][0]["lifecycle"] = serde_json::json!("hibernating");
+        let (sent, calls) = a_pass_serving(vec![worker.clone(), worker], an_empty_node_for_a_worker).await;
+        let writes: Vec<_> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
+        assert!(writes.is_empty(), "a worker's unknown destination was acted on: {writes:?}");
+        let views = sent.iter().filter(|(h, _)| h.starts_with("get /provider/v1/desired-state")).count();
+        assert_eq!(views, 1, "a worker's unknown destination was taken towards a build, its view read again");
+        let report = the_report(&sent);
+        assert_eq!(report["workers"], serde_json::json!([]), "{report}");
+        assert_eq!(report["observation"]["complete"], serde_json::json!(false), "{report}");
     }
 
     /// The loop is re-armed when Core's poll moved, and only then.
@@ -2765,6 +3460,28 @@ mod handshake_tests {
     }
 }
 
+/// **What this agent says at its handshake**: the protocol's own type since
+/// v0.28.0 (contract change 1), with the keys every agent has sent and
+/// `refusal_codes`, since this agent reads a refusal's code.
+fn handshake_body(kind: omnuv_protocol::RuntimeKind) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(omnuv_protocol::Handshake {
+        agent_version: AGENT_VERSION.to_string(),
+        // **A range, not a point**, and the same defect Core had from the other
+        // side: advertising only the current version means a Core that has not
+        // been upgraded yet — or one rolled back — finds no common version and
+        // refuses an agent that could have spoken its dialect perfectly well.
+        // Core picks the highest both sides list.
+        protocol_versions: (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION).collect(),
+        drivers: omnuv_protocol::Drivers { compute: vec![kind.as_str().to_string()] },
+        // What this agent can do that an older one could not (lifecycle phase
+        // 7, S12). Core relies on none of it unless it is listed here, and a
+        // Core from before it reads none of it.
+        capabilities: crate::session::CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+        // This agent reads a refusal's `code` (`refusal`, `handshake_next`).
+        refusal_codes: true,
+    })?)
+}
+
 async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u64> {
     handshake_telling(core, driver, &|| {}).await
 }
@@ -2773,22 +3490,7 @@ async fn handshake(core: &Core, driver: &impl ComputeDriver) -> anyhow::Result<u
 /// unreachable: no answer, 5xx or 429 (`Refusal::Unreachable`). Not a 409:
 /// Core is up and another agent holds this provider.
 async fn handshake_telling(core: &Core, driver: &impl ComputeDriver, unreachable: &(dyn Fn() + Sync)) -> anyhow::Result<u64> {
-    let body = serde_json::json!({
-        "agent_version": AGENT_VERSION,
-        // **A range, not a point**, and the same defect Core had from the other
-        // side: advertising only the current version means a Core that has not
-        // been upgraded yet — or one rolled back — finds no common version and
-        // refuses an agent that could have spoken its dialect perfectly well.
-        // Core picks the highest both sides list.
-        "protocol_versions":
-            (omnuv_protocol::MINIMUM_PROTOCOL_VERSION..=omnuv_protocol::PROTOCOL_VERSION)
-                .collect::<Vec<_>>(),
-        "drivers": { "compute": [driver.kind().as_str()] },
-        // What this agent can do that an older one could not (lifecycle phase
-        // 7, S12). Core relies on none of it unless it is listed here, and a
-        // Core from before it reads none of it.
-        "capabilities": crate::session::CAPABILITIES,
-    });
+    let body = handshake_body(driver.kind())?;
 
     // Core may simply not be up yet at boot; keep trying with a bounded backoff.
     let mut delay = 2u64;
@@ -2796,15 +3498,7 @@ async fn handshake_telling(core: &Core, driver: &impl ComputeDriver, unreachable
         match core.post(HANDSHAKE, Some(body.clone())).await {
             Ok(r) if r.status().is_success() => {
                 let v: serde_json::Value = r.json().await?;
-                let secs = heartbeat_secs(&v);
-                // The session this agent now holds its provider under, or
-                // none from a Core that mints none: then no header is sent.
-                let session = crate::session::take(&core.session, &v);
-                // Whether this Core holds restores (lifecycle phase 8): only
-                // then is this agent's own detection armed.
-                crate::restore::arm(&core.restore, &v);
-                // D35: the period to report at, before the first view says it.
-                core.report.answer(&v);
+                let (secs, session) = heard_handshake(core, &v);
                 println!(
                     "handshake ok: provider {} protocol v{} heartbeat {}s session {}",
                     v.get("provider_id").and_then(|x| x.as_str()).unwrap_or("?"),
@@ -2815,27 +3509,35 @@ async fn handshake_telling(core: &Core, driver: &impl ComputeDriver, unreachable
                 return Ok(secs);
             }
             Ok(r) => {
-                let status = r.status();
-                let detail = r.text().await.unwrap_or_default();
-                eprintln!("handshake rejected ({status}): {detail}");
-                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::UPGRADE_REQUIRED {
-                    return Err(anyhow::Error::from(CoreAnswered { path: HANDSHAKE.into(), status: status.as_u16() })
-                        .context(if status == reqwest::StatusCode::UNAUTHORIZED {
-                            "enrollment token rejected; re-enrol this provider"
-                        } else {
-                            "Core requires a newer protocol than this agent speaks"
-                        }));
-                }
-                // **Held by another agent** (lifecycle phase 7): Core is up
-                // and answering, and the wait ends when the holder's lease
-                // does, so it is asked again every few seconds rather than on
-                // a back-off grown for an unreachable Core.
-                if status == reqwest::StatusCode::CONFLICT {
-                    tokio::time::sleep(HELD_RETRY).await;
-                    continue;
-                }
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    unreachable();
+                let (answered, detail) = CoreAnswered::read(HANDSHAKE, r).await;
+                eprintln!("handshake rejected ({answered}): {detail}");
+                match handshake_next(answered.status, answered.code) {
+                    HandshakeNext::Stop => {
+                        let why = match answered.status {
+                            401 => "enrollment token rejected; re-enrol this provider",
+                            426 => "Core requires a newer protocol than this agent speaks",
+                            _ => "Core refused this agent's handshake for good",
+                        };
+                        return Err(anyhow::Error::from(answered).context(why));
+                    }
+                    // **Held by another agent** (lifecycle phase 7): Core is
+                    // up and answering, and the wait ends when the holder's
+                    // lease does, so it is asked again every few seconds
+                    // rather than on a back-off grown for an unreachable Core.
+                    HandshakeNext::Held => {
+                        tokio::time::sleep(HELD_RETRY).await;
+                        continue;
+                    }
+                    HandshakeNext::Backoff { unreachable: true } => unreachable(),
+                    HandshakeNext::Backoff { unreachable: false } => {
+                        // **Awaiting admission is never final** (v0.28.0,
+                        // Core's C1): an approval reaches this agent at its
+                        // next ask, without a restart.
+                        let means = omnuv_protocol::answer_means(HANDSHAKE, answered.status, answered.code);
+                        if means == omnuv_protocol::AnswerMeans::Wait {
+                            println!("handshake: this provider is not admitted yet ({answered}); asking again in {delay}s");
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -2845,6 +3547,53 @@ async fn handshake_telling(core: &Core, driver: &impl ComputeDriver, unreachable
         }
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         delay = (delay * 2).min(60);
+    }
+}
+
+/// **What this agent takes from Core's answer to a handshake**: the heartbeat
+/// period, which it returns with the session it now holds. One function, so
+/// the goldens (`crate::goldens`) read an answer exactly as a handshake does.
+fn heard_handshake(core: &Core, v: &serde_json::Value) -> (u64, Option<String>) {
+    let secs = heartbeat_secs(v);
+    // The session this agent now holds its provider under, or none from a
+    // Core that mints none: then no header is sent.
+    let session = crate::session::take(&core.session, v);
+    // Whether this Core holds restores (lifecycle phase 8): only then is
+    // this agent's own detection armed.
+    crate::restore::arm(&core.restore, v);
+    // D35: the period to report at, before the first view says it.
+    core.report.answer(v);
+    // What this Core serves (v0.28.0), typed; a Core whose answer is not the
+    // protocol's type said nothing of it.
+    *crate::poison::lock(&core.accepted, "handshake answer") =
+        serde_json::from_value::<omnuv_protocol::HandshakeAccepted>(v.clone()).ok();
+    (secs, session)
+}
+
+/// What the handshake does after a refusal.
+#[derive(Debug, PartialEq, Eq)]
+enum HandshakeNext {
+    /// Final: the agent stops, and says why.
+    Stop,
+    /// Another agent holds the provider: asked again in `HELD_RETRY`.
+    Held,
+    /// Asked again on the growing back-off; `unreachable` when Core is
+    /// unwell, which the held view counts (A6).
+    Backoff { unreachable: bool },
+}
+
+/// **The handshake's reading of a refusal**, by the protocol's table
+/// (`answer_means`): final stops; `held`, or a 409 with no code (a Core that
+/// predates codes), waits out the holder; an outage, and anything else, backs
+/// off. A 403 `admission_*` is a wait, and so a back-off, never a stop.
+fn handshake_next(status: u16, code: Option<omnuv_protocol::RefusalCode>) -> HandshakeNext {
+    use omnuv_protocol::{AnswerMeans, RefusalCode};
+    match omnuv_protocol::answer_means(HANDSHAKE, status, code) {
+        AnswerMeans::Final => HandshakeNext::Stop,
+        AnswerMeans::Wait if code == Some(RefusalCode::Held) => HandshakeNext::Held,
+        AnswerMeans::Other if status == 409 => HandshakeNext::Held,
+        AnswerMeans::Unavailable => HandshakeNext::Backoff { unreachable: true },
+        _ => HandshakeNext::Backoff { unreachable: false },
     }
 }
 
@@ -2899,7 +3648,7 @@ async fn mirror_images(
     for vmid in crate::images::ensure_environment_tags(driver, node, &offered).await {
         eprintln!("image mirror: template {vmid} tagged with its environment");
     }
-    let wanted = crate::images::outstanding(catalogue, &offered, &held);
+    let wanted = crate::images::outstanding(catalogue, &offered, &held, node);
 
     let dir = std::path::Path::new(&cfg.proxmox.snippet_dir)
         .parent()
@@ -3138,6 +3887,9 @@ async fn reconcile_workers(
     // download finished. Writing the catalogue and waking the mirror costs a
     // lock and a notify.
     if !desired.images.is_empty() {
+        // Each image's family as the catalogue says it (v0.28.0), before the
+        // mirror or a survey asks what shape a template should have.
+        driver.hear_catalogue(&desired.images);
         crate::poison::lock(mirror_wanted, "image catalogue").clone_from(&desired.images);
         mirror_kick.notify_one();
     }
@@ -3212,6 +3964,14 @@ async fn reconcile_workers(
     let mut statuses = Vec::new();
     let mut unobserved_workers = 0usize;
     for spec in &desired.inference_workers {
+        // **A destination this build does not know** (v0.28.0, contract
+        // change 12): acted on not at all, and not reported, so the pass is
+        // incomplete rather than silent about it.
+        if spec.intent == Lifecycle::Unknown {
+            unobserved_workers += 1;
+            eprintln!("worker {}: a destination this agent does not know; nothing done", spec.id);
+            continue;
+        }
         let result = match spec.intent {
             Lifecycle::Absent => driver
                 .delete_inference_worker(&spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
@@ -3227,6 +3987,8 @@ async fn reconcile_workers(
                     diagnostics: None,
                     message: Some(crate::teardown::said(&gone)),
                     telemetry: None,
+                    outcome: crate::teardown::outcome(&gone).0,
+                    residue: crate::teardown::outcome(&gone).1,
                 }),
             // **Never built again under an id this agent tore down** (the
             // model's G_agentTomb, lifecycle phase 7).
@@ -3279,6 +4041,8 @@ async fn reconcile_workers(
                 diagnostics: None,
                 message: Some(e.to_string().chars().take(400).collect()),
                 telemetry: None,
+                outcome: None,
+                residue: Vec::new(),
             }
         }));
     }
@@ -3366,6 +4130,13 @@ async fn reconcile_workers(
     let mut instances = Vec::new();
     let mut unobserved_instances = 0usize;
     for spec in &desired.instances {
+        // As for a worker above: an unknown destination is acted on not at
+        // all, neither started, stopped nor removed.
+        if spec.intent == Lifecycle::Unknown {
+            unobserved_instances += 1;
+            eprintln!("instance {}: a destination this agent does not know; nothing done", spec.id);
+            continue;
+        }
         let result = match spec.intent {
             Lifecycle::Absent => driver
                 .delete_instance(node, &spec.id, &cfg.proxmox.snippet_dir, &live_tags, still_absent(core, held, &spec.id))
@@ -3397,6 +4168,8 @@ async fn reconcile_workers(
                 message: Some(crate::teardown::said(&gone)),
                 recipe_progress: None,
                 ready_to_start: None,
+                outcome: crate::teardown::outcome(&gone).0,
+                residue: crate::teardown::outcome(&gone).1,
             }),
             // **Never built again under an id this agent tore down** (the
             // model's G_agentTomb, lifecycle phase 7): a view that names it
@@ -3431,7 +4204,7 @@ async fn reconcile_workers(
                         )
                         .await
                 }
-                None => Err(anyhow::anyhow!("image {} is not offered by this provider", spec.image.id)),
+                None => Err(anyhow::Error::new(crate::instance::ImageNotOffered { image: spec.image.id.clone() })),
             },
         };
         // **What was seen, what was not, and what failed (PROVIDER-26).**
@@ -3462,6 +4235,8 @@ async fn reconcile_workers(
                         message: Some(seen.cause.chars().take(400).collect()),
                         recipe_progress: None,
                         ready_to_start: None,
+                        outcome: None,
+                        residue: Vec::new(),
                     })
                 }
                 Err(e) => Err(e),
@@ -3496,13 +4271,19 @@ async fn reconcile_workers(
             // recycled VMID. Measured on Pluto, 19 September 2026.
             //
             // `Unplaceable` carries the same fact as a type, which a rename
-            // cannot break. The image refusal is still a phrase and is still
-            // the hazard; it is left as one deliberately rather than changed
-            // blind, because it lives in a different function and deserves its
-            // own change.
+            // cannot break, and so since v0.28.0 does the image refusal
+            // (`ImageNotOffered`).
             let unplaceable = e.downcast_ref::<crate::instance::Unplaceable>();
-            let no_image = why.contains("is not offered by this provider");
+            let no_image = e.downcast_ref::<crate::instance::ImageNotOffered>().is_some();
             let retryable = !(no_image || unplaceable.is_some());
+            // **And typed on the wire** (v0.28.0, contract change 3), from
+            // the same two types: a Core that reads `outcome` no longer
+            // depends on the words, which stay for one that does not.
+            let outcome = if no_image {
+                Some(omnuv_protocol::StatusOutcome::ImageNotOffered)
+            } else {
+                unplaceable.map(|_| omnuv_protocol::StatusOutcome::Unplaceable)
+            };
             InstanceStatus {
                 id: spec.id.clone(),
                 rebooted_token: None,
@@ -3522,6 +4303,8 @@ async fn reconcile_workers(
                 message: Some(why.chars().take(400).collect()),
                 recipe_progress: None,
                 ready_to_start: None,
+                outcome,
+                residue: Vec::new(),
             }
         }));
     }

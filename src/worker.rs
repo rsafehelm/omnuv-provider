@@ -73,25 +73,13 @@ impl BuiltViews {
     }
 }
 
-/// The workers a view's body sends as built: `"built": true` on a worker.
-/// A Core that predates it sends none, and every worker reads as not built,
-/// as it always has. A body this cannot read names none; the protocol's own
-/// read of it is what fails, and says why.
-pub(crate) fn built_workers(body: &[u8]) -> std::collections::BTreeSet<String> {
-    #[derive(Deserialize)]
-    struct Worker {
-        id: String,
-        #[serde(default)]
-        built: bool,
-    }
-    #[derive(Deserialize)]
-    struct View {
-        #[serde(default)]
-        inference_workers: Vec<Worker>,
-    }
-    serde_json::from_slice::<View>(body)
-        .map(|v| v.inference_workers.into_iter().filter(|w| w.built).map(|w| w.id).collect())
-        .unwrap_or_default()
+/// The workers a view sends as built: `InferenceWorkerSpec::built`, typed
+/// since protocol v0.28.0 (contract change 2) with the bytes Core has sent
+/// since 0205, `"built": true` beside a worker's fields. It was read by
+/// parsing the view's body a second time until then. A Core that predates it
+/// sends none, and every worker reads as not built, as it always has.
+pub(crate) fn built_workers(view: &omnuv_protocol::DesiredState) -> std::collections::BTreeSet<String> {
+    view.inference_workers.iter().filter(|w| w.built).map(|w| w.id.clone()).collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,9 +126,22 @@ pub(crate) fn mapping_name(pci: &str) -> String {
 /// has none, and a worker it builds downloads without a check.
 const WORKLOADD_SHA256: Option<&str> = option_env!("OMNUV_WORKLOADD_SHA256");
 
+/// **The digest this build's workers verify**, as `Heartbeat::workloadd_sha256`
+/// says it (protocol v0.28.0, contract change 11): lowercase hex, and only one
+/// `workloadd_check` would actually write into a first boot, so Core is never
+/// told of a check no worker makes.
+pub(crate) fn workloadd_sha256() -> Option<String> {
+    valid_sha256(WORKLOADD_SHA256).map(str::to_ascii_lowercase)
+}
+
+/// A SHA-256 as `sha256sum -c` takes it: 64 hex digits.
+fn valid_sha256(sha256: Option<&str>) -> Option<&str> {
+    sha256.filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// The shell fragment that refuses a download that is not that binary.
 fn workloadd_check(sha256: Option<&str>) -> String {
-    match sha256.filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())) {
+    match valid_sha256(sha256) {
         Some(sha) => format!(" && echo '{sha}  /usr/local/bin/onv-workloadd.new' | sha256sum -c --quiet -"),
         None => String::new(),
     }
@@ -563,6 +564,8 @@ impl Client {
                     _ => None,
                 },
                 telemetry: telemetry.clone(),
+                outcome: None,
+                residue: Vec::new(),
             });
         }
 
@@ -588,6 +591,8 @@ impl Client {
                     owed.waiting_on()
                 )),
                 telemetry: None,
+                outcome: None,
+                residue: Vec::new(),
             });
         }
         // **Nor beside another agent's clone** (finding 8 of the lifecycle
@@ -614,6 +619,8 @@ impl Client {
                     named.join(", ")
                 )),
                 telemetry: None,
+                outcome: None,
+                residue: Vec::new(),
             });
         }
 
@@ -639,6 +646,10 @@ impl Client {
                     diagnostics: None,
                     message: Some(LOST_WORKER.into()),
                     telemetry: None,
+                    // The words for a Core that predates the typed field;
+                    // the type for one that reads it (v0.28.0, change 3).
+                    outcome: Some(omnuv_protocol::StatusOutcome::Lost),
+                    residue: Vec::new(),
                 });
             }
             Some(false) => {}
@@ -843,6 +854,8 @@ impl Client {
             diagnostics: None,
             message: Some(format!("vm {vmid} created and started")),
             telemetry: None,
+            outcome: None,
+            residue: Vec::new(),
         })
     }
 
@@ -1126,6 +1139,7 @@ mod tests {
             gpu_local_ids: vec![],
             gpu_node: None,
             port: 8000,
+            built: false,
         };
         let ci = super::cloud_init(&spec, "https://api.example.com/");
 
@@ -1201,6 +1215,7 @@ mod workload_agent_tests {
             gpu_node: None,
             port: 8000,
             budget_secs: None,
+            built: false,
         }
     }
 
@@ -1371,6 +1386,7 @@ mod workload_unit_tests {
                 gpu_node: None,
                 port: 8000,
                 budget_secs: None,
+                built: false,
             },
             "https://api.omnuv.com",
         )
@@ -1449,6 +1465,7 @@ mod a_worker_is_claimed_before_it_can_fail {
             gpu_node: None,
             port: 8000,
             budget_secs: None,
+            built: false,
         }
     }
 
@@ -1520,6 +1537,7 @@ mod a_worker_sent_built_is_looked_for {
             gpu_node: None,
             port: 8000,
             budget_secs: None,
+            built: false,
         }
     }
 
@@ -1681,12 +1699,14 @@ mod a_worker_sent_built_is_looked_for {
             ]
         })
         .to_string();
-        let built = super::built_workers(body.as_bytes());
-        assert_eq!(built.into_iter().collect::<Vec<_>>(), vec!["a".to_string()]);
         let view: omnuv_protocol::DesiredState = serde_json::from_slice(body.as_bytes()).expect("the protocol's read");
         assert_eq!(view.inference_workers.len(), 3);
-        assert!(super::built_workers(br#"{"version": 1}"#).is_empty(), "a view with no workers named one");
-        assert!(super::built_workers(b"not json").is_empty(), "a body that cannot be read named one");
+        let built = super::built_workers(&view);
+        assert_eq!(built.into_iter().collect::<Vec<_>>(), vec!["a".to_string()]);
+        let none: omnuv_protocol::DesiredState = serde_json::from_value(serde_json::json!({
+            "protocol_version": omnuv_protocol::PROTOCOL_VERSION, "version": 1, "unchanged": false, "instances": []
+        })).expect("a view with no workers");
+        assert!(super::built_workers(&none).is_empty(), "a view with no workers named one");
 
         let mut views = super::BuiltViews::default();
         views.heard(7, ["a".to_string()].into());
@@ -1766,6 +1786,7 @@ mod a_worker_takes_its_new_configuration {
             gpu_node: None,
             port: 8000,
             budget_secs: None,
+            built: false,
         }
     }
 

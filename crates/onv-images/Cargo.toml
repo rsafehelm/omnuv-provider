@@ -14,7 +14,7 @@ doctest = false
 
 # The versions the agent already locks; this crate adds none to the build.
 [dependencies]
-omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.28.0" }
 onv-agent-lib = { path = "../onv-agent-lib" }
 anyhow = "1"
 serde_json = "1"

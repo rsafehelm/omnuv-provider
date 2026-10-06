@@ -1,0 +1,32 @@
+{
+  "headers": {
+    "session": "onv-session",
+    "run_lease": "onv-run-lease",
+    "restore": "onv-restore",
+    "restore_detected": "onv-restore-detected",
+    "report_interval": "onv-report-interval"
+  },
+  "routes": {
+    "handshake": "/provider/v1/handshake",
+    "inventory": "/provider/v1/inventory",
+    "heartbeat": "/provider/v1/heartbeat",
+    "session": "/provider/v1/session",
+    "desired_state": "/provider/v1/desired-state",
+    "status": "/provider/v1/status",
+    "tunnel": "/provider/v1/tunnel",
+    "scrubs": "/provider/v1/scrubs",
+    "leave": "/provider/v1/leave",
+    "image_artefact": "/provider/v1/images/{id}/artefact"
+  },
+  "query_known": "known",
+  "capabilities": [
+    "session",
+    "proven-delete",
+    "restore-mode",
+    "run-lease",
+    "worker-lost",
+    "group-prepare",
+    "card-scrub",
+    "report-interval"
+  ]
+}

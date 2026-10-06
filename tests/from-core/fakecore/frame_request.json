@@ -1,0 +1,7 @@
+{
+  "t": "request",
+  "id": "onvt-r1",
+  "worker_id": "onvt-worker-1",
+  "path": "/v1/chat/completions",
+  "body": "{\"model\":\"llama-small\"}"
+}

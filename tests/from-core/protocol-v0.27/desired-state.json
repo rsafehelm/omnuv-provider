@@ -1,0 +1,63 @@
+{
+  "protocol_version": 6,
+  "version": 57,
+  "unchanged": false,
+  "inference_workers": [
+    {
+      "budget_secs": 900,
+      "id": "77777777-7777-7777-7777-777777777777",
+      "lifecycle": "running",
+      "image": "ubuntu-2604-nvidia",
+      "model_repo": "Qwen/Qwen3-8B",
+      "vllm_args": [
+        "--max-model-len",
+        "8192"
+      ],
+      "vcpus": 8,
+      "memory_mib": 32768,
+      "disk_gib": 120,
+      "gpu_local_ids": [
+        "0000:01:00.0"
+      ],
+      "gpu_node": "pluto",
+      "port": 8000,
+      "built": true
+    }
+  ],
+  "instances": [
+    {
+      "budget_secs": null,
+      "id": "55555555-5555-5555-5555-555555555555",
+      "lifecycle": "running",
+      "name": "gpu-2",
+      "image": {
+        "id": "windows-11-gaming",
+        "os_family": "windows",
+        "first_boot": "cloudbase-init",
+        "default_user": "omnuv",
+        "auth_mode": "password"
+      },
+      "vcpus": 4,
+      "memory_mib": 16384,
+      "disk_gib": 100,
+      "ssh_keys": [],
+      "console_password_hash": null,
+      "console_password_generation": 0,
+      "built": false,
+      "gpu_local_ids": [],
+      "reboot_token": null,
+      "network": null,
+      "recipe": null,
+      "overlay": null
+    }
+  ],
+  "images": [
+    {
+      "id": "windows-11-gaming",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "bytes": 21474836480,
+      "url": "https://api.omnuv.com/provider/v1/images/windows-11-gaming/artefact"
+    }
+  ],
+  "poll_interval_secs": 30
+}

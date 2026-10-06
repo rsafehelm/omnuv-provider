@@ -1,0 +1,12 @@
+{
+  "scrubs": [
+    {
+      "id": "6f1c2f2e-58a4-4b43-9b0a-0d7b6c3c1d11",
+      "attempt": 1,
+      "card": "0000:01:00.0",
+      "node": "pluto",
+      "model": "GA102 [GeForce RTX 3090]",
+      "image": "scrub-nvidia"
+    }
+  ]
+}

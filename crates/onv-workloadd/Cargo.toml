@@ -28,6 +28,13 @@ path = "src/main.rs"
 # The versions the agent already locks, with the features the agent asks of
 # them; this crate adds none to the build.
 [dependencies]
+# **Pinned at v0.27.0 on purpose, while the agent speaks v0.28.0** (omnuv's
+# modular design, A7, from A2's review). Following the agent through the
+# shared lock would move this binary's digest, and with it every inference
+# worker's snippet: each running worker would reboot once for a protocol
+# change it does not use (it reads none of v0.28.0's fields). The lock holds
+# both tags; packaging/workloadd-closure.txt records this one, so moving it
+# fails the check until it is re-recorded on purpose, with the reboot said.
 omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
 anyhow = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider"] }

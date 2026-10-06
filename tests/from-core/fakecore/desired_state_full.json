@@ -1,0 +1,83 @@
+{
+  "protocol_version": 6,
+  "version": 41,
+  "unchanged": false,
+  "inference_workers": [
+    {
+      "budget_secs": 3600,
+      "id": "onvt-worker-1",
+      "lifecycle": "running",
+      "image": "vllm/vllm-openai:v0.10.0",
+      "model_repo": "Qwen/Qwen2.5-1.5B-Instruct",
+      "vllm_args": [
+        "--max-model-len",
+        "4096"
+      ],
+      "vcpus": 8,
+      "memory_mib": 32768,
+      "disk_gib": 200,
+      "gpu_local_ids": [
+        "0000:01:00.0"
+      ],
+      "port": 8000
+    }
+  ],
+  "instances": [
+    {
+      "budget_secs": 7200,
+      "id": "onvt-instance-1",
+      "lifecycle": "running",
+      "name": "gpu-1",
+      "image": {
+        "id": "ubuntu-26.04",
+        "os_family": "linux",
+        "first_boot": "cloud-init",
+        "default_user": "ubuntu",
+        "auth_mode": "ssh-key"
+      },
+      "vcpus": 4,
+      "memory_mib": 16384,
+      "disk_gib": 100,
+      "ssh_keys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA onvt"
+      ],
+      "console_password_hash": "$6$onvt$fixture",
+      "console_password_generation": 2,
+      "built": true,
+      "gpu_local_ids": [
+        "0000:02:00.0"
+      ],
+      "reboot_token": "onvt-reboot-1",
+      "network": {
+        "network_id": "onvt-network-1",
+        "dns_name": "gpu-1-5e30afa9",
+        "mac": "BC:24:11:00:00:01"
+      },
+      "recipe": {
+        "id": "ollama-openwebui",
+        "compose": "services: {}\n",
+        "gpu": true,
+        "post_up": [
+          "echo onvt"
+        ]
+      },
+      "overlay": {
+        "setup_key": "onvt-setup-key",
+        "management_url": "https://overlay.test.omnuv.com",
+        "hostname": "gpu-1-5e30afa9"
+      },
+      "certificate": {
+        "core_url": "https://api.test.omnuv.com",
+        "bootstrap_token": "onvt-certificate-bootstrap"
+      }
+    }
+  ],
+  "images": [
+    {
+      "id": "ubuntu-26.04",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "bytes": 2147483648,
+      "url": "https://api.test.omnuv.com/provider/v1/images/ubuntu-26.04"
+    }
+  ]
+}

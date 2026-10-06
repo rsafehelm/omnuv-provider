@@ -380,6 +380,7 @@ mod tests {
                 .collect(),
             images: vec![],
             poll_interval_secs: None,
+            agent_settings: None,
         }
     }
 
