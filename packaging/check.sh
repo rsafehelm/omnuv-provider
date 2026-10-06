@@ -87,7 +87,8 @@ step "Maintainer scripts and the build script pass shellcheck"
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm packaging/deb/DEBIAN/postrm \
     packaging/build-deb.sh packaging/check.sh packaging/baselines.sh crates/onv-generators/guest/onv-certificate.sh \
-    tests/opening/nft_test.sh tests/opening/in_container.sh
+    tests/opening/nft_test.sh tests/opening/in_container.sh \
+    tests/logs/rotate_test.sh tests/logs/in_container.sh
 
 # The script a web machine runs to fetch its project's certificate rides in
 # its first-boot data, so this package never installs it: it is run instead,
@@ -157,6 +158,20 @@ grep -q '^ *systemctl enable --now onv-opening.path' <<< "$postinst"
 grep -q 'nft delete table inet onv_opening' <<< "$(dpkg-deb -I "$deb" prerm)"
 tests/opening/nft_test.sh "$out/root/usr/bin/onv-provider" > "$out/opening.log" 2>&1 || { cat "$out/opening.log"; exit 1; }
 grep -q '^opening: every case passed$' "$out/opening.log"
+
+# Supervision and log bounds (omnuv's modular design, A4): the journal's cap
+# and the logs' rotation shipped as conffiles; then, in a disposable
+# container, logrotate rotates /var/log/onv with the package's own file, the
+# packaged binary appends to the new audit log, and systemd loads the agent's
+# unit with nothing to say (tests/logs/).
+step "The package caps the journal and rotates its logs, and systemd loads its unit"
+grep -q ' ./etc/logrotate.d/onv-provider$' <<< "$listing"
+grep -q ' ./etc/systemd/journald.conf.d/60-onv-provider.conf$' <<< "$listing"
+conffiles="$(dpkg-deb -I "$deb" conffiles)"
+grep -qx '/etc/logrotate.d/onv-provider' <<< "$conffiles"
+grep -qx '/etc/systemd/journald.conf.d/60-onv-provider.conf' <<< "$conffiles"
+tests/logs/rotate_test.sh "$out/root" > "$out/logs.log" 2>&1 || { cat "$out/logs.log"; exit 1; }
+grep -q '^logs: every case passed$' "$out/logs.log"
 
 step "The Workload Agent is built, static, and starts"
 kind="$(file "$out/workloadd/onv-workloadd")"

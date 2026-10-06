@@ -119,7 +119,7 @@ impl Client {
         audit::record("console.open", "core", instance_id, "ok", Some(&format!("vmid={}", vm.vmid)));
 
         let id = instance_id.to_string();
-        tokio::spawn(async move {
+        onv_core_link::supervise::spawn("console (terminal)", async move {
             // termproxy drops a session it has not heard from; the same
             // interval the hypervisor's own console uses.
             let mut ping = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -190,7 +190,7 @@ impl Client {
         audit::record("console.open", "core", instance_id, "ok", Some(&format!("vmid={vmid} kind=vnc")));
 
         let id = instance_id.to_string();
-        tokio::spawn(async move {
+        onv_core_link::supervise::spawn("console (screen)", async move {
             loop {
                 tokio::select! {
                     msg = stream.next() => match msg {

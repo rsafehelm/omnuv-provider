@@ -5,5 +5,9 @@
 //! design, work package A1b). The Proxmox consoles behind `ConsoleOpener` stay
 //! with the driver in the agent.
 
+// Tests spawn directly; production code spawns through
+// onv_core_link::supervise (clippy.toml, A4).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod console;
 pub mod tunnel;

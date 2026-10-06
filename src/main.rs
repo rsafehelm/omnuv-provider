@@ -1,3 +1,6 @@
+// Tests spawn directly; production code spawns through
+// onv_core_link::supervise (clippy.toml, A4).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 use onv_agent_lib::names;
 use onv_driver_proxmox::snippets;
 mod agent;

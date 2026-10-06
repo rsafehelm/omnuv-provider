@@ -1,0 +1,8 @@
+# **Every task is spawned through onv_core_link::supervise** (omnuv's modular
+# design, A4): a bare spawn whose handle is dropped turns a panic into
+# silence. Test code may spawn directly; each crate root allows it under
+# cfg(test).
+disallowed-methods = [
+    { path = "tokio::task::spawn", reason = "spawn through onv_core_link::supervise::spawn, so a panic exits 70 (A4)" },
+    { path = "tokio::spawn", reason = "spawn through onv_core_link::supervise::spawn, so a panic exits 70 (A4)" },
+]
