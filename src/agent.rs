@@ -3245,6 +3245,11 @@ mod handshake_tests {
         let (sent, calls) = a_pass_serving(vec![view("hibernating"), view("hibernating")], an_empty_node).await;
         let writes: Vec<_> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
         assert!(writes.is_empty(), "an unknown destination was acted on: {writes:?}");
+        // Not even considered for a build: a build's gate reads the view
+        // again (S8), and that gate is what would have refused it here, so
+        // the one view the pass read is the whole of Core's part in it.
+        let views = sent.iter().filter(|(h, _)| h.starts_with("get /provider/v1/desired-state")).count();
+        assert_eq!(views, 1, "an unknown destination was taken towards a build, its view read again");
         let report = the_report(&sent);
         assert_eq!(report["instances"], serde_json::json!([]), "{report}");
         assert_eq!(report["observation"]["complete"], serde_json::json!(false), "{report}");
@@ -3254,6 +3259,8 @@ mod handshake_tests {
         let (sent, calls) = a_pass_serving(vec![worker.clone(), worker], an_empty_node_for_a_worker).await;
         let writes: Vec<_> = calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
         assert!(writes.is_empty(), "a worker's unknown destination was acted on: {writes:?}");
+        let views = sent.iter().filter(|(h, _)| h.starts_with("get /provider/v1/desired-state")).count();
+        assert_eq!(views, 1, "a worker's unknown destination was taken towards a build, its view read again");
         let report = the_report(&sent);
         assert_eq!(report["workers"], serde_json::json!([]), "{report}");
         assert_eq!(report["observation"]["complete"], serde_json::json!(false), "{report}");
