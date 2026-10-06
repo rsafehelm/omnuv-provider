@@ -20,6 +20,8 @@
 #                                     date, which move with every build
 set -euo pipefail
 
+# A package named relative to the caller's directory, resolved before the cd.
+[ -z "${2:-}" ] || set -- "$1" "$(realpath -- "$2")"
 cd "$(dirname "$0")/.."
 export LC_ALL=C
 
