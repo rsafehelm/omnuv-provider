@@ -133,7 +133,7 @@ mod tests {
     /// constant as a whole string literal.
     #[test]
     fn the_workload_agent_writes_where_the_provider_agent_reads() {
-        let writer = include_str!("bin/onv-workloadd.rs");
+        let writer = include_str!("../crates/onv-workloadd/src/main.rs");
         let wanted = format!("const STATUS_PATH: &str = \"{WORKLOAD_STATUS}\";");
         assert!(writer.contains(&wanted), "onv-workloadd does not declare {wanted}");
         // The negative case: the old path must not satisfy the check.
