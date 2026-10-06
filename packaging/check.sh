@@ -162,15 +162,17 @@ grep -q '^opening: every case passed$' "$out/opening.log"
 # Supervision and log bounds (omnuv's modular design, A4): the journal's cap
 # and the logs' rotation shipped as conffiles; then, in a disposable
 # container, logrotate rotates /var/log/onv with the package's own file, the
-# packaged binary appends to the new audit log, and systemd loads the agent's
-# unit with nothing to say (tests/logs/).
+# packaged binary appends to the new audit log, systemd loads the agent's
+# unit with nothing to say, and the packaged postinst restarts journald only
+# when the cap changed or its last restart failed (tests/logs/).
 step "The package caps the journal and rotates its logs, and systemd loads its unit"
 grep -q ' ./etc/logrotate.d/onv-provider$' <<< "$listing"
 grep -q ' ./etc/systemd/journald.conf.d/60-onv-provider.conf$' <<< "$listing"
 conffiles="$(dpkg-deb -I "$deb" conffiles)"
 grep -qx '/etc/logrotate.d/onv-provider' <<< "$conffiles"
 grep -qx '/etc/systemd/journald.conf.d/60-onv-provider.conf' <<< "$conffiles"
-tests/logs/rotate_test.sh "$out/root" > "$out/logs.log" 2>&1 || { cat "$out/logs.log"; exit 1; }
+dpkg-deb -e "$deb" "$out/control"
+tests/logs/rotate_test.sh "$out/root" "$out/control/postinst" > "$out/logs.log" 2>&1 || { cat "$out/logs.log"; exit 1; }
 grep -q '^logs: every case passed$' "$out/logs.log"
 
 step "The Workload Agent is built, static, and starts"
