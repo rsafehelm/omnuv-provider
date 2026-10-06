@@ -400,6 +400,24 @@ pub fn write_private(path: &str, contents: &[u8], mode: u32) -> std::io::Result<
     f.sync_all()
 }
 
+/// Whether a tag list belongs to a machine this agent built under an older
+/// name. **Two generations now**, `omnu-` and `omnuv-`, because there have been
+/// two renames — and the second is the reason this function is a list rather
+/// than a prefix test: `omnuv-` starts with `omnu-`, so a prefix check alone
+/// would have called every `omnuv-instance` legacy.
+///
+/// Exact names, not prefixes. A machine tagged `omnuv-something-else` is not
+/// one of ours under an old name; it is somebody else's machine that happens to
+/// start with a string we used to use, and *the safe reading of "we do not know
+/// whose this is" is "not ours"*.
+pub fn is_legacy_marketplace_tag(tags: &str) -> bool {
+    const LEGACY: &[&str] = &[
+        "omnuv-instance", "omnuv-gateway", "omnuv-worker",
+        "omnu-instance", "omnu-gateway", "omnu-worker",
+    ];
+    tags.split(&[';', ','][..]).map(str::trim).any(|t| LEGACY.contains(&t))
+}
+
 #[cfg(test)]
 mod tests {
     /// **The stamp's exact text, per claim** (phase 1). The clone call, the

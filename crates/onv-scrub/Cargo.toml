@@ -1,0 +1,19 @@
+[package]
+name = "onv-scrub"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "A GPU card's scrub: what Core wants, what the guest reports, and the next step."
+publish = false
+
+# Moved comments indent quoted output by four spaces, which rustdoc reads as
+# Rust to run. They were never doctests in the agent's binary crate.
+[lib]
+doctest = false
+
+# The versions the agent already locks; this crate adds none to the build.
+[dependencies]
+onv-agent-lib = { path = "../onv-agent-lib" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

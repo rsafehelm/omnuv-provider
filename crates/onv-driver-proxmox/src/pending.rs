@@ -95,7 +95,7 @@ impl PendingClone {
 }
 
 fn instance_claim() -> String {
-    crate::names::TAG_INSTANCE.to_string()
+    onv_agent_lib::names::TAG_INSTANCE.to_string()
 }
 
 pub fn dir(snippet_dir: &str) -> PathBuf {
@@ -111,7 +111,7 @@ fn file(dir: &Path, vmid: u32) -> PathBuf {
 pub fn write(dir: &Path, entry: &PendingClone) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let raw = serde_json::to_vec(entry)?;
-    crate::names::write_private(&file(dir, entry.vmid).to_string_lossy(), &raw, 0o600)
+    onv_agent_lib::names::write_private(&file(dir, entry.vmid).to_string_lossy(), &raw, 0o600)
         .map_err(|e| anyhow::anyhow!("recording the pending clone of {}: {e}", entry.vmid))
 }
 
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn an_older_record_is_an_instances() {
         let old: PendingClone = serde_json::from_str(r#"{"vmid":1,"id":"i","node":"n","upid":null}"#).unwrap();
-        assert_eq!(old.claim, crate::names::TAG_INSTANCE);
+        assert_eq!(old.claim, onv_agent_lib::names::TAG_INSTANCE);
         assert_eq!(old.stage, Stage::Cloning);
     }
 

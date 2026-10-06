@@ -1,0 +1,28 @@
+[package]
+name = "onv-core-link"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "The agent's link to Core: TLS, the session, the report period, restore mode, the install watch."
+publish = false
+
+# Moved comments indent quoted output by four spaces, which rustdoc reads as
+# Rust to run. They were never doctests in the agent's binary crate.
+[lib]
+doctest = false
+
+# The versions the agent already locks; this crate adds none to the build.
+[dependencies]
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+onv-agent-lib = { path = "../onv-agent-lib" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11"
+
+[dev-dependencies]
+tempfile = "3.27.0"

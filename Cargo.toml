@@ -48,6 +48,16 @@ libc = "0.2"
 # design A1). Moved out with no behaviour change; pinned by tests/linux and
 # tests/windows.
 onv-generators = { path = "crates/onv-generators" }
+# The rest of the split (the agent workspace, omnuv's modular design, A1b):
+# the parts that stand outside the agent's cycle, moved with no behaviour
+# change. The agent imports each module under the name it always had.
+onv-agent-lib = { path = "crates/onv-agent-lib" }
+onv-core-link = { path = "crates/onv-core-link" }
+onv-driver-proxmox = { path = "crates/onv-driver-proxmox" }
+onv-hostnet = { path = "crates/onv-hostnet" }
+onv-images = { path = "crates/onv-images" }
+onv-scrub = { path = "crates/onv-scrub" }
+onv-tunnel = { path = "crates/onv-tunnel" }
 
 # **The agent's workspace** (omnuv's modular design, A1). The root package is
 # the agent and stays the only default member, so `cargo build` and the
@@ -55,7 +65,16 @@ onv-generators = { path = "crates/onv-generators" }
 # packaging/workspace-members.txt records them and packaging/check.sh refuses
 # any other set.
 [workspace]
-members = ["crates/onv-generators"]
+members = [
+    "crates/onv-agent-lib",
+    "crates/onv-core-link",
+    "crates/onv-driver-proxmox",
+    "crates/onv-generators",
+    "crates/onv-hostnet",
+    "crates/onv-images",
+    "crates/onv-scrub",
+    "crates/onv-tunnel",
+]
 
 [dev-dependencies]
 tempfile = "3.27.0"

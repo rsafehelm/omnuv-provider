@@ -1672,23 +1672,8 @@ pub(crate) fn shell_left(vmid: u32) -> String {
     format!("vm {vmid} was not seen to go away, so nothing was proven to have been taken back")
 }
 
-/// Whether a tag list belongs to a machine this agent built under an older
-/// name. **Two generations now**, `omnu-` and `omnuv-`, because there have been
-/// two renames — and the second is the reason this function is a list rather
-/// than a prefix test: `omnuv-` starts with `omnu-`, so a prefix check alone
-/// would have called every `omnuv-instance` legacy.
-///
-/// Exact names, not prefixes. A machine tagged `omnuv-something-else` is not
-/// one of ours under an old name; it is somebody else's machine that happens to
-/// start with a string we used to use, and *the safe reading of "we do not know
-/// whose this is" is "not ours"*.
-pub(crate) fn is_legacy_marketplace_tag(tags: &str) -> bool {
-    const LEGACY: &[&str] = &[
-        "omnuv-instance", "omnuv-gateway", "omnuv-worker",
-        "omnu-instance", "omnu-gateway", "omnu-worker",
-    ];
-    tags.split(&[';', ','][..]).map(str::trim).any(|t| LEGACY.contains(&t))
-}
+// Moved to `onv_agent_lib::names` (omnuv's modular design, A1b).
+pub(crate) use onv_agent_lib::names::is_legacy_marketplace_tag;
 
 /// A machine was seen, and a step after the sighting failed (PROVIDER-26).
 /// Carries what was seen, so the report says that rather than ERROR.

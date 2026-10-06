@@ -46,10 +46,10 @@ use std::time::{Duration, Instant};
 // first boot. The crate has no library, so the two programs include the same
 // files; each uses its own half, which is why dead code is allowed here.
 #[allow(dead_code)]
-#[path = "../dur.rs"]
+#[path = "../../crates/onv-agent-lib/src/dur.rs"]
 mod dur;
 #[allow(dead_code)]
-#[path = "../workload_config.rs"]
+#[path = "../../crates/onv-agent-lib/src/workload_config.rs"]
 mod workload_config;
 
 use workload_config::WorkloadConfig;

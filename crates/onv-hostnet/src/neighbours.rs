@@ -38,18 +38,18 @@ const ATF_COM: u32 = 0x2;
 /// dead one the kernel had not yet aged out. Keying this one-to-one picked
 /// whichever arrived last and called a silent address "observed".
 #[derive(Debug, Default, Clone)]
-pub(crate) struct Neighbours(HashMap<String, Vec<String>>);
+pub struct Neighbours(HashMap<String, Vec<String>>);
 
 impl Neighbours {
     /// Read the host's table. A host that cannot be read yields an empty table,
     /// which reports nothing as observed — the safe direction. Claiming an
     /// address works because we failed to check is how a blind spot becomes a
     /// wrong answer.
-    pub(crate) fn read() -> Self {
+    pub fn read() -> Self {
         std::fs::read_to_string("/proc/net/arp").map(|s| Self::parse(&s)).unwrap_or_default()
     }
 
-    pub(crate) fn parse(table: &str) -> Self {
+    pub fn parse(table: &str) -> Self {
         let mut out = HashMap::new();
         for line in table.lines().skip(1) {
             let f: Vec<&str> = line.split_whitespace().collect();
@@ -67,7 +67,7 @@ impl Neighbours {
         Self(out)
     }
 
-    pub(crate) fn get(&self, mac: &str) -> &[String] {
+    pub fn get(&self, mac: &str) -> &[String] {
         self.0.get(&normalise(mac)).map(Vec::as_slice).unwrap_or_default()
     }
 }
@@ -90,7 +90,7 @@ fn normalise(mac: &str) -> String {
 /// authoritative because the field is the same either way. Core derives both
 /// MACs from the machine id and sends the segment one in the attachment, so
 /// there is no guessing left to do.
-pub(crate) fn adapters(
+pub fn adapters(
     config: &serde_json::Value,
     seen: &Neighbours,
     believed: Option<&str>,

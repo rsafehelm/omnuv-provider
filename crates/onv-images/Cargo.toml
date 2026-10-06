@@ -1,0 +1,21 @@
+[package]
+name = "onv-images"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "The image store's rules: an artefact's name, digest and template shape."
+publish = false
+
+# Moved comments indent quoted output by four spaces, which rustdoc reads as
+# Rust to run. They were never doctests in the agent's binary crate.
+[lib]
+doctest = false
+
+# The versions the agent already locks; this crate adds none to the build.
+[dependencies]
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+onv-agent-lib = { path = "../onv-agent-lib" }
+anyhow = "1"
+serde_json = "1"
+sha2 = "0.11"
