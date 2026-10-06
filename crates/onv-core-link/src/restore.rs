@@ -232,7 +232,7 @@ mod tests {
 
     fn view(version: u64, ids: &[(&str, Lifecycle)]) -> DesiredState {
         let mut d: DesiredState =
-            serde_json::from_str(include_str!("../tests/from-core/desired-state.json")).expect("the fixture");
+            serde_json::from_str(include_str!("../../../tests/from-core/desired-state.json")).expect("the fixture");
         let template = d.instances[0].clone();
         d.inference_workers.clear();
         d.unchanged = false;

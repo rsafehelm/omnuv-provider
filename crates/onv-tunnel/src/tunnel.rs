@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::audit;
+use onv_agent_lib::audit;
 use crate::console::{ConsoleInput, ConsoleOpener};
 
 /// Resolves a marketplace worker id to the endpoint it serves on locally.
@@ -57,12 +57,12 @@ pub struct Keepalive {
 
 impl Default for Keepalive {
     fn default() -> Self {
-        Self::from(&crate::timings::Timings::default())
+        Self::from(&onv_agent_lib::timings::Timings::default())
     }
 }
 
-impl From<&crate::timings::Timings> for Keepalive {
-    fn from(t: &crate::timings::Timings) -> Self {
+impl From<&onv_agent_lib::timings::Timings> for Keepalive {
+    fn from(t: &onv_agent_lib::timings::Timings) -> Self {
         Self { ping: t.tunnel_ping.std(), silence: t.tunnel_silence.std() }
     }
 }
@@ -70,7 +70,7 @@ impl From<&crate::timings::Timings> for Keepalive {
 pub async fn run(
     core_url: &str,
     token: &omnuv_protocol::Redacted,
-    session: crate::session::Session,
+    session: onv_core_link::session::Session,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -187,7 +187,7 @@ impl Tables {
 async fn connect(
     ws_url: &str,
     token: &omnuv_protocol::Redacted,
-    session: &crate::session::Session,
+    session: &onv_core_link::session::Session,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -200,7 +200,7 @@ async fn connect(
 async fn connect_with(
     ws_url: &str,
     token: &omnuv_protocol::Redacted,
-    session: &crate::session::Session,
+    session: &onv_core_link::session::Session,
     resolve: ResolveWorker,
     nudge: Arc<tokio::sync::Notify>,
     consoles: Arc<dyn ConsoleOpener>,
@@ -217,8 +217,8 @@ async fn connect_with(
         .insert("authorization", format!("Bearer {}", token.expose()).parse()?);
     // The session, when Core minted one (lifecycle phase 7, RC12): the tunnel
     // is a call like any other, and Core takes it only from the holder.
-    if let Some(s) = crate::session::current(session) {
-        request.headers_mut().insert(crate::session::HEADER, s.parse()?);
+    if let Some(s) = onv_core_link::session::current(session) {
+        request.headers_mut().insert(onv_core_link::session::HEADER, s.parse()?);
     }
 
     let parts = url_lite::parse(ws_url)?;

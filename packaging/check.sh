@@ -123,6 +123,12 @@ test "$(dpkg-deb -f "$deb" Version)" = "$(cat "$out/onv-provider_current.version
 step "The package's file list is the one recorded"
 packaging/baselines.sh deb "$deb"
 
+# The digest the agent compiles into every inference worker's snippet: a new
+# one reboots every running worker once (PROVIDER-31), so it moves only when
+# re-recorded on purpose (A1b, where a pure move changed it unnoticed).
+step "onv-workloadd's digest is the one recorded"
+packaging/baselines.sh workloadd "$out/workloadd/onv-workloadd"
+
 # The host timer (lifecycle phase 12). The packaged binary is run, not only
 # listed: against a configuration that is not there it must refuse (exit 1,
 # not the 2 of an unknown command), say so in its own file and in the audit

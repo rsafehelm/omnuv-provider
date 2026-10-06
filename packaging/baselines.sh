@@ -4,6 +4,7 @@
 #
 #     packaging/baselines.sh members              the workspace's members
 #     packaging/baselines.sh deb <file.deb>       the package's file list
+#     packaging/baselines.sh workloadd <binary>   onv-workloadd's digest
 #     ONV_BASELINE=write packaging/baselines.sh … records instead of comparing
 #
 # Each is compared with a file recorded beside this script, and a difference
@@ -18,6 +19,19 @@
 #                                     in the data archive, then each member of
 #                                     the control archive; no size, owner or
 #                                     date, which move with every build
+#   packaging/workloadd-sha256.txt    the sha256 of the static onv-workloadd
+#                                     build-deb.sh builds. It is compiled into
+#                                     every inference worker's snippet
+#                                     (worker.rs, WORKLOADD_SHA256), and a
+#                                     changed snippet reboots the worker
+#                                     (PROVIDER-31): a new digest restarts
+#                                     every running inference worker once on
+#                                     the first pass after the package is
+#                                     installed. So it moves only when
+#                                     re-recorded, in the change that moves it,
+#                                     and that change says so. A new compiler
+#                                     behind rust:1.98-alpine moves it too, and
+#                                     is the same decision.
 set -euo pipefail
 
 # A package named relative to the caller's directory, resolved before the cd.
@@ -58,8 +72,14 @@ deb)
     control="$(dpkg-deb --ctrl-tarfile "$deb" | tar -tf - | sed 's/^/control /' | sort)"
     compare deb-files.txt "$data"$'\n'"$control"
     ;;
+workloadd)
+    bin="${2:?usage: baselines.sh workloadd <binary>}"
+    actual="$(sha256sum -- "$bin" | cut -d' ' -f1)"
+    [[ "$actual" =~ ^[0-9a-f]{64}$ ]] || { echo "baselines: no digest for $bin" >&2; exit 1; }
+    compare workloadd-sha256.txt "$actual"
+    ;;
 *)
-    echo "usage: baselines.sh members | deb <file.deb>" >&2
+    echo "usage: baselines.sh members | deb <file.deb> | workloadd <binary>" >&2
     exit 2
     ;;
 esac

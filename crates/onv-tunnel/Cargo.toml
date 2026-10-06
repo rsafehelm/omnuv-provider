@@ -1,0 +1,31 @@
+[package]
+name = "onv-tunnel"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "The agent's tunnel to Core: consoles and inference relayed over one websocket."
+publish = false
+
+# Moved comments indent quoted output by four spaces, which rustdoc reads as
+# Rust to run. They were never doctests in the agent's binary crate.
+[lib]
+doctest = false
+
+# The versions the agent already locks; this crate adds none to the build.
+[dependencies]
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+onv-agent-lib = { path = "../onv-agent-lib" }
+onv-core-link = { path = "../onv-core-link" }
+anyhow = "1"
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "stream"] }
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider"] }
+
+[dev-dependencies]
+# Fault injection over a simulated network: the tunnel under partitions and
+# silence, in simulated time (tunnel.rs, `mod partition`).
+turmoil = "0.7.2"

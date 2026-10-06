@@ -1,2 +1,9 @@
 omnuv-provider
+onv-agent-lib
+onv-core-link
+onv-driver-proxmox
 onv-generators
+onv-hostnet
+onv-images
+onv-scrub
+onv-tunnel

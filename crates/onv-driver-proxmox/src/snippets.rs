@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::names::{snippet_owner, SnippetKind};
+use onv_agent_lib::names::{snippet_owner, SnippetKind};
 
 /// What the provider knows about its machines, as far as it managed to look.
 ///
@@ -192,13 +192,13 @@ mod tests {
     #[test]
     fn both_generations_are_seen_and_treated_differently() {
         let d = dir_with(&[
-            crate::names::snippet_worker(A),
-            crate::names::snippet_worker_legacy(B),
+            onv_agent_lib::names::snippet_worker(A),
+            onv_agent_lib::names::snippet_worker_legacy(B),
         ]);
         let s = sweep(d.path(), &known(&[], &[], true), real);
-        assert_eq!(s.collected, vec![crate::names::snippet_worker(A)]);
-        assert_eq!(s.uncertain, vec![crate::names::snippet_worker_legacy(B)]);
-        assert!(d.path().join(crate::names::snippet_worker_legacy(B)).exists());
+        assert_eq!(s.collected, vec![onv_agent_lib::names::snippet_worker(A)]);
+        assert_eq!(s.uncertain, vec![onv_agent_lib::names::snippet_worker_legacy(B)]);
+        assert!(d.path().join(onv_agent_lib::names::snippet_worker_legacy(B)).exists());
     }
 
     /// A live machine keeps its file, and so does one that is merely *wanted* —
@@ -207,15 +207,15 @@ mod tests {
     #[test]
     fn live_and_provisioning_machines_keep_their_snippets() {
         let d = dir_with(&[
-            crate::names::snippet_worker(A),
-            crate::names::snippet_worker(B),
-            crate::names::snippet_worker(C),
+            onv_agent_lib::names::snippet_worker(A),
+            onv_agent_lib::names::snippet_worker(B),
+            onv_agent_lib::names::snippet_worker(C),
         ]);
         let s = sweep(d.path(), &known(&[A], &[B], true), real);
         assert_eq!(s.kept, 2);
-        assert_eq!(s.collected, vec![crate::names::snippet_worker(C)]);
-        assert!(d.path().join(crate::names::snippet_worker(A)).exists());
-        assert!(d.path().join(crate::names::snippet_worker(B)).exists());
+        assert_eq!(s.collected, vec![onv_agent_lib::names::snippet_worker(C)]);
+        assert!(d.path().join(onv_agent_lib::names::snippet_worker(A)).exists());
+        assert!(d.path().join(onv_agent_lib::names::snippet_worker(B)).exists());
     }
 
     /// Files that are not ours are counted and untouched. A prefix is
@@ -225,7 +225,7 @@ mod tests {
         let d = dir_with(&[
             "user-data.yaml".into(),
             "onv-notes.yaml".into(),
-            crate::names::snippet_worker(A),
+            onv_agent_lib::names::snippet_worker(A),
         ]);
         let s = sweep(d.path(), &known(&[], &[], true), real);
         assert_eq!(s.foreign, 2);
@@ -238,7 +238,7 @@ mod tests {
     /// most: with an incomplete view every unlisted machine looks disposable.
     #[test]
     fn an_incomplete_view_collects_nothing() {
-        let files = vec![crate::names::snippet_worker(A), crate::names::snippet_worker(B)];
+        let files = vec![onv_agent_lib::names::snippet_worker(A), onv_agent_lib::names::snippet_worker(B)];
         let d = dir_with(&files);
         let s = sweep(d.path(), &known(&[], &[], false), real);
         assert!(s.collected.is_empty());
@@ -266,7 +266,7 @@ mod tests {
     /// path safe rather than permanent.
     #[test]
     fn a_failed_removal_is_recorded_and_retried_later() {
-        let d = dir_with(&[crate::names::snippet_worker(A), crate::names::snippet_worker(B)]);
+        let d = dir_with(&[onv_agent_lib::names::snippet_worker(A), onv_agent_lib::names::snippet_worker(B)]);
         let mut first = true;
         let s = sweep(d.path(), &known(&[], &[], true), |p| {
             if first {
@@ -311,10 +311,10 @@ mod tests {
         use serde_json::json;
 
         let d = dir_with(&[
-            crate::names::snippet_worker(A),
-            crate::names::snippet_instance(B),
-            crate::names::snippet_network(B),
-            crate::names::snippet_worker(C),
+            onv_agent_lib::names::snippet_worker(A),
+            onv_agent_lib::names::snippet_instance(B),
+            onv_agent_lib::names::snippet_network(B),
+            onv_agent_lib::names::snippet_worker(C),
         ]);
         let live = observed(vec![
             ("/nodes/fixture/qemu", json!([
@@ -322,17 +322,17 @@ mod tests {
                 {"vmid": 101, "status": "running"},
             ])),
             ("/nodes/fixture/qemu/100/config", json!({
-                "cicustom": format!("user=onv-snippets:snippets/{}", crate::names::snippet_worker(A)),
+                "cicustom": format!("user=onv-snippets:snippets/{}", onv_agent_lib::names::snippet_worker(A)),
             })),
             ("/nodes/fixture/qemu/101/config", json!({
                 "cicustom": format!("user=onv-snippets:snippets/{},network=onv-snippets:snippets/{}",
-                    crate::names::snippet_instance(B), crate::names::snippet_network(B)),
+                    onv_agent_lib::names::snippet_instance(B), onv_agent_lib::names::snippet_network(B)),
             })),
         ]).await.unwrap();
         assert_eq!(live, BTreeSet::from([A.to_string(), B.to_string()]));
         let s = sweep(d.path(), &Known { live, desired: BTreeSet::new(), complete: true }, real);
         assert_eq!(s.kept, 3);
-        assert_eq!(s.collected, vec![crate::names::snippet_worker(C)]);
+        assert_eq!(s.collected, vec![onv_agent_lib::names::snippet_worker(C)]);
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 3);
 
         // Core no longer lists the final machine, but runtime absence is only
@@ -349,11 +349,11 @@ mod tests {
     async fn partial_runtime_observation_cannot_release_unlisted_snippets() {
         use serde_json::json;
 
-        let d = dir_with(&[crate::names::snippet_worker(A), crate::names::snippet_worker(B)]);
+        let d = dir_with(&[onv_agent_lib::names::snippet_worker(A), onv_agent_lib::names::snippet_worker(B)]);
         let observation = observed(vec![
             ("/nodes/fixture/qemu", json!([{"vmid": 100}, {"vmid": 101}])),
             ("/nodes/fixture/qemu/100/config", json!({
-                "cicustom": format!("user=onv-snippets:snippets/{}", crate::names::snippet_worker(A)),
+                "cicustom": format!("user=onv-snippets:snippets/{}", onv_agent_lib::names::snippet_worker(A)),
             })),
             // Reading VM 101 fails after VM 100 was observed successfully.
         ]).await;

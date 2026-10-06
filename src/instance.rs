@@ -1672,23 +1672,8 @@ pub(crate) fn shell_left(vmid: u32) -> String {
     format!("vm {vmid} was not seen to go away, so nothing was proven to have been taken back")
 }
 
-/// Whether a tag list belongs to a machine this agent built under an older
-/// name. **Two generations now**, `omnu-` and `omnuv-`, because there have been
-/// two renames — and the second is the reason this function is a list rather
-/// than a prefix test: `omnuv-` starts with `omnu-`, so a prefix check alone
-/// would have called every `omnuv-instance` legacy.
-///
-/// Exact names, not prefixes. A machine tagged `omnuv-something-else` is not
-/// one of ours under an old name; it is somebody else's machine that happens to
-/// start with a string we used to use, and *the safe reading of "we do not know
-/// whose this is" is "not ours"*.
-pub(crate) fn is_legacy_marketplace_tag(tags: &str) -> bool {
-    const LEGACY: &[&str] = &[
-        "omnuv-instance", "omnuv-gateway", "omnuv-worker",
-        "omnu-instance", "omnu-gateway", "omnu-worker",
-    ];
-    tags.split(&[';', ','][..]).map(str::trim).any(|t| LEGACY.contains(&t))
-}
+// Moved to `onv_agent_lib::names` (omnuv's modular design, A1b).
+pub(crate) use onv_agent_lib::names::is_legacy_marketplace_tag;
 
 /// A machine was seen, and a step after the sighting failed (PROVIDER-26).
 /// Carries what was seen, so the report says that rather than ERROR.
@@ -3313,48 +3298,6 @@ mod tests {
         assert_eq!(summary.result, omnuv_protocol::CheckResult::Fail);
         assert!(client.refreshes.drain().is_empty(), "a pass's checks outlived the pass");
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// The rename guard has to recognise **every** generation, and getting it
-    /// wrong either blocks a healthy host forever or lets the duplicate-machine
-    /// accident through. Two now: `omnu-` and `omnuv-`.
-    ///
-    /// The prefixes nest — `omnuv-` starts with `omnu-`, and `onv-` starts with
-    /// neither — which is why this matches exact names rather than testing a
-    /// prefix. A prefix test called every current machine legacy the first time
-    /// and would do it again.
-    #[test]
-    fn a_tag_from_any_older_generation_is_recognised() {
-        use super::is_legacy_marketplace_tag;
-        // First generation.
-        assert!(is_legacy_marketplace_tag("omnu-42472e172c55;omnu-instance"));
-        assert!(is_legacy_marketplace_tag("gw-bfd571c2;omnu-gateway"));
-        assert!(is_legacy_marketplace_tag("omnu-worker"));
-        // Second, legacy as of the rename to `onv`.
-        assert!(is_legacy_marketplace_tag("omnuv-42472e172c55;omnuv-instance"));
-        assert!(is_legacy_marketplace_tag("omnuv-gateway"));
-        assert!(is_legacy_marketplace_tag("omnuv-worker"));
-    }
-
-    /// The current name is not legacy, or the agent would refuse to reconcile
-    /// a host it had just built correctly.
-    #[test]
-    fn the_current_tags_are_not_legacy() {
-        use super::is_legacy_marketplace_tag;
-        assert!(!is_legacy_marketplace_tag("onv-instance"));
-        assert!(!is_legacy_marketplace_tag("onv-gateway;g-1"));
-        assert!(!is_legacy_marketplace_tag("onv-worker"));
-    }
-
-    /// And nothing that merely resembles one of ours counts. *The safe reading
-    /// of "we do not know whose this is" is "not ours".*
-    #[test]
-    fn a_name_that_only_resembles_ours_is_not_legacy() {
-        use super::is_legacy_marketplace_tag;
-        assert!(!is_legacy_marketplace_tag(""));
-        assert!(!is_legacy_marketplace_tag("someone-elses-vm"));
-        assert!(!is_legacy_marketplace_tag("omnuv-something-else"));
-        assert!(!is_legacy_marketplace_tag("omnu-backup"));
     }
 
     /// Maintenance restarts what crashed and does nothing else. Every other

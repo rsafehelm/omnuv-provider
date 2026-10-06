@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::dur::Dur;
+use onv_agent_lib::dur::Dur;
 
 /// What this agent advertises: it reports at Core's period, and only a
 /// completed survey. Core's `provider_api::REPORT_CAPABILITY`.
@@ -83,7 +83,7 @@ impl Heard {
             return Dur::secs(said).max(FLOOR).min(CEILING).std();
         }
         let poll = self.poll.load(Ordering::Relaxed);
-        fallback(inventory_every, crate::timings::poll((poll > 0).then_some(poll)))
+        fallback(inventory_every, onv_agent_lib::timings::poll((poll > 0).then_some(poll)))
     }
 
     /// Whether Core has said a period: with one, this agent reports at it.
@@ -160,9 +160,9 @@ mod tests {
     /// The fallback, as the agent always computed it (D10).
     #[test]
     fn the_fallback_goes_at_least_twice_per_core_poll() {
-        assert_eq!(fallback(secs(300), crate::timings::poll(None)), secs(60));
+        assert_eq!(fallback(secs(300), onv_agent_lib::timings::poll(None)), secs(60));
         assert!(2 * fallback(secs(300), secs(120)) < 2 * secs(120), "one missed report went stale");
         assert_eq!(fallback(secs(30), secs(120)), secs(30), "a shorter configured interval is kept");
-        assert_eq!(fallback(secs(300), crate::timings::poll(Some(1800))), secs(300));
+        assert_eq!(fallback(secs(300), onv_agent_lib::timings::poll(Some(1800))), secs(300));
     }
 }
