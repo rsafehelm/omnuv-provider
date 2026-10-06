@@ -20,7 +20,9 @@
 #                its own rules, then src and crates
 #     package    shellcheck; the manifest check's own cases; the .deb built as
 #                a release is built; what it holds, its manifest held to the
-#                built onv-workloadd; the Workload Agent static, and starting
+#                built onv-workloadd; its version the hash of its inputs; its
+#                postinst restarting only what moved; the Workload Agent
+#                static, and starting
 #
 # Stops at the first failure and names the step. Needs cargo and docker. In
 # omnuv, `deployment/onv check` runs this as its `agent` stage.
@@ -103,7 +105,8 @@ docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     packaging/build-deb.sh packaging/check.sh packaging/baselines.sh packaging/manifest.sh \
     tests/packaging/manifest_test.sh crates/onv-generators/guest/onv-certificate.sh \
     tests/opening/nft_test.sh tests/opening/in_container.sh \
-    tests/logs/rotate_test.sh tests/logs/in_container.sh
+    tests/logs/rotate_test.sh tests/logs/in_container.sh \
+    tests/packaging/restart_test.sh tests/packaging/restart_in_container.sh
 
 # The script a web machine runs to fetch its project's certificate rides in
 # its first-boot data, so this package never installs it: it is run instead,
@@ -139,6 +142,22 @@ grep -q ' ./usr/bin/onv-provider$' <<< "$listing"
 grep -q ' ./lib/systemd/system/onv-provider.service$' <<< "$listing"
 for s in postinst prerm postrm; do dpkg-deb -I "$deb" "$s" > /dev/null; done
 test "$(dpkg-deb -f "$deb" Version)" = "$(cat "$out/onv-provider_current.version")"
+
+# **The version is the content hash of the package's inputs** (omnuv's
+# modular design, A5): `<crate>+c<hash12>`, from the dep-info this build
+# wrote; a tests/-only change keeps it, a source or unit-file change moves
+# it (tests/packaging/version_test.py, both ways). Beside the package, the
+# commit it was built from, which the version no longer names.
+step "The package version is the content hash of its inputs, and a test-only change keeps it"
+version="$(dpkg-deb -f "$deb" Version)"
+crate="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+grep -Eqx "${crate//./\\.}\+c[0-9a-f]{12}" <<< "$version"
+depinfo=(target/release/onv-provider.d target/release/onv-opening.d
+         target/release/onv-lease-expire.d target/musl/release/onv-workloadd.d)
+test "$(python3 packaging/version.py . "${depinfo[@]}")" = "$version"
+python3 tests/packaging/version_test.py "${depinfo[@]}" > "$out/version-test.log" 2>&1 || { cat "$out/version-test.log"; exit 1; }
+test "$(tail -1 "$out/version-test.log")" = "version: every case passed"
+grep -Eqx "[0-9a-f]{40} (clean|dirty)" "$out/onv-provider_current.commit"
 
 # Every file, not only the ones named above: a split into crates moves
 # source, never what is installed (omnuv's modular design, A1).
@@ -238,6 +257,19 @@ grep -qx '/etc/systemd/journald.conf.d/60-onv-provider.conf' <<< "$conffiles"
 dpkg-deb -e "$deb" "$out/control"
 tests/logs/rotate_test.sh "$out/root" "$out/control/postinst" > "$out/logs.log" 2>&1 || { cat "$out/logs.log"; exit 1; }
 grep -q '^logs: every case passed$' "$out/logs.log"
+
+# **One restart per upgrade** (A5): the package installed with dpkg in a
+# disposable container, under a stub systemctl, then again with only
+# onv-opening changed, and so on; postinst restarts exactly the units whose
+# bytes moved (tests/packaging/restart_in_container.sh). The agent reports
+# its crate version, never the package's (agent.rs, AGENT_VERSION): compiled
+# in, the package version would move its bytes with every input. The
+# compiler stores such a string as immediates, so the binary is asked, not
+# searched.
+step "postinst restarts only the units whose bytes moved, and the agent reports its crate version"
+test "$("$out/root/usr/bin/onv-provider" version)" = "$crate"
+tests/packaging/restart_test.sh "$deb" > "$out/restart.log" 2>&1 || { cat "$out/restart.log"; exit 1; }
+grep -q '^restart: every case passed$' "$out/restart.log"
 
 step "The Workload Agent is built, static, and starts"
 kind="$(file "$out/workloadd/onv-workloadd")"

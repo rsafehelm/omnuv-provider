@@ -19,30 +19,27 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # what the running agent says it is — which is precisely the number the runtime
 # compatibility profiles are written against.
 CRATE="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
-# **The version has to move when the bytes move.** The crate version does not
-# change between iterations, so two different binaries called themselves the
-# same thing and `apt` — which decides by version — installed neither. On 12
-# September that meant a fix was built, committed, deployed to both providers,
-# and the failure reproduced exactly, because what reached the hosts was the
-# package from an hour before.
+# **The version moves when the bytes move, and only then** (omnuv's modular
+# design, A5). The crate version does not change between iterations, so two
+# different binaries once called themselves the same thing and `apt`, which
+# decides by version, installed neither: on 12 September a fix was built,
+# deployed to both providers, and the failure reproduced exactly. `+g<commit>`
+# answered that and overshot: every commit, a test-only one too, was a new
+# package. The version is now `<crate>+c<hash12>`, the content hash of what
+# the package is built from (packaging/version.py), computed below once
+# cargo has said what it read. `${CRATE}` stays the upstream version.
 #
-# `+g<sha>` is a Debian-legal suffix that sorts above the bare version, and
-# `git describe --dirty` appends `-dirty` when the tree is not clean — so a
-# package built from uncommitted work is distinguishable too, rather than
-# silently identical to the commit it came from.
-BUILD="$(cd "$ROOT" && git describe --always --abbrev=7 2>/dev/null || echo unknown)"
-# **Two dirty builds of one commit are two versions.** `--dirty` gave both the
-# same `+g<sha>-dirty`, so the second was never installed (apt decides by
-# version), and Debian reads that `-` as a revision separator. A dirty tree now
-# carries a digest of its uncommitted changes, tracked and untracked, so each
-# distinct working tree has its own version.
+# The commit is still recorded, beside the package and never in it
+# (onv-provider_current.commit), for omnuv's deploy gate: in the package it
+# would make two packages of one version differ.
+COMMIT="$(cd "$ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -n "$(cd "$ROOT" && git status --porcelain 2>/dev/null)" ]; then
-    DIRTY="$(cd "$ROOT" && { git diff HEAD; git ls-files --others --exclude-standard -z | xargs -0 -r sha256sum; } | sha256sum | cut -c1-8)"
-    BUILD="${BUILD}.dirty.${DIRTY}"
+    COMMIT="$COMMIT dirty"
+else
+    COMMIT="$COMMIT clean"
 fi
-VERSION="${CRATE}+g${BUILD}"
-if [ -n "${1:-}" ] && [ "$1" != "$CRATE" ] && [ "$1" != "$VERSION" ]; then
-    echo "Cargo.toml says $CRATE (package $VERSION), not $1." >&2
+if [ -n "${1:-}" ] && [ "$1" != "$CRATE" ]; then
+    echo "Cargo.toml says $CRATE, not $1." >&2
     exit 2
 fi
 # dist/ is what deploy-agent.yml installs. A check builds elsewhere
@@ -51,7 +48,7 @@ OUT="${ONV_PACKAGE_OUT:-$ROOT/dist}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 STAGE="$OUT/.deb"
 
-echo "onv-provider $VERSION ($ARCH)"
+echo "onv-provider $CRATE ($ARCH)"
 
 # **The Workload Agent, built by the same command, and alone.** Its own crate
 # (crates/onv-workloadd, omnuv's modular design A2), so only its closure is
@@ -81,6 +78,11 @@ fi
 # Core serves against the one this package was built with (worker.rs).
 WORKLOADD_SHA256="$(sha256sum "$OUT/workloadd/onv-workloadd" | cut -d' ' -f1)"
 
+# **No package version is compiled in** (A5): the agent reports its crate
+# version (agent.rs, AGENT_VERSION). A version compiled in would move every
+# binary's bytes whenever any input moved, and postinst restarts a unit when
+# its bytes move.
+#
 # `--locked`: the committed Cargo.lock is the dependency set, so two builds of
 # one commit link the same crates. It was gitignored, so every build resolved
 # afresh and a package could not be rebuilt as it was.
@@ -89,9 +91,15 @@ WORKLOADD_SHA256="$(sha256sum "$OUT/workloadd/onv-workloadd" | cut -d' ' -f1)"
 # the agent speaks TLS through rustls rather than the system OpenSSL, so the
 # only real link is glibc.
 docker run --rm -v "$ROOT:/w" -v omnuv_cargo-registry:/usr/local/cargo/registry \
-    -e OMNUV_BUILD="$VERSION" -e OMNUV_WORKLOADD_SHA256="$WORKLOADD_SHA256" \
+    -e OMNUV_WORKLOADD_SHA256="$WORKLOADD_SHA256" \
     -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-24}" \
     -w /w rust:1.98 cargo build --release --locked --quiet -p omnuv-provider -p onv-lease-expire
+
+# What cargo read, as its dep-info says, with the packaging around it.
+VERSION="$(python3 "$ROOT/packaging/version.py" "$ROOT" \
+    "$ROOT/target/release/onv-provider.d" "$ROOT/target/release/onv-opening.d" \
+    "$ROOT/target/release/onv-lease-expire.d" "$ROOT/target/musl/release/onv-workloadd.d")"
+echo "onv-provider $VERSION ($ARCH)"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
@@ -151,15 +159,19 @@ docker run --rm -v "$OUT:/out" -w /out debian:trixie-slim sh -ec "
 " >/dev/null
 
 # A stable name for the deploy to install, beside the versioned one it keeps.
-# The play cannot guess `+g<sha>`, and hard-coding a version there would be the
+# The play cannot guess `+c<hash>`, and hard-coding a version there would be the
 # same one-definition-in-two-places mistake that produced this bug.
 cp "$OUT/onv-provider_${VERSION}_${ARCH}.deb" "$OUT/onv-provider_current_${ARCH}.deb"
 
-# Written beside it, so the deploy can assert that the agent Core ends up seeing
-# is the one that was packaged. The controller has no dpkg-deb to ask, and a
+# Written beside it, for the deploy, which has no dpkg-deb to ask, and a
 # version hard-coded in the play would be the same two-definitions mistake in a
-# new place.
+# new place. Since A5 the agent reports its crate version, not this one, so
+# whether a host runs this package's agent is its binary's sha256, which
+# postinst records in /var/lib/onv/units.sha256.
 printf '%s\n' "$VERSION" > "$OUT/onv-provider_current.version"
+# `<commit> clean|dirty`: the source the package was built from, which the
+# version no longer names.
+printf '%s\n' "$COMMIT" > "$OUT/onv-provider_current.commit"
 printf '%s\n' "$MANIFEST" > "$OUT/onv-provider_current.manifest.json"
 
 echo "  $(basename "$OUT")/onv-provider_${VERSION}_${ARCH}.deb"
