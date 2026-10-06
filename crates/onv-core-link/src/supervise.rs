@@ -137,10 +137,19 @@ mod tests {
     /// completes: an awaiting caller does not read a panic as an end.
     #[tokio::test]
     async fn a_panic_is_said_by_name_and_the_handle_never_completes() {
-        let handle = super::spawn_with("named", async { panic!("on purpose") }, note);
-        let waited = tokio::time::timeout(Duration::from_millis(300), handle).await;
+        let mut handle = super::spawn_with("named", async { panic!("on purpose") }, note);
+        // ceiling: the hook runs as soon as the watcher is scheduled; 10 s
+        // only bounds a hook that, wrongly, is never called. Polled, so a
+        // loaded host waits longer instead of failing.
+        let said = async {
+            while !onv_agent_lib::poison::lock(&PANICKED, "test").contains(&"named") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), said).await.expect("the hook named the task");
+        // Once the panic is said, the handle still does not complete.
+        let waited = tokio::time::timeout(Duration::from_millis(300), &mut handle).await;
         assert!(waited.is_err(), "the handle completed after a panic: {waited:?}");
-        assert!(onv_agent_lib::poison::lock(&PANICKED, "test").contains(&"named"));
     }
 
     /// Everything but a panic is as `tokio::spawn`: the output comes back,
