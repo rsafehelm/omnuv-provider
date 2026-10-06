@@ -14,8 +14,9 @@
 #     package a deploy ships.
 #
 # Sections, in order:
-#     crate      build, test and clippy (warnings refused), then the review's
-#                defect classes: semgrep's tests of its own rules, then src
+#     crate      the workspace's members as recorded; build, test and clippy
+#                of every member (warnings refused), then the review's defect
+#                classes: semgrep's tests of its own rules, then src and crates
 #     package    shellcheck; the .deb built as a release is built; what it
 #                holds; the Workload Agent static, and starting
 #
@@ -53,14 +54,20 @@ SHELLCHECK_IMAGE=koalaman/shellcheck:v0.11.0
 PWSH_IMAGE=mcr.microsoft.com/powershell:7.5-ubuntu-24.04
 
 if want crate; then
+# **Every member, not the default one.** The root package is the workspace's
+# only default member, so a bare `cargo test` skipped onv-generators and its
+# golden files (omnuv's modular design, A1).
+step "The workspace's members are the ones recorded"
+packaging/baselines.sh members
+
 step "Build"
-cargo build --locked --all-targets
+cargo build --locked --workspace --all-targets
 
 step "Test"
-cargo test --locked
+cargo test --locked --workspace
 
 step "Lints"
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # The shapes Core's source review of 24 September 2026 found, one of
 # them in this agent: the rules' own tests, then the tree.
@@ -68,7 +75,7 @@ step "The review's defect classes (semgrep), and the rules' own tests"
 docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
     semgrep --test --strict --metrics=off --config .semgrep/review-classes.yml .semgrep/review-classes.rs
 docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
-    semgrep scan --strict --error --metrics=off --config .semgrep/review-classes.yml --exclude .semgrep src
+    semgrep scan --strict --error --metrics=off --config .semgrep/review-classes.yml --exclude .semgrep src crates
 fi
 
 if want package; then
@@ -79,7 +86,7 @@ if want package; then
 step "Maintainer scripts and the build script pass shellcheck"
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" \
     packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm packaging/deb/DEBIAN/postrm \
-    packaging/build-deb.sh packaging/check.sh src/guest/onv-certificate.sh \
+    packaging/build-deb.sh packaging/check.sh packaging/baselines.sh crates/onv-generators/guest/onv-certificate.sh \
     tests/opening/nft_test.sh tests/opening/in_container.sh
 
 # The script a web machine runs to fetch its project's certificate rides in
@@ -110,6 +117,11 @@ grep -q ' ./usr/bin/onv-provider$' <<< "$listing"
 grep -q ' ./lib/systemd/system/onv-provider.service$' <<< "$listing"
 for s in postinst prerm postrm; do dpkg-deb -I "$deb" "$s" > /dev/null; done
 test "$(dpkg-deb -f "$deb" Version)" = "$(cat "$out/onv-provider_current.version")"
+
+# Every file, not only the ones named above: a split into crates moves
+# source, never what is installed (omnuv's modular design, A1).
+step "The package's file list is the one recorded"
+packaging/baselines.sh deb "$deb"
 
 # The host timer (lifecycle phase 12). The packaged binary is run, not only
 # listed: against a configuration that is not there it must refuse (exit 1,

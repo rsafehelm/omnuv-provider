@@ -1,0 +1,6 @@
+version: 2
+ethernets:
+  onv0:
+    match:
+      macaddress: "02:05:1C:CC:27:2A"
+    dhcp4: true

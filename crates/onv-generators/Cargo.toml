@@ -1,0 +1,26 @@
+[package]
+name = "onv-generators"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rsafehelm/omnuv-provider"
+description = "What an Omnuv machine's first boot reads: cloud-init and cloudbase-init data, rendered byte for byte."
+publish = false
+
+# The moved comments indent quoted output (a cloud-init error, a line of
+# YAML) by four spaces, which rustdoc reads as Rust to run. They were never
+# doctests in the agent's binary crate and are not code.
+[lib]
+doctest = false
+
+# The versions the agent already locks; this crate adds none to the build.
+# `url` is the crate behind `reqwest::Url`, which the join file's origin check
+# used before the move.
+[dependencies]
+omnuv-protocol = { git = "https://github.com/rsafehelm/omnuv-protocol", tag = "v0.27.0" }
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+url = "2"
