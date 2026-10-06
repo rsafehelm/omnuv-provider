@@ -765,42 +765,20 @@ pub struct AgentSecrets {
     pub proxmox_token_secret: omnuv_protocol::Redacted,
 }
 
+/// The names `agent-secrets.yaml` may hold: both are the agent's.
+pub const AGENT_SECRET_KEYS: [&str; 2] = ["coreToken", "proxmoxTokenSecret"];
+
 impl AgentSecrets {
-    /// Parse the file. **A refusal names the key, never the value**: a YAML
-    /// library's own messages quote what they could not read, so this reads a
-    /// map of names to values itself and says what is wrong in its own words.
+    /// Parse the file: `onv_agent_lib::secrets`' partial reading over the
+    /// agent's two names, then both required.
     pub fn parse(yaml: &str) -> Result<AgentSecrets, Vec<String>> {
-        let map: std::collections::BTreeMap<String, serde_yaml_ng::Value> = if yaml.trim().is_empty() {
-            Default::default()
-        } else {
-            serde_yaml_ng::from_str(yaml).map_err(|_| {
-                vec!["it is not a map of names to values; the line is not quoted here, because it may hold a credential"
-                    .to_string()]
-            })?
-        };
-        let (mut core, mut pve) = (None, None);
-        let mut bad = Vec::new();
-        for (key, value) in map {
-            let slot = match key.as_str() {
-                "coreToken" => &mut core,
-                "proxmoxTokenSecret" => &mut pve,
-                other => {
-                    bad.push(format!("`{other}` is not a credential this agent knows: it knows coreToken and proxmoxTokenSecret"));
-                    continue;
-                }
-            };
-            match value {
-                serde_yaml_ng::Value::String(v) if !v.trim().is_empty() => *slot = Some(omnuv_protocol::Redacted::from(v)),
-                serde_yaml_ng::Value::String(_) | serde_yaml_ng::Value::Null => bad.push(format!("{key} is empty")),
-                _ => bad.push(format!("{key} must be a string")),
-            }
-        }
-        for (key, slot) in [("coreToken", &core), ("proxmoxTokenSecret", &pve)] {
-            if slot.is_none() && !bad.iter().any(|b| b.starts_with(key)) {
+        let (mut found, mut bad) = onv_agent_lib::secrets::read_partial(yaml, &AGENT_SECRET_KEYS);
+        for key in AGENT_SECRET_KEYS {
+            if !found.contains_key(key) && !bad.iter().any(|b| b.starts_with(key)) {
                 bad.push(format!("{key} is missing"));
             }
         }
-        match (core, pve) {
+        match (found.remove("coreToken"), found.remove("proxmoxTokenSecret")) {
             (Some(core_token), Some(proxmox_token_secret)) if bad.is_empty() => {
                 Ok(AgentSecrets { core_token, proxmox_token_secret })
             }

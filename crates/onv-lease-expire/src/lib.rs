@@ -4,11 +4,18 @@
 //! The agent's lease task (`lease.rs`) stops a machine whose run lease ran
 //! out, and an agent that is dead stops nothing, so a restart elsewhere could
 //! leave two copies running. This is the other half: `onv-lease-expire.timer`
-//! runs `onv-provider run-lease-expire` every minute, and it stops each
-//! machine in `run-lease.json` past its time **when the lease task is not
-//! running**. It is a separate, minimal entry point: it reads the file and
-//! the configuration's hypervisor credentials, never talks to Core, and
-//! never does anything but stop.
+//! runs `onv-lease-expire` every minute, and it stops each machine in
+//! `run-lease.json` past its time **when the lease task is not running**.
+//!
+//! **A binary of its own, with a credential of its own** (omnuv's modular
+//! design, A3). It was `onv-provider run-lease-expire`, which loaded the
+//! agent's whole configuration and both its credentials, so a configuration
+//! the agent refused disarmed it too, and it held Core's token for no
+//! reason. Now it reads four keys of agent.yaml (`ForTimer`) and one token,
+//! `onv@pve!lease` (VM.Audit and VM.PowerMgmt on the buyers' pool), handed
+//! to it by its unit's `LoadCredential=`; it refuses to start without it. It
+//! links no Core client, never talks to Core, and never does anything but
+//! stop.
 //!
 //! ```text
 //! no file, or empty    nothing is leased here: no lock taken, nothing asked
@@ -24,8 +31,9 @@
 //! unreadable           refused whole: nothing in it is acted on
 //! otherwise            each lease past its time: the machine's guests with its
 //!                      claim tag and whole stamp, stopped when their node's
-//!                      live status says they are not (lease.rs stop_leased,
-//!                      the agent's own call), a decoy left and said
+//!                      live status says they are not
+//!                      (`onv_driver_proxmox::leased::stop_leased`, the
+//!                      agent's own rule), a decoy left and said
 //! ```
 //!
 //! **The two never act at once.** This holds the lock for its whole pass, so
@@ -40,8 +48,15 @@
 //! VMIDs, nodes and the hypervisor's own error text; never a credential. It
 //! never writes `run-lease.json`, whose one writer is the agent.
 
-use crate::lease;
-use crate::proxmox::Client;
+mod pve;
+#[cfg(test)]
+mod mock;
+
+pub use onv_agent_lib::lease_token::{read_token, CREDENTIAL, CREDENTIAL_SOURCE, PRIVILEGES};
+use onv_agent_lib::audit;
+use onv_agent_lib::run_lease as lease;
+use onv_driver_proxmox::leased::{self, Api};
+pub use pve::Client;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -158,10 +173,10 @@ impl Log {
     pub fn say(&self, subject: &str, outcome: &str, detail: &str) {
         if let Some(path) = &self.audit {
             self.opened.get_or_init(|| {
-                crate::audit::open(Some(path));
+                audit::open(Some(path));
             });
         }
-        crate::audit::record("instance.lease", "host-timer", subject, outcome, Some(detail));
+        audit::record("instance.lease", "host-timer", subject, outcome, Some(detail));
         let ts = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
@@ -279,8 +294,8 @@ pub async fn pass(driver: &anyhow::Result<Client>, file: &Path, log: &Log, now: 
                 ),
             )
         };
-        let mut out = lease::Stops { announce: Some(&announce), ..Default::default() };
-        let result = driver.stop_leased(&l.id, &mut out).await;
+        let mut out = leased::Stops { announce: Some(&announce), ..Default::default() };
+        let result = leased::stop_leased(driver, &l.id, &mut out).await;
         for g in &out.stopped {
             log.say(&l.id, "stopped", g);
         }
@@ -297,38 +312,183 @@ pub async fn pass(driver: &anyhow::Result<Client>, file: &Path, log: &Log, now: 
     Verdict::Acted { due: due.len(), stopped, refused, failed }
 }
 
-/// `onv-provider run-lease-expire`: one run, from the agent's own files. The
-/// exit status is [`Verdict::exit_code`]; a configuration that cannot be
-/// loaded is 1, said without the loader's words (they can quote a value).
-pub async fn main(config: &str, secrets: &str, dry_run: bool) -> i32 {
+/// What the timer reads of `agent.yaml`: the hypervisor's address, its
+/// certificate and where the lease file is. **Nothing else**, so a
+/// key the agent refuses, or a credential the file still holds from an older
+/// `join`, is never parsed here, and a configuration the agent refuses does
+/// not disarm the timer.
+#[derive(serde::Deserialize)]
+struct ForTimer {
+    proxmox: TimerProxmox,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TimerProxmox {
+    api_url: String,
+    #[serde(default)]
+    tls_fingerprint_sha256: Option<String>,
+    #[serde(default = "default_snippet_dir")]
+    snippet_dir: String,
+}
+
+/// The agent's own default for `proxmox.snippetDir` (its config.rs).
+fn default_snippet_dir() -> String {
+    "/var/lib/onv/snippets".to_string()
+}
+
+/// **The token holds what it should, and nothing more**, asked of Proxmox with
+/// the token itself (`/access/permissions`, which answers any caller its own):
+/// [`PRIVILEGES`] on the buyers' pool, and no privilege outside them anywhere.
+/// What deploy-agent.yml spends the token on before it trusts it.
+pub async fn probe(driver: &Client) -> Result<String, String> {
+    let held: std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>> =
+        driver.get_json("/access/permissions").await.map_err(|e| format!("the token was refused: {e:#}"))?;
+    let pool = format!("/pool/{}", onv_agent_lib::names::POOL_BUYERS);
+    let beyond: Vec<String> = held
+        .iter()
+        .flat_map(|(path, privs)| privs.keys().filter(|p| !PRIVILEGES.contains(&p.as_str())).map(move |p| format!("{p} on {path}")))
+        .collect();
+    if !beyond.is_empty() {
+        return Err(format!("the token holds more than {}: {}", PRIVILEGES.join(" and "), beyond.join(", ")));
+    }
+    let on_pool = held.get(&pool);
+    let lacking: Vec<&str> =
+        PRIVILEGES.iter().copied().filter(|p| !on_pool.is_some_and(|privs| privs.contains_key(*p))).collect();
+    if !lacking.is_empty() {
+        return Err(format!("the token lacks {} on {pool}", lacking.join(" and ")));
+    }
+    Ok(format!("the token authenticates and holds {} on {pool}, and nothing else", PRIVILEGES.join(" and ")))
+}
+
+/// One invocation, as `cli` reads it from the process: separate so a test
+/// can run it whole against a stand-in hypervisor.
+pub struct Invocation {
+    pub config: String,
+    pub dry_run: bool,
+    pub probe: bool,
+    pub credentials: Option<PathBuf>,
+    pub log: Log,
+}
+
+const USAGE: &str = "\
+onv-lease-expire - the Omnuv host timer
+
+USAGE:
+    onv-lease-expire [--config /etc/onv/agent.yaml] [--dry-run]
+    onv-lease-expire [--config /etc/onv/agent.yaml] --probe
+
+Run by onv-lease-expire.timer every minute, as onv: when the agent's lease
+task is not running, it stops each machine in run-lease.json past its run
+lease, and only stops. `--dry-run` says what it would stop. It exits 0 when
+nothing is wrong, 1 when something was not done (a missing token among
+them), and 2 when the lease file was refused.
+
+It holds one credential, its own Proxmox token (onv@pve!lease: VM.Audit and
+VM.PowerMgmt on the buyers' pool), given by its unit's LoadCredential=; it
+refuses to start without it. It reads agent.yaml's proxmox address,
+certificate and snippetDir, and never Core's token. `--probe` asks
+Proxmox, with the token, what the token holds, and fails on anything more.
+";
+
+/// `onv-lease-expire`: one run. The exit status is [`Verdict::exit_code`]; a
+/// missing or wrong token, or a configuration that cannot be read, is 1, said
+/// without the loader's words (they can quote a value).
+pub async fn cli() -> i32 {
+    // reqwest needs a process-wide default when built with
+    // `rustls-no-provider`; ring, the agent's.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{USAGE}");
+        return 0;
+    }
+    let known = |a: &String| matches!(a.as_str(), "--config" | "--dry-run" | "--probe");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if !known(a) {
+            eprint!("onv-lease-expire: unknown argument {a:?}\n\n{USAGE}");
+            return 2;
+        }
+        if a == "--config" && it.next().is_none() {
+            eprintln!("onv-lease-expire: --config needs a path");
+            return 2;
+        }
+    }
+    let config = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "/etc/onv/agent.yaml".into());
     // As the agent's user, as the unit runs it: a log this made as root is one
     // the unit can no longer append to, and nobody would notice.
     // SAFETY: geteuid has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } == 0 {
         eprintln!(
-            "run-lease-expire: not as root; as the agent's user, as onv-lease-expire.service runs it: \
-             runuser -u onv -- onv-provider run-lease-expire --dry-run. Nothing done"
+            "onv-lease-expire: not as root; as the agent's user, as onv-lease-expire.service runs it: \
+             systemd-run -p User=onv -p LoadCredential={CREDENTIAL}:{CREDENTIAL_SOURCE} --pipe --wait \
+             /usr/bin/onv-lease-expire --dry-run. Nothing done"
         );
         return 1;
     }
     let audit = std::env::var("OMNUV_AUDIT_LOG").unwrap_or_else(|_| "/var/log/onv/audit.log".into());
     let own = std::env::var("OMNUV_LEASE_TIMER_LOG").unwrap_or_else(|_| DEFAULT_LOG.into());
-    let log = Log::new(PathBuf::from(own), Some(audit));
-    let cfg = match crate::config::load_agent_with(config, secrets) {
-        Ok(c) => c,
-        Err(_) => {
-            log.say(
-                config,
+    let inv = Invocation {
+        config,
+        dry_run: args.iter().any(|a| a == "--dry-run"),
+        probe: args.iter().any(|a| a == "--probe"),
+        credentials: std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from),
+        log: Log::new(PathBuf::from(own), Some(audit)),
+    };
+    run(&inv).await
+}
+
+/// **One run, in order: the token, then the configuration, then the pass.**
+/// No token is a refusal before anything else is read or asked: the timer
+/// does not start without the one credential it is given.
+pub async fn run(inv: &Invocation) -> i32 {
+    let token = match read_token(inv.credentials.as_deref()) {
+        Ok(t) => t,
+        Err(why) => {
+            inv.log.say(CREDENTIAL, "refused", &format!("{why}; nothing stopped"));
+            return 1;
+        }
+    };
+    let cfg = match std::fs::read_to_string(&inv.config)
+        .ok()
+        .and_then(|raw| serde_yaml_ng::from_str::<ForTimer>(&raw).ok())
+    {
+        Some(c) => c.proxmox,
+        None => {
+            inv.log.say(
+                &inv.config,
                 "refused",
-                "the configuration could not be loaded, so no machine can be asked about; \
-                 `onv-provider check-config` names the key; nothing stopped",
+                "the configuration could not be read (proxmox.apiUrl, and tlsFingerprintSha256 and \
+                 snippetDir where set), so no machine can be asked about; nothing stopped",
             );
             return 1;
         }
     };
-    let driver = crate::agent::driver_of(&cfg);
-    let file = lease::file(&cfg.proxmox.snippet_dir);
-    let v = pass(&driver, &file, &log, SystemTime::now(), !dry_run).await;
+    let driver = Client::new(&cfg.api_url, cfg.tls_fingerprint_sha256.as_deref(), &token.id, token.secret.expose());
+    if inv.probe {
+        let said = match &driver {
+            Ok(d) => probe(d).await,
+            Err(e) => Err(format!("the hypervisor client could not be built: {e:#}")),
+        };
+        return match said {
+            Ok(fine) => {
+                println!("onv-lease-expire: {} ({})", fine, token.id);
+                0
+            }
+            Err(why) => {
+                inv.log.say(CREDENTIAL, "refused", &format!("{} ({})", why, token.id));
+                1
+            }
+        };
+    }
+    let file = lease::file(&cfg.snippet_dir);
+    let v = pass(&driver, &file, &inv.log, SystemTime::now(), !inv.dry_run).await;
     println!("run-lease-expire: {}", v.describe());
     v.exit_code()
 }
@@ -336,16 +496,17 @@ pub async fn main(config: &str, secrets: &str, dry_run: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pvemock::{task_ok, Mock};
+    use crate::mock::{task_ok, Mock};
+    use onv_agent_lib::names;
 
     const ID: &str = "0b1f7a2e-1111-4222-8333-944455556666";
 
     /// Two guests carry the machine's tag: 701 with its whole stamp, 702 (the
     /// decoy) with another. `status` is what 701's node says of it now.
     async fn proxmox(status: (u16, serde_json::Value)) -> Mock {
-        let tags = format!("onv-instance;{}", crate::names::short_tag(ID));
-        let stamp = crate::names::description(crate::names::TAG_INSTANCE, ID);
-        Mock::start(move |method, path, _| {
+        let tags = format!("onv-instance;{}", names::short_tag(ID));
+        let stamp = names::description(names::TAG_INSTANCE, ID);
+        Mock::start(move |method, path| {
             if let Some(r) = task_ok(path) {
                 return r;
             }
@@ -415,6 +576,15 @@ mod tests {
         serde_json::json!({"leases": [{"id": ID, "until_unix": now - ago}]}).to_string()
     }
 
+    /// **The agent's lease task, as far as the timer can tell**: the lock it
+    /// holds for as long as it runs (the agent's `lease::take_lock`, the same
+    /// `flock` on the same file, `run_lease::lock_file`).
+    fn agents_lock(file: &Path) -> std::fs::File {
+        let f = lease::open_lock(&lease::lock_file(file)).expect("the lock file");
+        f.try_lock().expect("the agent's lock");
+        f
+    }
+
     fn own_log(h: &Host) -> String {
         std::fs::read_to_string(&h.own).unwrap_or_default()
     }
@@ -459,14 +629,14 @@ mod tests {
     async fn nothing_is_stopped_while_the_agent_holds_the_lease_lock() {
         let mock = proxmox(running()).await;
         let h = host(Some(&expired_body(60)), Duration::from_secs(120));
-        let held = lease::take_lock(&h.file).await.expect("the agent's lock");
+        let held = agents_lock(&h.file);
         let v = pass(&Ok(mock.client()), &h.file, &h.log, SystemTime::now(), true).await;
         assert_eq!(v, Verdict::AgentHolds { stale: Some(120) }, "{}", v.describe());
         assert!(!asked_anything(&mock), "Proxmox was asked while the agent ran");
         assert!(own_log(&h).contains("refused"), "a live agent that stopped writing was not said");
         // A fresh file under a held lock is the normal case: nothing said.
         let fresh = host(Some(&expired_body(60)), Duration::from_secs(5));
-        let _also = lease::take_lock(&fresh.file).await.expect("the agent's lock");
+        let _also = agents_lock(&fresh.file);
         let v = pass(&Ok(mock.client()), &fresh.file, &fresh.log, SystemTime::now(), true).await;
         assert_eq!(v, Verdict::AgentHolds { stale: None });
         assert_eq!(own_log(&fresh), "", "the normal case was logged");
@@ -494,7 +664,11 @@ mod tests {
         let timer = lease::open_lock(&lease::lock_file(&h.file)).unwrap();
         timer.try_lock().expect("the timer's lock");
         let file = h.file.clone();
-        let agent = tokio::spawn(async move { lease::take_lock(&file).await });
+        // The agent's take_lock: a blocking flock, off the runtime's threads.
+        let agent = tokio::task::spawn_blocking(move || {
+            let f = lease::open_lock(&lease::lock_file(&file)).ok()?;
+            f.lock().ok().map(|()| f)
+        });
         tokio::time::sleep(Duration::from_millis(200)).await; // wait: nothing to poll; a lock not yet granted
         assert!(!agent.is_finished(), "the agent's lease task ran beside the timer's pass");
         drop(timer);
@@ -598,19 +772,173 @@ mod tests {
     }
 
     /// **The period the bound is derived from is the unit's**, and the unit
-    /// runs this entry point.
+    /// runs this binary, with its token and nothing else (A3).
     #[test]
-    fn the_timer_unit_runs_this_entry_point_every_minute_to_the_second() {
-        let timer = include_str!("../packaging/deb/lib/systemd/system/onv-lease-expire.timer");
+    fn the_timer_unit_runs_this_binary_every_minute_to_the_second() {
+        let timer = include_str!("../../../packaging/deb/lib/systemd/system/onv-lease-expire.timer");
         let lines: Vec<&str> = timer.lines().map(str::trim).collect();
         assert!(lines.contains(&"OnCalendar=minutely"), "the timer's period is not the one STALE_AFTER assumes");
         assert!(lines.contains(&"AccuracySec=1s"), "systemd's default accuracy (1 min) would double the period");
         assert_eq!(EVERY, Duration::from_secs(60));
-        let service = include_str!("../packaging/deb/lib/systemd/system/onv-lease-expire.service");
+        let service = include_str!("../../../packaging/deb/lib/systemd/system/onv-lease-expire.service");
         assert!(
-            service.lines().any(|l| l == "ExecStart=/usr/bin/onv-provider run-lease-expire --config /etc/onv/agent.yaml"),
-            "the service does not run the host timer's entry point"
+            service.lines().any(|l| l == "ExecStart=/usr/bin/onv-lease-expire --config /etc/onv/agent.yaml"),
+            "the service does not run the host timer's binary"
         );
+        let load = format!("LoadCredential={CREDENTIAL}:{CREDENTIAL_SOURCE}");
+        assert!(service.lines().any(|l| l == load), "the service does not load the timer's token as {CREDENTIAL}");
+    }
+
+    /// A credentials directory as systemd makes one, holding `body` as the
+    /// timer's credential (or nothing).
+    fn credentials(body: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(body) = body {
+            std::fs::write(dir.path().join(CREDENTIAL), body).unwrap();
+        }
+        dir
+    }
+
+    const LEASE_TOKEN: &str = "proxmoxTokenId: onv@pve!lease\nproxmoxTokenSecret: SEKRET-LEASE\n";
+
+    /// agent.yaml as the timer reads it, beside `h`'s lease file: the
+    /// stand-in's address and nothing of Core. The agent itself refuses this
+    /// file (no core section, no token id, a timing it does not know), which
+    /// is the point: the timer reads only its own keys.
+    fn config_for(h: &Host, mock: &Mock) -> PathBuf {
+        let snippets = h.file.parent().unwrap().join("snippets");
+        let path = h.file.parent().unwrap().join("agent.yaml");
+        let body = format!(
+            "proxmox:\n  apiUrl: {}\n  tlsFingerprintSha256: \"{}\"\n  snippetDir: {}\ntimings:\n  noSuchTiming: 1\n",
+            mock.base,
+            "AB".repeat(32),
+            snippets.display()
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn invocation(config: &Path, creds: Option<&Path>, h: &Host, probe: bool) -> Invocation {
+        Invocation {
+            config: config.display().to_string(),
+            dry_run: false,
+            probe,
+            credentials: creds.map(Path::to_path_buf),
+            log: Log::new(h.own.clone(), None),
+        }
+    }
+
+    /// **The timer refuses to start without its token** (A3's acceptance): a
+    /// machine past its lease, a dead agent, and no credential, or a
+    /// credentials directory without the timer's. Nothing is asked of
+    /// Proxmox, nothing is stopped, the refusal is said in the timer's own
+    /// file naming where the token comes from, and the run exits 1.
+    #[tokio::test]
+    async fn the_timer_refuses_to_start_without_its_token() {
+        let mock = proxmox(running()).await;
+        let h = host(Some(&expired_body(60)), Duration::from_secs(120));
+        let config = config_for(&h, &mock);
+        let empty = credentials(None);
+        for creds in [None, Some(empty.path())] {
+            let code = run(&invocation(&config, creds, &h, false)).await;
+            assert_eq!(code, 1, "{creds:?}: a run without its token did not refuse");
+        }
+        assert!(!asked_anything(&mock), "Proxmox was asked without the timer's token");
+        let said = own_log(&h);
+        assert_eq!(said.matches("lease refused: no credential").count(), 2, "{said}");
+        assert!(said.contains(&format!("LoadCredential={CREDENTIAL}:{CREDENTIAL_SOURCE}")), "{said}");
+        // The same files, with the token: the machine is stopped. So the
+        // refusal above was the token's absence and nothing else.
+        let token = credentials(Some(LEASE_TOKEN));
+        assert_eq!(run(&invocation(&config, Some(token.path()), &h, false)).await, 0, "{}", own_log(&h));
+        assert_eq!(stops(&mock), ["/nodes/n1/qemu/701/status/stop"]);
+    }
+
+    /// **It stops with its own token, and asks with nothing else**: every
+    /// call carries `onv@pve!lease`, never the agent's token, and the
+    /// configuration it read is one the agent itself refuses.
+    #[tokio::test]
+    async fn with_its_token_it_stops_with_that_token_alone() {
+        let mock = proxmox(running()).await;
+        let h = host(Some(&expired_body(60)), Duration::from_secs(120));
+        let config = config_for(&h, &mock);
+        let token = credentials(Some(LEASE_TOKEN));
+        assert_eq!(run(&invocation(&config, Some(token.path()), &h, false)).await, 0, "{}", own_log(&h));
+        assert_eq!(stops(&mock), ["/nodes/n1/qemu/701/status/stop"]);
+        let auths: std::collections::BTreeSet<String> = mock.calls.lock().unwrap().iter().map(|c| c.auth.clone()).collect();
+        assert_eq!(auths.into_iter().collect::<Vec<_>>(), ["PVEAPIToken=onv@pve!lease=SEKRET-LEASE"]);
+    }
+
+    /// **A credential that is not the timer's own is refused**, before
+    /// anything is asked: one naming Core's token, one naming the agent's
+    /// Proxmox token, one with a part missing or empty or not a string. No
+    /// refusal quotes a secret.
+    #[tokio::test]
+    async fn a_credential_that_is_not_the_timers_own_is_refused() {
+        let mock = proxmox(running()).await;
+        let h = host(Some(&expired_body(60)), Duration::from_secs(120));
+        let config = config_for(&h, &mock);
+        for (body, why) in [
+            ("proxmoxTokenId: onv@pve!lease\nproxmoxTokenSecret: SEKRET-A\ncoreToken: SEKRET-B\n", "`coreToken` is not a credential"),
+            ("proxmoxTokenId: onv@pve!agent\nproxmoxTokenSecret: SEKRET-A\n", "never with the agent's"),
+            ("proxmoxTokenId: lease\nproxmoxTokenSecret: SEKRET-A\n", "not a `<user>@<realm>!lease` token"),
+            ("proxmoxTokenSecret: SEKRET-A\n", "proxmoxTokenId missing"),
+            ("proxmoxTokenId: onv@pve!lease\n", "proxmoxTokenSecret missing"),
+            ("proxmoxTokenId: onv@pve!lease\nproxmoxTokenSecret: ''\n", "proxmoxTokenSecret is empty"),
+            ("proxmoxTokenId: onv@pve!lease\nproxmoxTokenSecret: [SEKRET-A]\n", "proxmoxTokenSecret must be a string"),
+            ("proxmoxTokenSecret: \"SEKRET-A\n", "not a map of names to values"),
+        ] {
+            let creds = credentials(Some(body));
+            let why_said = read_token(Some(creds.path())).err().unwrap_or_default();
+            assert!(why_said.contains(why), "{body:?}: said {why_said:?}");
+            assert!(!why_said.contains("SEKRET"), "{body:?}: a secret was quoted: {why_said}");
+            assert_eq!(run(&invocation(&config, Some(creds.path()), &h, false)).await, 1, "{body:?}");
+        }
+        assert!(!asked_anything(&mock), "Proxmox was asked with a credential that is not the timer's");
+        assert!(!own_log(&h).contains("SEKRET"), "a secret reached the log");
+    }
+
+    /// The token's own permissions, as `/access/permissions` answers them.
+    async fn permissions(held: serde_json::Value) -> Mock {
+        Mock::start(move |method, path| match (method, path) {
+            ("GET", "/access/permissions") => (200, held.clone()),
+            _ => (404, serde_json::Value::Null),
+        })
+        .await
+    }
+
+    /// **`--probe` passes the token that holds what it should, and fails one
+    /// that holds more or less**: the play's proof that the token it minted
+    /// works and is the narrow one.
+    #[tokio::test]
+    async fn the_probe_passes_only_the_narrow_token() {
+        let h = host(None, Duration::ZERO);
+        let token = credentials(Some(LEASE_TOKEN));
+        let right = serde_json::json!({
+            "/pool/onv-buyers": {"VM.Audit": 1, "VM.PowerMgmt": 1},
+            "/vms/701": {"VM.Audit": 1, "VM.PowerMgmt": 1},
+        });
+        let mock = permissions(right).await;
+        let config = config_for(&h, &mock);
+        assert_eq!(run(&invocation(&config, Some(token.path()), &h, true)).await, 0, "{}", own_log(&h));
+        assert!(mock.calls.lock().unwrap().iter().all(|c| c.auth == "PVEAPIToken=onv@pve!lease=SEKRET-LEASE"));
+        for (held, why) in [
+            (
+                serde_json::json!({"/pool/onv-buyers": {"VM.Audit": 1, "VM.PowerMgmt": 1}, "/": {"Sys.Audit": 1}}),
+                "Sys.Audit on /",
+            ),
+            (
+                serde_json::json!({"/pool/onv-buyers": {"VM.Audit": 1, "VM.PowerMgmt": 1, "VM.Allocate": 1}}),
+                "VM.Allocate on /pool/onv-buyers",
+            ),
+            (serde_json::json!({"/pool/onv-buyers": {"VM.Audit": 1}}), "lacks VM.PowerMgmt on /pool/onv-buyers"),
+            (serde_json::json!({"/pool/onv": {"VM.Audit": 1, "VM.PowerMgmt": 1}}), "lacks VM.Audit and VM.PowerMgmt"),
+        ] {
+            let mock = permissions(held.clone()).await;
+            let config = config_for(&h, &mock);
+            assert_eq!(run(&invocation(&config, Some(token.path()), &h, true)).await, 1, "{held} passed");
+            assert!(own_log(&h).contains(why), "{held}: {}", own_log(&h));
+        }
     }
 
     /// **The bound fits Core's margin**: a machine whose agent died at its

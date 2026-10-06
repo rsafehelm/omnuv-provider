@@ -3,7 +3,7 @@
 # a disposable privileged container (its own network namespace; nothing on
 # this machine is touched), against the egress policy omnuv's play installs.
 #
-#     tests/opening/nft_test.sh <onv-provider binary> [egress.nft]
+#     tests/opening/nft_test.sh <onv-opening binary> [egress.nft]
 #
 # The binary must run on Debian trixie: the one build-deb.sh builds does.
 # egress.nft defaults to tests/opening/egress.nft, a rendering of omnuv's
@@ -14,7 +14,7 @@ bin="$(realpath "$1")"
 egress="$(realpath "${2:-$here/egress.nft}")"
 # Default bridge network: apt needs the internet, and no network is created.
 docker run --rm --privileged --name "onvt-opening-$$" \
-    -v "$bin:/usr/local/bin/onv-provider:ro" \
+    -v "$bin:/usr/local/bin/onv-opening:ro" \
     -v "$here/udp.py:/t/udp.py:ro" \
     -v "$here/in_container.sh:/t/in_container.sh:ro" \
     -v "$egress:/t/egress.nft:ro" \

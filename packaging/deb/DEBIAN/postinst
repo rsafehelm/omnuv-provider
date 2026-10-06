@@ -87,6 +87,14 @@ case "$1" in
         # the lease lock, and never the one it replaced. Before `join` its
         # service's ConditionPathExists skips each run.
         systemctl enable --now onv-lease-expire.timer >/dev/null 2>&1 || true
+        # Its one credential, its own Proxmox token (omnuv's modular design,
+        # A3), is written by deploy-agent.yml or `join`, never by a package.
+        # A joined host without it has a timer whose every run fails; said
+        # here, where the person installing will read it.
+        if [ -f /etc/onv/agent.yaml ] && [ ! -f /etc/onv/lease-secrets.yaml ]; then
+            echo "onv-provider: /etc/onv/lease-secrets.yaml is missing, so onv-lease-expire cannot start;" >&2
+            echo "  deploy-agent.yml or onv-provider join writes the host timer's token there." >&2
+        fi
         # **The provider opening's applier** (opening.rs): at boot, and again
         # whenever the agent rewrites its ports. Started once now so the
         # kernel holds what the configuration says from this install on:

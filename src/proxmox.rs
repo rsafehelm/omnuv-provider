@@ -60,49 +60,15 @@ struct Envelope<T> {
     data: T,
 }
 
-/// **What Proxmox said when it refused a call** (the lifecycle phase 7
-/// regression, nuc0, 26 September: the journal said "500 Internal Server
-/// Error" and nothing else). `pve-http-server` answers a handler's `die` with
-/// the message as the HTTP reason phrase, which reqwest keeps only as hyper's
-/// extension, and some answers carry it in the body as well. Both are said:
-/// the reason, then the body's `message`, or the body itself when it has none
-/// (cut to 300 characters). **Never the token**: its id and secret are
-/// replaced wherever Proxmox might have echoed them.
+/// **What Proxmox said when it refused a call**: the driver crate's
+/// `refusal_text` since A3, which the host timer's client says it with too.
 pub(crate) fn refusal_text(
     status: reqwest::StatusCode,
     reason: Option<&str>,
     body: &str,
     auth: &omnuv_protocol::Redacted,
 ) -> String {
-    let mut said = status.as_u16().to_string();
-    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
-    let canonical = status.canonical_reason().unwrap_or("");
-    said.push(' ');
-    said.push_str(reason.unwrap_or(canonical));
-    let message = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|m| m.trim().to_string()));
-    let detail = match message {
-        Some(m) => m,
-        None => {
-            let b = body.trim();
-            if b == r#"{"data":null}"# { String::new() } else { b.to_string() }
-        }
-    };
-    if !detail.is_empty() && Some(detail.as_str()) != reason {
-        said.push_str(": ");
-        said.push_str(&detail);
-    }
-    let mut said: String = said.chars().take(300).collect();
-    // `PVEAPIToken=<id>=<secret>`: each part scrubbed on its own.
-    let token = auth.expose().trim_start_matches("PVEAPIToken=");
-    let (id, secret) = token.split_once('=').unwrap_or((token, ""));
-    for part in [secret, id] {
-        if part.len() >= 3 {
-            said = said.replace(part, "<token>");
-        }
-    }
-    said
+    onv_driver_proxmox::leased::refusal_text(status.as_u16(), status.canonical_reason(), reason, body, auth)
 }
 
 /// A request that never got an answer, with every cause reqwest knows.
@@ -467,6 +433,22 @@ impl PciClaims {
             self.complete = false;
         }
         result
+    }
+}
+
+/// **The three calls a leased machine's stop makes** (A3): the agent's own
+/// methods, so its lease task stops by the rule the host timer stops by.
+impl onv_driver_proxmox::leased::Api for Client {
+    async fn get_json<T: serde::de::DeserializeOwned + Send>(&self, path: &str) -> anyhow::Result<T> {
+        self.get(path).await
+    }
+
+    async fn post_empty(&self, path: &str) -> anyhow::Result<String> {
+        self.post_form(path, &[] as &[(String, String)]).await
+    }
+
+    async fn wait_task(&self, node: &str, upid: &str) -> anyhow::Result<()> {
+        Client::wait_task(self, node, upid).await
     }
 }
 

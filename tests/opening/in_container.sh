@@ -12,7 +12,8 @@
 # Loaded: the egress policy omnuv's play installs (/t/egress.nft), which owns
 # the bridge's NAT, a stand-in that moves two probe ports (below), and the
 # agent's table, by
-# the packaged binary's own `apply-opening`. Every verdict is a packet sent
+# the packaged `onv-opening`, which holds no credential (omnuv's modular
+# design, A3): none is in this container, and agent.yaml names none. Every verdict is a packet sent
 # and an answer heard or not heard.
 set -uo pipefail
 cd /t || exit 1
@@ -86,7 +87,7 @@ YAML
 book() { # json of machines
     printf '{"machines": %s}\n' "$1" > /var/lib/onv/opening.json
 }
-apply() { onv-provider apply-opening --config /etc/onv/agent.yaml > /tmp/apply.out 2>&1; echo $?; }
+apply() { onv-opening --config /etc/onv/agent.yaml > /tmp/apply.out 2>&1; echo $?; }
 table() { nft list table inet onv_opening 2>/dev/null; }
 has_table() { if table > /dev/null; then echo present; else echo absent; fi; }
 
@@ -107,7 +108,7 @@ ask() { nsx "$1" python3 /t/udp.py ask "${@:2}"; }
 # ---- on ----
 config true public 203.0.113.1 31820-31822
 book '{"m-guest": {"port": 31820, "address": "10.201.0.105"}, "m-other": {"port": 31821, "address": null}}'
-expect "on: apply-opening exits 0" 0 "$(apply)"
+expect "on: onv-opening exits 0" 0 "$(apply)"
 expect "on: one rule pair, for the machine seen on the bridge" "1 1" \
     "$(table | grep -c ' dnat ip to 10.201.0.105:31820') $(table | grep -c 'masquerade to :31820')"
 expect "the internet reaches the guest's own port, answered from the public address and port" \

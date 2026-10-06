@@ -1333,7 +1333,7 @@ mod handshake_tests {
         assert!(held, "no lease task held the lock while the handshake waited for Core");
         assert!(rewritten, "no lease task wrote the file while the handshake waited for Core");
         let leases = crate::lease::read_body(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(leases, [crate::lease::Written { id: "m1".into(), until_unix: until }], "the lease was not resumed");
+        assert_eq!(leases, [onv_agent_lib::run_lease::Written { id: "m1".into(), until_unix: until }], "the lease was not resumed");
     }
 
     /// **A restarted agent that cannot reach Core maintains from the held

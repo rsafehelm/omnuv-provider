@@ -156,22 +156,60 @@ packaging/manifest.sh "$deb" "$out/workloadd/onv-workloadd" "$out/onv-provider_c
 step "onv-workloadd's digest is the one recorded"
 packaging/baselines.sh workloadd "$out/workloadd/onv-workloadd"
 
+# **Three host binaries, each with its own sandbox** (omnuv's modular design,
+# A3): the agent, the host timer and the opening's applier, every unit held
+# to its lines by packaging/units.py, whose own test first proves it fails a
+# unit that drops one.
+step "The package holds three host binaries, and every unit holds its sandboxing"
+for b in onv-provider onv-lease-expire onv-opening; do
+    grep -q " ./usr/bin/$b\$" <<< "$listing"
+done
+dpkg-deb -x "$deb" "$out/root"
+python3 packaging/units.py --self-test
+python3 packaging/units.py "$out/root"
+# The applier holds no credential, so it links no client that could spend
+# one: neither Proxmox's token header nor Core's token name is in it. The
+# needles are split so this line does not match itself in a listing.
+opening_strings="$(strings "$out/root/usr/bin/onv-opening")"
+for needle in "PVEAPI""Token=" "core""Token" "CREDENTIALS_""DIRECTORY"; do
+    if grep -q "$needle" <<< "$opening_strings"; then
+        echo "onv-opening holds $needle: it links a credential's client" >&2
+        exit 1
+    fi
+done
+grep -q 'onv-opening - the Omnuv provider opening' <<< "$opening_strings"
+# The host timer holds a Proxmox token and no Core credential, so it links no
+# Core client: neither Core's token name nor the session header is in it.
+timer_strings="$(strings "$out/root/usr/bin/onv-lease-expire")"
+for needle in "core""Token" "onv-ses""sion"; do
+    if grep -q "$needle" <<< "$timer_strings"; then
+        echo "onv-lease-expire holds $needle: it links Core's client" >&2
+        exit 1
+    fi
+done
+
 # The host timer (lifecycle phase 12). The packaged binary is run, not only
-# listed: against a configuration that is not there it must refuse (exit 1,
-# not the 2 of an unknown command), say so in its own file and in the audit
-# log as `host-timer`, and touch nothing else.
-step "The package holds the host timer, its postinst enables it, and the packaged binary runs it"
+# listed: without its token it must refuse to start (exit 1, not the 2 of an
+# unknown argument), say so in its own file and in the audit log as
+# `host-timer`, and touch nothing else. A configuration is there, so the
+# refusal is the token's.
+step "The package holds the host timer, its postinst enables it, and the packaged binary refuses to start without its token"
 grep -q ' ./lib/systemd/system/onv-lease-expire.service$' <<< "$listing"
 grep -q ' ./lib/systemd/system/onv-lease-expire.timer$' <<< "$listing"
 postinst="$(dpkg-deb -I "$deb" postinst)"
 grep -q '^ *systemctl enable --now onv-lease-expire.timer' <<< "$postinst"
-dpkg-deb -x "$deb" "$out/root"
+printf 'proxmox:\n  apiUrl: https://127.0.0.1:8006\n  snippetDir: %s/snippets\n' "$out" > "$out/agent.yaml"
 rc=0
-OMNUV_LEASE_TIMER_LOG="$out/timer.log" OMNUV_AUDIT_LOG="$out/audit.log" \
-    "$out/root/usr/bin/onv-provider" run-lease-expire --config "$out/absent.yaml" > "$out/timer.out" 2>&1 || rc=$?
+env -u CREDENTIALS_DIRECTORY OMNUV_LEASE_TIMER_LOG="$out/timer.log" OMNUV_AUDIT_LOG="$out/audit.log" \
+    "$out/root/usr/bin/onv-lease-expire" --config "$out/agent.yaml" > "$out/timer.out" 2>&1 || rc=$?
 test "$rc" -eq 1
-grep -q 'refused' "$out/timer.log"
+grep -q 'lease refused: no credential' "$out/timer.log"
 grep -q '"actor":"host-timer"' "$out/audit.log"
+# The agent's own binary no longer runs it, and says where it went.
+rc=0
+"$out/root/usr/bin/onv-provider" run-lease-expire > "$out/moved.out" 2>&1 || rc=$?
+test "$rc" -eq 2
+grep -q 'moved to /usr/bin/onv-lease-expire' "$out/moved.out"
 
 # The provider opening (opening.rs): its units in the package, enabled by its
 # postinst, its table removed by its prerm; then the packaged binary applies
@@ -182,7 +220,7 @@ grep -q ' ./lib/systemd/system/onv-opening.service$' <<< "$listing"
 grep -q ' ./lib/systemd/system/onv-opening.path$' <<< "$listing"
 grep -q '^ *systemctl enable --now onv-opening.path' <<< "$postinst"
 grep -q 'nft delete table inet onv_opening' <<< "$(dpkg-deb -I "$deb" prerm)"
-tests/opening/nft_test.sh "$out/root/usr/bin/onv-provider" > "$out/opening.log" 2>&1 || { cat "$out/opening.log"; exit 1; }
+tests/opening/nft_test.sh "$out/root/usr/bin/onv-opening" > "$out/opening.log" 2>&1 || { cat "$out/opening.log"; exit 1; }
 grep -q '^opening: every case passed$' "$out/opening.log"
 
 # Supervision and log bounds (omnuv's modular design, A4): the journal's cap
