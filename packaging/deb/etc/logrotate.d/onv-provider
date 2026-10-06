@@ -1,0 +1,31 @@
+# The provider's own logs in /var/log/onv (omnuv's modular design, A4): the
+# audit log, which the agent and the host timer append to, and the host
+# timer's own log. They grew without bound on the hypervisor's root.
+#
+# By rename, never copytruncate: the agent's audit sink sees that the path no
+# longer names the file it holds and opens it again before its next record
+# (onv_agent_lib::audit), and the host timer opens its files on each run. So
+# no signal is needed, and no record is lost between a copy and a truncate.
+#
+# Kept: 12 rotations of at most 100 MB, compressed. The audit log is the
+# provider's record of what this marketplace did on their hardware; this
+# bounds how much of it sits on the root filesystem, and what is older is
+# theirs to ship elsewhere before it ages out. Edit this file to keep more:
+# it is a conffile, and an upgrade asks before replacing an edited one.
+/var/log/onv/*.log {
+    # The directory is onv's to write (onv:adm 0750), so rotation runs as
+    # onv rather than as root in a directory another user controls. Group
+    # onv, not adm: under `su onv adm` the new file came out onv:adm, as
+    # logrotate could not give it a group the process was not in (measured
+    # in tests/logs with logrotate 3.22).
+    su onv onv
+    weekly
+    maxsize 100M
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # As the package's postinst leaves it, and as the agent makes it.
+    create 0640 onv onv
+}

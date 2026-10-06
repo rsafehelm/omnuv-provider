@@ -97,6 +97,8 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/doc/onv-provider"
 cp -r "$ROOT/packaging/deb/DEBIAN" "$STAGE/"
 cp -r "$ROOT/packaging/deb/lib" "$STAGE/"
+# The journal's cap and the logs' rotation (A4); DEBIAN/conffiles names them.
+cp -r "$ROOT/packaging/deb/etc" "$STAGE/"
 install -m 0755 "$ROOT/target/release/onv-provider" "$STAGE/usr/bin/onv-provider"
 install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/onv-provider/README.md"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/onv-provider/copyright"

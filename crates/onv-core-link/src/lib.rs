@@ -10,4 +10,5 @@ pub mod installwatch;
 pub mod report;
 pub mod restore;
 pub mod session;
+pub mod supervise;
 pub mod tls;

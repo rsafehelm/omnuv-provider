@@ -259,7 +259,7 @@ where
     // and a dead tunnel that still looks alive is worse than a closed one.
     {
         let ping = out_tx.clone();
-        tokio::spawn(async move {
+        onv_core_link::supervise::spawn("tunnel keepalive", async move {
             let mut tick = tokio::time::interval(keepalive.ping);
             loop {
                 tick.tick().await;
@@ -270,7 +270,7 @@ where
         });
     }
 
-    let writer = tokio::spawn(async move {
+    let writer = onv_core_link::supervise::spawn("tunnel writer", async move {
         while let Some(frame) = out_rx.recv().await {
             let Ok(text) = serde_json::to_string(&frame) else { continue };
             if sink.send(Message::text(text)).await.is_err() {
@@ -319,7 +319,7 @@ where
 
                 let tx = out_tx.clone();
                 let key = id.clone();
-                let handle = tokio::spawn(async move {
+                let handle = onv_core_link::supervise::spawn("tunnel request", async move {
                     forward(&endpoint, &path, body, id, tx).await;
                 });
                 track(&inflight, key, handle).await;
@@ -332,7 +332,7 @@ where
                 let opener = consoles.clone();
                 let table = sessions.clone();
                 let key = id.clone();
-                let handle = tokio::spawn(async move {
+                let handle = onv_core_link::supervise::spawn("tunnel console", async move {
                     let stream = match opener.open(&instance_id, kind).await {
                         Ok(s) => s,
                         Err(e) => {

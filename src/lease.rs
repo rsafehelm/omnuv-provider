@@ -434,24 +434,17 @@ pub fn spawn(book: Shared, driver: Arc<Client>, file: std::path::PathBuf, on_unr
     if let Err(why) = &found {
         on_unread(why);
     }
-    let task = tokio::spawn(async move {
+    // **The agent never runs without its lease task.** A panic there frees
+    // the lock, and the host timer would then act beside a reconcile loop
+    // still maintaining the same machines; so the process ends (70, as every
+    // supervised task's panic does since A4), and systemd starts it again
+    // with the file's leases resumed.
+    onv_core_link::supervise::spawn("run lease", async move {
         let _held = take_lock(&file).await;
         let mut every = tokio::time::interval(WRITE_EVERY);
         loop {
             every.tick().await;
             check(&book, &driver, &file).await;
-        }
-    });
-    // **The agent never runs without its lease task.** A panic there frees
-    // the lock, and the host timer would then act beside a reconcile loop
-    // still maintaining the same machines; so the process ends, and systemd
-    // starts it again with the file's leases resumed.
-    tokio::spawn(async move {
-        if let Err(e) = task.await
-            && e.is_panic()
-        {
-            eprintln!("run lease: the lease task panicked; the agent exits rather than run without it");
-            std::process::exit(70);
         }
     });
     found

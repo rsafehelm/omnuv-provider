@@ -20,7 +20,36 @@ use serde::Serialize;
 /// `journalctl -u onv-provider` shows the same events.
 const DEFAULT_PATH: &str = "/var/log/onv/audit.log";
 
-static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+/// The open file and the path it was opened at.
+///
+/// **The sink reopens its file when the path no longer names it** (omnuv's
+/// modular design, A4). It held one handle for the life of the process, so
+/// once logrotate renamed `audit.log` the agent went on appending to
+/// `audit.log.1` for ever, and the new `audit.log` stayed empty. Before each
+/// record the path is compared with the handle, device and inode; a path that
+/// is gone or names another file is opened again. A rename is what logrotate
+/// does by default, so rotation needs no signal and no `copytruncate`.
+struct Sink {
+    path: String,
+    file: std::fs::File,
+}
+
+impl Sink {
+    /// Whether `path` still names the file held, by device and inode.
+    fn current(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(&self.path), self.file.metadata()) {
+            (Ok(at_path), Ok(held)) => at_path.dev() == held.dev() && at_path.ino() == held.ino(),
+            _ => false,
+        }
+    }
+}
+
+fn open_append(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
+}
 
 /// Records not yet sent to the marketplace.
 ///
@@ -88,9 +117,9 @@ pub fn open(path: Option<&str>) -> Option<String> {
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        Ok(f) => {
-            *crate::poison::lock(&SINK, "audit file") = Some(f);
+    match open_append(path) {
+        Ok(file) => {
+            *crate::poison::lock(&SINK, "audit file") = Some(Sink { path: path.to_string(), file });
             Some(path.to_string())
         }
         Err(e) => {
@@ -118,9 +147,18 @@ pub fn record(action: &str, actor: &str, subject: &str, outcome: &str, detail: O
     // One write per record, newline included: the host timer appends to the
     // same file from its own process, and `writeln!` is two writes, between
     // which another process's line could land.
-    if let Some(f) = crate::poison::lock(&SINK, "audit file").as_mut() {
-        let _ = f.write_all(format!("{line}\n").as_bytes());
-        let _ = f.flush();
+    if let Some(sink) = crate::poison::lock(&SINK, "audit file").as_mut() {
+        if !sink.current() {
+            match open_append(&sink.path) {
+                Ok(file) => sink.file = file,
+                // Kept on the old handle: the record still lands, in the
+                // renamed file, and the next record tries again.
+                Err(e) => eprintln!("warning: cannot reopen audit log at {}: {e:#}", sink.path),
+            }
+        }
+        if let Err(e) = sink.file.write_all(format!("{line}\n").as_bytes()).and_then(|()| sink.file.flush()) {
+            eprintln!("warning: audit record not written to {}: {e:#}", sink.path);
+        }
     }
 
     {
@@ -164,6 +202,41 @@ pub const REDACTION_POLICY: &str = "metadata only; no secrets, no buyer payloads
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering::Relaxed;
+
+    /// **Renaming the audit log causes a reopen** (A4's acceptance): a record
+    /// after the rename lands in a new file at the path, and the renamed file
+    /// keeps only what was written before. With one handle for the process,
+    /// the second record went to the renamed file and the path stayed absent.
+    ///
+    /// The sink is the process's, shared with every test that records, so
+    /// each file is searched for this test's own subjects, never counted.
+    #[test]
+    fn renaming_the_log_reopens_it_at_its_path() {
+        let dir = std::env::temp_dir().join(format!("onv-audit-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let rotated = dir.join("audit.log.1");
+        let path_s = path.to_str().unwrap();
+        assert_eq!(super::open(Some(path_s)).as_deref(), Some(path_s));
+
+        super::record("test.reopen", "agent", "before-the-rename", "ok", None);
+        std::fs::rename(&path, &rotated).unwrap();
+        super::record("test.reopen", "agent", "after-the-rename", "ok", None);
+
+        let now = std::fs::read_to_string(&path).expect("a record after the rename made the file again");
+        let old = std::fs::read_to_string(&rotated).unwrap();
+        assert!(old.contains("before-the-rename"), "{old}");
+        assert!(!old.contains("after-the-rename"), "written to the renamed file: {old}");
+        assert!(now.contains("after-the-rename"), "{now}");
+        assert!(!now.contains("before-the-rename"), "{now}");
+
+        // And a deleted file, which `logrotate`'s `create` never leaves but a
+        // person might: the next record makes it again.
+        std::fs::remove_file(&path).unwrap();
+        super::record("test.reopen", "agent", "after-the-delete", "ok", None);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("after-the-delete"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// **The backlog is `timings.auditBacklog`**, and past it the oldest record
     /// goes first. It was a constant, 500, until 26 September 2026.

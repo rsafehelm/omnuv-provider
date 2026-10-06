@@ -44,6 +44,28 @@ case "$1" in
         chmod 0640 /var/log/onv/audit.log
     fi
 
+    if [ -d /run/systemd/system ]; then
+        # **The journal's cap** (60-onv-provider.conf, omnuv's modular
+        # design A4) is read when journald starts, so journald is restarted,
+        # and only when the file differs from the one last applied: an
+        # upgrade that leaves it alone restarts nothing. The file's hash is
+        # recorded only once a restart succeeded, so a failed one is tried
+        # again by the next configure rather than forgotten
+        # (tests/logs/in_container.sh holds both).
+        cap=/etc/systemd/journald.conf.d/60-onv-provider.conf
+        applied=/var/lib/onv/journald-cap.sha256
+        if [ -f "$cap" ]; then
+            sum="$(sha256sum "$cap" | cut -d' ' -f1)"
+            if [ "$sum" != "$(cat "$applied" 2>/dev/null || true)" ]; then
+                if systemctl try-restart systemd-journald.service; then
+                    printf '%s\n' "$sum" > "$applied"
+                else
+                    echo "onv-provider: journald was not restarted; its cap applies at its next start" >&2
+                fi
+            fi
+        fi
+    fi
+
     # Enabled, but not started: there is nothing to start until `join` has
     # written a configuration. The unit's ConditionPathExists keeps it from
     # starting, and restart-looping, before that.

@@ -1,0 +1,2 @@
+/etc/logrotate.d/onv-provider
+/etc/systemd/journald.conf.d/60-onv-provider.conf

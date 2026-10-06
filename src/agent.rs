@@ -743,7 +743,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
             driver: driver.clone(),
         });
         let keepalive = crate::tunnel::Keepalive::from(&cfg.timings);
-        tokio::spawn(async move {
+        onv_core_link::supervise::spawn("tunnel", async move {
             let resolve: crate::tunnel::ResolveWorker = Arc::new(move |worker_id: &str| {
                 // Blocking lock inside a sync closure: the map is tiny and
                 // contended only by the reconcile loop.
@@ -786,7 +786,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         let cfg = cfg.clone();
         let wanted = mirror_wanted.clone();
         let kick = mirror_kick.clone();
-        tokio::spawn(async move {
+        onv_core_link::supervise::spawn("image mirror", async move {
             loop {
                 kick.notified().await;
                 // Resolved each time rather than once: with no node configured
@@ -822,7 +822,7 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
         let core = core.clone();
         let driver = driver.clone();
         let cfg = cfg.clone();
-        tokio::spawn(async move {
+        onv_core_link::supervise::spawn("card scrub", async move {
             let mut held = crate::scrub::Held::default();
             let mut tick = tokio::time::interval(cfg.timings.scrub_every.std());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1014,7 +1014,7 @@ fn spawn_reports<D: ComputeDriver + Send + Sync + 'static>(
     offered_images: Vec<String>,
     inventory_every: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    onv_core_link::supervise::spawn("inventory report", async move {
         let arm = |period: std::time::Duration, first: tokio::time::Instant| {
             let mut tick = tokio::time::interval_at(first, period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1063,7 +1063,7 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     period: std::time::Duration,
     config_hash: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    onv_core_link::supervise::spawn("heartbeat", async move {
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let body = heartbeat_body(&config_hash);

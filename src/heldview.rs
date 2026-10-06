@@ -233,7 +233,7 @@ pub struct Boot {
 /// attempts is followed by one more, never by a queue.
 pub fn spawn(gates: Gates, driver: Arc<crate::proxmox::Client>, mut unreachable: tokio::sync::watch::Receiver<u64>) -> Boot {
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(async move {
+    let task = onv_core_link::supervise::spawn("held view at boot", async move {
         loop {
             tokio::select! {
                 _ = stopped.changed() => return,

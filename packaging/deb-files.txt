@@ -1,3 +1,5 @@
+-rw-r--r-- ./etc/logrotate.d/onv-provider
+-rw-r--r-- ./etc/systemd/journald.conf.d/60-onv-provider.conf
 -rw-r--r-- ./lib/systemd/system/onv-lease-expire.service
 -rw-r--r-- ./lib/systemd/system/onv-lease-expire.timer
 -rw-r--r-- ./lib/systemd/system/onv-opening.path
@@ -8,6 +10,10 @@
 -rw-r--r-- ./usr/share/onv-provider/manifest.json
 -rwxr-xr-x ./usr/bin/onv-provider
 drwxr-xr-x ./
+drwxr-xr-x ./etc/
+drwxr-xr-x ./etc/logrotate.d/
+drwxr-xr-x ./etc/systemd/
+drwxr-xr-x ./etc/systemd/journald.conf.d/
 drwxr-xr-x ./lib/
 drwxr-xr-x ./lib/systemd/
 drwxr-xr-x ./lib/systemd/system/
@@ -18,6 +24,7 @@ drwxr-xr-x ./usr/share/doc/
 drwxr-xr-x ./usr/share/doc/onv-provider/
 drwxr-xr-x ./usr/share/onv-provider/
 control ./
+control ./conffiles
 control ./control
 control ./postinst
 control ./postrm

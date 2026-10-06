@@ -10,6 +10,11 @@ case "$1" in
     if getent group onv >/dev/null; then delgroup --system onv || true; fi
     echo "The audit log in /var/log/onv has been left in place. It is your"
     echo "record of what this marketplace did on this machine."
+    # dpkg has removed the journal's cap with the other conffiles; journald
+    # holds it until it starts again.
+    if [ -d /run/systemd/system ] && [ ! -e /etc/systemd/journald.conf.d/60-onv-provider.conf ]; then
+        systemctl try-restart systemd-journald.service || true
+    fi
     ;;
 esac
 if [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi

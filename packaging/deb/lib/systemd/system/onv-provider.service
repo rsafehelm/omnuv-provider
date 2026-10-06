@@ -22,6 +22,25 @@ User=onv
 Group=onv
 Restart=always
 RestartSec=10s
+# **Exit 3 is "stop for good"** (agent.rs, `stop_for_good`): Core will not
+# work with this agent as it is, and only an upgrade or a re-enrolment
+# changes that. Restart=always undid it every 10 s, for ever. 70 is a
+# supervised task's panic (onv_agent_lib::supervise) and is restarted, and
+# so is 2, a configuration refused, so a corrected file is picked up.
+RestartPreventExitStatus=3
+# ceiling: SIGTERM is honoured between passes, and a pass may be inside one
+# hypervisor task the client waits up to 600 s for (proxmox.rs, wait_task);
+# 60 s more for `release_session`. The default 90 s SIGKILLed such a pass
+# before it released the session, and the successor then waited out Core's
+# takeover lease. Unmeasured: passes are usually seconds.
+TimeoutStopSec=660
+# ceiling: unmeasured. A bound against a leak, not a budget: the agent holds
+# small maps and streams image downloads to disk (agent.rs, bytes_stream),
+# never whole. The page cache of a multi-gigabyte download is charged here
+# too; at the bound the kernel reclaims it and throttles the writer rather
+# than kill. Past it, the OOM kill ends the process and Restart=always
+# starts it again.
+MemoryMax=1G
 
 # It talks to a local hypervisor API and to Core. It does not need root, and
 # later phases that touch host devices should widen this deliberately rather
