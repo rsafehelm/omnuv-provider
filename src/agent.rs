@@ -85,6 +85,9 @@ struct Core {
     /// v0.28.0, contract change 6), `None` from a Core that sends none. What
     /// the heartbeat's `settings_hash` answers (`crate::settings`).
     settings: std::sync::Arc<std::sync::Mutex<Option<omnuv_protocol::AgentSettings>>>,
+    /// The longest heartbeat interval Core's settings may set here
+    /// (`timings.heartbeatCeiling`, A8).
+    heartbeat_ceiling: std::time::Duration,
 }
 
 /// **Tell Core this provider is leaving (PROVIDER-16).** `onv-provider leave`
@@ -325,6 +328,7 @@ impl Core {
             install_watch: Default::default(),
             accepted: Default::default(),
             settings: Default::default(),
+            heartbeat_ceiling: onv_agent_lib::timings::defaults::HEARTBEAT_CEILING.std(),
         })
     }
 
@@ -673,10 +677,14 @@ async fn handshake_then_core_check(
 /// units on this host with what each runs (`components`, contract change
 /// 11), and the Workload Agent's digest its workers verify
 /// (`workloadd_sha256`), which Core holds against the binary it serves.
-fn heartbeat_body(config_hash: &str, settings: Option<&omnuv_protocol::AgentSettings>) -> serde_json::Value {
+fn heartbeat_body(
+    config_hash: &str,
+    settings: Option<&omnuv_protocol::AgentSettings>,
+    ceiling: std::time::Duration,
+) -> serde_json::Value {
     serde_json::to_value(omnuv_protocol::Heartbeat {
         config_hash: Some(config_hash.to_string()),
-        settings_hash: crate::settings::hash(settings),
+        settings_hash: crate::settings::hash(settings, ceiling),
         components: components(config_hash),
         workloadd_sha256: crate::worker::workloadd_sha256(),
     })
@@ -766,7 +774,7 @@ fn check_line(c: &omnuv_protocol::SelfCheck) -> String {
 /// anything else is not an answer from Core about this agent.
 async fn core_check(core: &Core, url: &str, config_hash: &str) -> String {
     let settings = crate::poison::lock(&core.settings, "agent settings").clone();
-    match core.post("/provider/v1/heartbeat", Some(heartbeat_body(config_hash, settings.as_ref()))).await {
+    match core.post("/provider/v1/heartbeat", Some(heartbeat_body(config_hash, settings.as_ref(), core.heartbeat_ceiling))).await {
         Ok(r) if r.status().is_success() => format!("selfcheck: core reachable over tls at {url}, and accepts this agent"),
         Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
             format!("SELFCHECK FAILED: core at {url} refused this agent's token ({})", r.status())
@@ -815,8 +823,9 @@ pub async fn run(cfg: AgentConfig) -> anyhow::Result<()> {
     if let Err(e) = driver.opening.settle() {
         eprintln!("opening: not settled at start, every pass retries what it writes: {e:#}");
     }
-    let core = Core::new(&cfg.core.url, &cfg.core.token)?
+    let mut core = Core::new(&cfg.core.url, &cfg.core.token)?
         .with_restore_head(crate::restore::head_file(&cfg.proxmox.snippet_dir));
+    core.heartbeat_ceiling = cfg.timings.heartbeat_ceiling.std();
     // What every heartbeat says this agent runs, computed once: the file does
     // not change under a running agent, because a change is a restart (D34).
     let config_hash = cfg.timings.hash();
@@ -1226,13 +1235,34 @@ fn spawn_heartbeat<D: ComputeDriver + Send + Sync + 'static>(
     config_hash: String,
 ) -> tokio::task::JoinHandle<()> {
     onv_core_link::supervise::spawn("heartbeat", async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // **Its interval re-armed every beat** (A8): Core's settings move
+        // with its views, so a changed `providers.heartbeat_interval` is
+        // taken here without a restart, clamped to this agent's bounds and
+        // said once when it moves; the handshake's for a Core that sends none.
+        let mut first = true;
+        let mut said: Option<(std::time::Duration, Option<u64>)> = None;
         loop {
-            tick.tick().await;
+            let settings = crate::poison::lock(&core.settings, "agent settings").clone();
+            let (every, clamped) = crate::settings::heartbeat(settings.as_ref(), core.heartbeat_ceiling, period);
+            if said != Some((every, clamped)) {
+                match (clamped, &said) {
+                    (Some(asked), _) => eprintln!(
+                        "heartbeat: every {}s, Core's settings asked {asked}s, clamped to this agent's bounds \
+                         (5s..timings.heartbeatCeiling {}s)",
+                        every.as_secs(), core.heartbeat_ceiling.as_secs()
+                    ),
+                    (None, Some(_)) => eprintln!("heartbeat: every {}s, as Core's settings say", every.as_secs()),
+                    (None, None) => {}
+                }
+                said = Some((every, clamped));
+            }
+            if !first {
+                tokio::time::sleep(every).await;
+            }
+            first = false;
             // Built each beat: the settings Core sent move with its views.
             let settings = crate::poison::lock(&core.settings, "agent settings").clone();
-            let body = heartbeat_body(&config_hash, settings.as_ref());
+            let body = heartbeat_body(&config_hash, settings.as_ref(), core.heartbeat_ceiling);
             let r = match core.post(omnuv_protocol::ROUTE_HEARTBEAT, Some(body)).await {
                 Ok(r) if r.status().is_success() => continue,
                 Ok(r) => r,
@@ -1878,7 +1908,7 @@ mod handshake_tests {
         core.get_json::<serde_json::Value>("/provider/v1/desired-state").await.expect("a view");
         let (view, _) = rx.recv().await.unwrap();
         assert!(view.contains("\r\nonv-session: s-1"), "the view was asked without the session: {view}");
-        core.post("/provider/v1/heartbeat", Some(heartbeat_body("abcdefabcdef", None))).await.expect("a heartbeat");
+        core.post("/provider/v1/heartbeat", Some(heartbeat_body("abcdefabcdef", None, std::time::Duration::from_secs(300)))).await.expect("a heartbeat");
         let (beat, _) = rx.recv().await.unwrap();
         assert!(beat.contains("\r\nonv-session: s-1"), "the heartbeat went without the session: {beat}");
     }
@@ -1997,7 +2027,7 @@ mod handshake_tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8_lossy(&request).into_owned()
             });
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "fixture".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default(), heartbeat_ceiling: std::time::Duration::from_secs(300) };
             let said = core_check(&core, &base, "0123456789ab").await;
             let request = server.await.unwrap();
             assert!(request.starts_with("POST /provider/v1/heartbeat "), "{request}");
@@ -2029,6 +2059,7 @@ mod handshake_tests {
             install_watch: Default::default(),
             accepted: Default::default(),
             settings: Default::default(),
+            heartbeat_ceiling: onv_agent_lib::timings::defaults::HEARTBEAT_CEILING.std(),
         };
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(3);
         let server = tokio::spawn(async move {
@@ -2109,7 +2140,7 @@ mod handshake_tests {
     async fn every_heartbeat_says_which_tunables_it_runs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (base, mut heard) = core_stub(serde_json::Value::Null).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default(), heartbeat_ceiling: std::time::Duration::from_secs(300) };
         let said = |(line, body): (String, String)| -> Option<String> {
             assert!(line.starts_with("POST /provider/v1/heartbeat "), "{line}");
             serde_json::from_str::<omnuv_protocol::Heartbeat>(&body).expect("a heartbeat body").config_hash
@@ -2138,7 +2169,7 @@ mod handshake_tests {
             "poll_interval_secs": 45,
         });
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default(), heartbeat_ceiling: std::time::Duration::from_secs(300) };
         let pve = crate::pvemock::Mock::start(|method, path, _| match (method, path) {
             ("GET", "/nodes/n1/qemu") => (200, serde_json::json!([])),
             _ => (404, serde_json::Value::Null),
@@ -2192,7 +2223,7 @@ mod handshake_tests {
         let file = Arc::new(Mutex::new("step=1/3\nlabel=Getting ready\n".to_string()));
         let said = file.clone();
         let (base, _heard) = core_stub(view).await;
-        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
+        let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default(), heartbeat_ceiling: std::time::Duration::from_secs(300) };
         let pve = crate::pvemock::Mock::start(move |method, path, _| {
             if let Some(ok) = crate::pvemock::task_ok(path) {
                 return ok;
@@ -3330,8 +3361,9 @@ mod handshake_tests {
     /// **A heartbeat says the settings it applied only to a Core that sent
     /// some**, from the view `get_view` read: none before a view, none after
     /// a v0.27 view, and after a v0.28 view the hash of what was applied
-    /// (nothing yet: `crate::settings`), which is not the hash of what was
-    /// sent.
+    /// (the heartbeat interval, A8: `crate::settings`), which is not the
+    /// hash of what was sent when the view carried members this agent does
+    /// not run.
     #[tokio::test]
     async fn a_heartbeat_says_the_settings_it_applied_after_a_view_that_sent_some() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3344,9 +3376,11 @@ mod handshake_tests {
         let mut v27 = v28.clone();
         v27.as_object_mut().unwrap().remove("agent_settings");
         let sent: omnuv_protocol::AgentSettings = serde_json::from_value(v28["agent_settings"].clone()).unwrap();
-        for (view, want) in [(v27, None), (v28, Some(omnuv_protocol::AgentSettings::default().hash()))] {
+        let applied = crate::settings::applied(&sent, std::time::Duration::from_secs(300)).hash();
+        assert!(sent.heartbeat_interval_secs.is_some(), "the golden view sends no heartbeat: this proves less");
+        for (view, want) in [(v27, None), (v28, Some(applied))] {
             let (base, mut heard) = core_stub(view).await;
-            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default() };
+            let core = Core { http: reqwest::Client::new(), base: base.clone(), token: "t".into(), session: Default::default(), restore: Default::default(), lease: Default::default(), built: Default::default(), report: Default::default(), install_watch: Default::default(), accepted: Default::default(), settings: Default::default(), heartbeat_ceiling: std::time::Duration::from_secs(300) };
             core_check(&core, &base, "0123456789ab").await;
             assert_eq!(said(heard.recv().await.unwrap()), None, "a settings hash before any view");
             core.get_view(0).await.expect("a view");
@@ -3365,7 +3399,7 @@ mod handshake_tests {
     /// different build. The heartbeat body is read as Core reads it.
     #[test]
     fn the_components_are_the_ones_this_process_can_vouch_for() {
-        let body = heartbeat_body("0123456789ab", None);
+        let body = heartbeat_body("0123456789ab", None, std::time::Duration::from_secs(300));
         let components = body["components"].as_array().expect("components on the wire");
         assert_eq!(components.len(), 1, "a unit vouched for from another file: {components:?}");
         assert_eq!(components[0]["name"], "onv-provider");

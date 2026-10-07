@@ -67,6 +67,9 @@ pub mod defaults {
     /// longer than Core waits on a silent lease. Unmeasured; it is a bound,
     /// not a reading.
     pub const HELD_VIEW_MAX_AGE: Dur = Dur::mins(15);
+    /// The longest heartbeat interval this agent takes from Core's settings
+    /// (A8): Core's own ceiling, 5m, unless the provider sets a lower one.
+    pub const HEARTBEAT_CEILING: Dur = Dur::mins(5);
 }
 
 /// The poll this agent keeps while Core says none: a Core that predates
@@ -155,6 +158,11 @@ pub struct Timings {
     /// (omnuv's modular design, A6). Older, it starts nothing. 0s: the
     /// boot-time maintain path is off.
     pub held_view_max_age: Dur,
+    /// **The longest heartbeat interval Core's settings may set here**
+    /// (omnuv's modular design, A8): Core's `providers.heartbeat_interval`
+    /// arrives with every view and is clamped to 5s..this, the clamp logged,
+    /// and the heartbeat says the hash of what it applied.
+    pub heartbeat_ceiling: Dur,
 }
 
 impl Default for Timings {
@@ -176,6 +184,7 @@ impl Default for Timings {
             scrub_guest_deadline: SCRUB_GUEST_DEADLINE,
             scrub_every: SCRUB_EVERY,
             held_view_max_age: HELD_VIEW_MAX_AGE,
+            heartbeat_ceiling: HEARTBEAT_CEILING,
         }
     }
 }
@@ -237,6 +246,8 @@ impl Timings {
              reports holds its card out of sale for as long as this");
         within(&mut bad, "scrubEvery", self.scrub_every, Dur::secs(5), Dur::mins(10),
             "each look asks Core and the hypervisor, and a scrubbed card waits this long to be reported");
+        within(&mut bad, "heartbeatCeiling", self.heartbeat_ceiling, Dur::secs(5), defaults::HEARTBEAT_CEILING,
+            "Core's heartbeat interval is clamped to it, and Core itself sets none above 5m or below 5s");
         if self.held_view_max_age != Dur::secs(0) {
             within(&mut bad, "heldViewMaxAge", self.held_view_max_age, Dur::mins(1), defaults::HELD_VIEW_MAX_AGE,
                 "longer than the run lease's T (15m) starts a machine from a view Core may have overruled for \
@@ -306,11 +317,12 @@ mod tests {
         // 3cf6624da40e; phase 8 added `startedDestroysPerHour` (0, no cap):
         // bac073f3123c; phase 9 added `scrubGuestDeadline` and `scrubEvery`:
         // c2961f8ee260; the modular design's A6 added `heldViewMaxAge`:
-        // a21e21d51d90.
+        // a21e21d51d90; A8 added `heartbeatCeiling` (5m): 228403bd6076.
         assert_eq!(t.started_destroys_per_hour, 0, "lifecycle phase 8: a new key, shipped off");
         assert_eq!((secs(t.scrub_guest_deadline), secs(t.scrub_every)), (1200.0, 30.0), "lifecycle phase 9: two new keys");
         assert_eq!(secs(t.held_view_max_age), 900.0, "A6: a new key, the run lease's T");
-        assert_eq!(t.hash(), "a21e21d51d90");
+        assert_eq!(secs(t.heartbeat_ceiling), 300.0, "A8: a new key, Core's own ceiling");
+        assert_eq!(t.hash(), "228403bd6076");
     }
 
     /// Core's poll is obeyed inside Core's own range, and zero or absent is
