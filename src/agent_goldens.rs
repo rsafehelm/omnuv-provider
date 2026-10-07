@@ -69,7 +69,7 @@ fn every_cores_view_is_read_as_the_agent_reads_it() {
         }
         let held = crate::poison::lock(&core.settings, "settings").clone();
         assert_eq!(held.is_some(), settings, "{path}: agent settings held {held:?}");
-        let sent_hash = crate::settings::hash(held.as_ref());
+        let sent_hash = crate::settings::hash(held.as_ref(), std::time::Duration::from_secs(300));
         assert_eq!(sent_hash.is_some(), settings, "{path}: a settings hash for settings never sent");
     }
 }
@@ -215,7 +215,7 @@ fn the_heartbeat_is_read_by_both_cores() {
     let settings: omnuv_protocol::AgentSettings =
         serde_json::from_value(json("protocol-v0.28/desired-state.json")["agent_settings"].clone()).expect("settings");
     for sent in [None, Some(&settings)] {
-        let body = heartbeat_body("0123456789ab", sent);
+        let body = heartbeat_body("0123456789ab", sent, std::time::Duration::from_secs(300));
         let old: v027::Heartbeat = serde_json::from_value(body.clone()).expect("a v0.27 Core reads the heartbeat");
         assert_eq!(old.config_hash.as_deref(), Some("0123456789ab"));
         let new: omnuv_protocol::Heartbeat = serde_json::from_value(body.clone()).expect("a v0.28 Core reads it");
