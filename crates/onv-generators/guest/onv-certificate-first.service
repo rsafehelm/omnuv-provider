@@ -1,0 +1,14 @@
+[Unit]
+Description=Omnuv: wait at first boot for this machine's project web certificate
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/onv/certificate/pull.env
+ConditionPathExists=!/etc/onv/certificate/live/fingerprint
+
+[Service]
+Type=oneshot
+# Every five seconds while Core has none yet, for at most fifteen minutes:
+# issuance takes under a minute once Core asks (the issuer looks every 15 s).
+# The timer keeps the certificate current after this, and asks again if not.
+ExecStart=/usr/local/sbin/onv-certificate --until-issued 900
+TimeoutStartSec=20min

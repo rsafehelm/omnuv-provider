@@ -76,6 +76,7 @@ class FakeCore:
         self.tokens: set[str] = set()
         self.issued: dict | None = None
         self.revoked = False
+        self.off = False  # Core serving no certificates at all
         self.seen: list[str] = []
         self.minted = 0
         core = self
@@ -112,6 +113,8 @@ class FakeCore:
                 if core.revoked or self.bearer() not in core.tokens:
                     return self.answer(401, {"error": "unauthorized"})
                 core.bootstrap_live = False  # the first fetch spends it
+                if core.off:
+                    return self.answer(404, {"error": "not found"})
                 if core.issued is None:
                     return self.answer(404, {"code": "certificate_not_issued", "error": "none yet"})
                 have = urllib.parse.parse_qs(url.query).get("have", [""])[0]
@@ -169,11 +172,11 @@ class GuestFetch(unittest.TestCase):
     def tearDown(self):
         self.core.httpd.shutdown()
 
-    def run_fetch(self) -> subprocess.CompletedProcess:
+    def run_fetch(self, *args: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, ONV_CERT_CONF=str(self.conf), ONV_CERT_STATE=str(self.state),
                    ONV_CERT_LIVE=str(self.live), ONV_CERT_HOOKS=str(self.hooks),
-                   ONV_CERT_CACERT=str(self.auth.ca))
-        p = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
+                   ONV_CERT_CACERT=str(self.auth.ca), ONV_CERT_WAIT_EVERY="0.2")
+        p = subprocess.run(["bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
         out = p.stdout + p.stderr
         # Nothing a run prints carries a credential or a key.
         self.assertNotIn(BOOTSTRAP, out)
@@ -193,6 +196,30 @@ class GuestFetch(unittest.TestCase):
         self.assertIn(token.read_text().strip(), self.core.tokens)
         self.assertFalse((self.live / "privkey.pem").exists())
         self.assertEqual(self.hook_runs(), 0)
+
+    def test_first_boot_waits_until_issued_and_installs_it_at_once(self):
+        cert, key = self.auth.leaf("w9", "*.p.cloud.test")
+        threading.Timer(1.0, self.core.issue, (cert, key)).start()
+        p = self.run_fetch("--until-issued", "30")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.live / "fingerprint").read_text().strip(), fingerprint(cert))
+        self.assertEqual(self.hook_runs(), 1)
+        gets = sum(1 for r in self.core.seen if r.startswith("GET "))
+        self.assertGreaterEqual(gets, 3, f"asked {gets} times: it did not wait and ask again")
+        self.assertEqual(self.core.seen.count("POST /v1/machine/certificate/exchange"), 1, "traded twice")
+
+    def test_first_boot_gives_up_at_its_deadline_quietly(self):
+        p = self.run_fetch("--until-issued", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no certificate within 1s", p.stdout)
+        self.assertFalse((self.live / "fingerprint").exists())
+
+    def test_first_boot_stops_at_once_when_core_serves_none(self):
+        self.core.off = True
+        p = self.run_fetch("--until-issued", "30")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("switched off", p.stdout)
+        self.assertEqual(sum(1 for r in self.core.seen if r.startswith("GET ")), 1, "asked again a Core that serves none")
 
     def test_an_issued_certificate_is_installed_once_and_its_hook_run(self):
         cert, key = self.auth.leaf("w1", "*.p.cloud.test")

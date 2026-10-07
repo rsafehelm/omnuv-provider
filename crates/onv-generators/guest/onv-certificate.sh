@@ -2,7 +2,11 @@
 # onv-certificate: this machine fetches its project's web certificate from
 # Core (omnuv's docs/plans/private-names-https.md, D-2: pulled by the machine).
 #
-# Run by onv-certificate.timer, as root, a few minutes apart. Each run:
+# Run by onv-certificate.timer, as root, a few minutes apart, and once at
+# first boot as `onv-certificate --until-issued <seconds>` (onv-certificate-
+# first.service): a run every few seconds while Core says none is issued
+# yet, so a web machine's HTTPS front starts within seconds of its project's
+# certificate rather than at the next quarter hour (omnuv TODO 5n). Each run:
 #
 #   1. holds a token of its own, or trades the bootstrap first boot wrote
 #      (pull.env) for one at Core: POST /v1/machine/certificate/exchange
@@ -31,6 +35,26 @@ CACERT="${ONV_CERT_CACERT:-}"
 say() { echo "onv-certificate: $*"; }
 fail() { echo "onv-certificate: $*" >&2; exit 1; }
 
+# **Until issued**: one run after another, while a run answers 75 (Core has
+# none for this project yet) or fails (the network is not up yet), until a
+# run is done or the deadline. The timer goes on after either.
+if [ "${1:-}" = --until-issued ]; then
+    limit="${2:?--until-issued needs a number of seconds}"
+    case "$limit" in *[!0-9]* | "") fail "--until-issued takes whole seconds, not $limit" ;; esac
+    every="${ONV_CERT_WAIT_EVERY:-5}"
+    end=$((SECONDS + limit))
+    while :; do
+        rc=0
+        ONV_CERT_WAITING=1 bash "$0" || rc=$?
+        [ "$rc" = 0 ] && exit 0
+        if [ "$SECONDS" -ge "$end" ]; then
+            say "no certificate within ${limit}s; the timer asks again"
+            exit 0
+        fi
+        sleep "$every" # wait: Core said not yet, or the run failed; it is asked again
+    done
+fi
+
 [ -r "$CONF" ] || { say "no $CONF: this machine fetches no certificate"; exit 0; }
 
 # KEY=VALUE, read rather than sourced: the file is data.
@@ -50,6 +74,10 @@ core_url="${core_url%/}"
 
 mkdir -p "$STATE" "$LIVE"
 chmod 700 "$STATE" "$LIVE"
+# One run at a time: the timer's and first boot's would each trade the
+# bootstrap, and the second trade replaces the first's token.
+exec 9> "$STATE/lock"
+flock 9
 work="$(mktemp -d "$STATE/run.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
@@ -126,6 +154,8 @@ case "$status" in
     404)
         if [ "$(field code)" = certificate_not_issued ]; then
             say "no certificate issued for this project yet; asking again next run"
+            # 75 (EX_TEMPFAIL) to --until-issued alone; to the timer, done.
+            [ -n "${ONV_CERT_WAITING:-}" ] && exit 75
             exit 0
         fi
         say "Core serves no certificates (switched off)"

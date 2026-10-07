@@ -113,6 +113,7 @@ pub const CERT_PULL_ENV: &str = "/etc/onv/certificate/pull.env";
 pub const CERT_SCRIPT: &str = include_str!("../guest/onv-certificate.sh");
 pub const CERT_SERVICE: &str = include_str!("../guest/onv-certificate.service");
 pub const CERT_TIMER: &str = include_str!("../guest/onv-certificate.timer");
+pub const CERT_FIRST: &str = include_str!("../guest/onv-certificate-first.service");
 
 /// **A web machine's certificate fetch** (omnuv-protocol v0.26.0; omnuv's
 /// private names a browser trusts, D-2: pulled by the machine). The fetch
@@ -135,6 +136,7 @@ pub fn certificate_files(pull: &omnuv_protocol::CertificatePull) -> String {
         write_file("/usr/local/sbin/onv-certificate", "0755", CERT_SCRIPT),
         write_file("/etc/systemd/system/onv-certificate.service", "0644", CERT_SERVICE),
         write_file("/etc/systemd/system/onv-certificate.timer", "0644", CERT_TIMER),
+        write_file("/etc/systemd/system/onv-certificate-first.service", "0644", CERT_FIRST),
     ]
     .concat()
 }
@@ -152,12 +154,13 @@ pub fn first_boot_files(spec: &InstanceSpec) -> String {
     if files.is_empty() { String::new() } else { format!("write_files:\n{files}") }
 }
 
-/// The timer that keeps the certificate current, and one fetch now rather
-/// than a minute from now. `|| true`: a machine whose timer cannot start still
-/// boots and serves its page over plain HTTP, as before.
+/// The timer that keeps the certificate current, and first boot's wait for
+/// the first one, asked every few seconds rather than a quarter hour apart.
+/// `|| true`: a machine whose timer cannot start still boots and serves its
+/// page over plain HTTP, as before.
 pub fn certificate_runcmd(_: &omnuv_protocol::CertificatePull) -> String {
     "  - [ sh, -c, \"systemctl daemon-reload && systemctl enable --now onv-certificate.timer \
-     && systemctl start --no-block onv-certificate.service || true\" ]\n"
+     && systemctl start --no-block onv-certificate-first.service || true\" ]\n"
         .to_string()
 }
 
