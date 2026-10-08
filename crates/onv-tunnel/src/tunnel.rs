@@ -95,8 +95,51 @@ pub async fn run(
         }
         // Bounded backoff: a provider that cannot reach Core must not spin, but
         // must also recover quickly once the path returns.
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        tokio::time::sleep(jittered(backoff, random())).await;
         backoff = (backoff * 2).min(60);
+    }
+}
+
+/// **A wait drawn at random between one second and the backoff** (8 October
+/// 2026, the Cloudflare report's section 4). Core closes every tunnel with
+/// 1001 when a deploy replaces it, and each agent then waited exactly the
+/// same two seconds, so all of them dialled again, and authenticated against
+/// the ledger, in the same second. Full jitter spreads them over the backoff;
+/// the floor keeps an agent that cannot reach Core from spinning.
+fn jittered(backoff_secs: u64, r: u64) -> std::time::Duration {
+    let ceiling = backoff_secs.max(1) * 1000;
+    let floor = 1000u64.min(ceiling);
+    std::time::Duration::from_millis(floor + r % (ceiling - floor + 1))
+}
+
+/// A random `u64` from std alone: each `RandomState` is keyed afresh from the
+/// process's random seed, which is all a jitter needs.
+fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
+#[cfg(test)]
+mod jitter {
+    use super::*;
+
+    #[test]
+    fn the_wait_stays_between_a_second_and_the_backoff() {
+        for backoff in [1u64, 2, 4, 60] {
+            for r in [0, 1, 999, u64::MAX / 2, u64::MAX] {
+                let ms = jittered(backoff, r).as_millis() as u64;
+                assert!((1000..=backoff * 1000).contains(&ms), "backoff {backoff}, r {r}: {ms} ms");
+            }
+        }
+    }
+
+    /// The negative case: a constant wait, the herd this replaces. Two
+    /// hundred agents after a clean close must not land in one second.
+    #[test]
+    fn agents_after_one_close_are_spread_over_the_backoff() {
+        let waits: std::collections::BTreeSet<u64> =
+            (0..200).map(|_| jittered(2, random()).as_millis() as u64 / 100).collect();
+        assert!(waits.len() >= 8, "200 agents fell in {} tenths of a second: {waits:?}", waits.len());
     }
 }
 
