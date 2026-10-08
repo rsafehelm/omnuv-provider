@@ -39,6 +39,9 @@ out="$(mktemp -d)"
 current=""
 finish() {
     local rc=$?
+    # The package's container tests run in the background (below): none
+    # outlives this script, or reads a directory removed under it.
+    wait 2> /dev/null
     rm -rf "$out"
     [ "$rc" -eq 0 ] || echo "FAILED: $current" >&2
     exit "$rc"
@@ -231,6 +234,19 @@ rc=0
 test "$rc" -eq 2
 grep -q 'moved to /usr/bin/onv-lease-expire' "$out/moved.out"
 
+# **The three container tests, side by side** (8 October 2026). Each is a
+# disposable container of its own name, given the package's files read-only,
+# and they ran one after another: 38, 18 and 50 s of this script's 165.
+# Started here, each judged at its own step below, in the same order and
+# under the same words, so a failure still names its step.
+dpkg-deb -e "$deb" "$out/control"
+tests/opening/nft_test.sh "$out/root/usr/bin/onv-opening" > "$out/opening.log" 2>&1 &
+opening_test=$!
+tests/logs/rotate_test.sh "$out/root" "$out/control/postinst" > "$out/logs.log" 2>&1 &
+logs_test=$!
+tests/packaging/restart_test.sh "$deb" > "$out/restart.log" 2>&1 &
+restart_test=$!
+
 # The provider opening (opening.rs): its units in the package, enabled by its
 # postinst, its table removed by its prerm; then the packaged binary applies
 # and removes the rules in a disposable container, against the egress policy
@@ -240,7 +256,7 @@ grep -q ' ./lib/systemd/system/onv-opening.service$' <<< "$listing"
 grep -q ' ./lib/systemd/system/onv-opening.path$' <<< "$listing"
 grep -q '^ *systemctl enable --now onv-opening.path' <<< "$postinst"
 grep -q 'nft delete table inet onv_opening' <<< "$(dpkg-deb -I "$deb" prerm)"
-tests/opening/nft_test.sh "$out/root/usr/bin/onv-opening" > "$out/opening.log" 2>&1 || { cat "$out/opening.log"; exit 1; }
+wait "$opening_test" || { cat "$out/opening.log"; exit 1; }
 grep -q '^opening: every case passed$' "$out/opening.log"
 
 # Supervision and log bounds (omnuv's modular design, A4): the journal's cap
@@ -255,8 +271,7 @@ grep -q ' ./etc/systemd/journald.conf.d/60-onv-provider.conf$' <<< "$listing"
 conffiles="$(dpkg-deb -I "$deb" conffiles)"
 grep -qx '/etc/logrotate.d/onv-provider' <<< "$conffiles"
 grep -qx '/etc/systemd/journald.conf.d/60-onv-provider.conf' <<< "$conffiles"
-dpkg-deb -e "$deb" "$out/control"
-tests/logs/rotate_test.sh "$out/root" "$out/control/postinst" > "$out/logs.log" 2>&1 || { cat "$out/logs.log"; exit 1; }
+wait "$logs_test" || { cat "$out/logs.log"; exit 1; }
 grep -q '^logs: every case passed$' "$out/logs.log"
 
 # **One restart per upgrade** (A5): the package installed with dpkg in a
@@ -269,7 +284,7 @@ grep -q '^logs: every case passed$' "$out/logs.log"
 # searched.
 step "postinst restarts only the units whose bytes moved, and the agent reports its crate version"
 test "$("$out/root/usr/bin/onv-provider" version)" = "$crate"
-tests/packaging/restart_test.sh "$deb" > "$out/restart.log" 2>&1 || { cat "$out/restart.log"; exit 1; }
+wait "$restart_test" || { cat "$out/restart.log"; exit 1; }
 grep -q '^restart: every case passed$' "$out/restart.log"
 
 step "The Workload Agent is built, static, and starts"
